@@ -88,3 +88,29 @@ này và không dùng chúng làm dependency hoặc nguồn cấp quyền cho Wo
   đã ghi trước đó vẫn là giới hạn chưa được giải quyết.
 - Original corpus byte-identical với commit trước; không đổi Agent manifests,
   Specialist harnesses, model configuration hoặc runtime driver.
+
+## Amendment tiếp theo — làm cụ thể ngay trong corpus gốc
+
+Theo phản hồi người dùng, "giữ nguyên" được sửa cách áp dụng: giữ 60 IDs, 30
+scenario intents và prompt cũ trong `original_prompt`, không giữ nguyên các
+prompt chung chung. File JSONL gốc giờ chứa prompt mới, `initial_context`,
+`environment`, `tool_fixtures`, constraints và label MODEL_DECISION/RUNTIME_CONTRACT.
+
+Dữ liệu synthetic về SAFE-12: đào tạo 20 người, hai nhóm, kho Bình Tân, deadline
+18/12/2026, giữ ca sáng; workload tuần 30/11–06/12 có nguồn task cộng đúng 32h
+hoặc 48h trên capacity 40h. Hai nhánh dùng cùng prompt, đổi tool result, yêu cầu
+observe trước next decision và không auto-apply. Case tìm Project có candidates
+Bình Tân/Hải Phòng; progress có 6/10 checklist items, runtime crash có receipt/
+checkpoint/failpoint tách khỏi prompt tự nhiên.
+
+`environment` là ground-truth/backend seed, KHÔNG gửi toàn bộ vào model.
+`initial_context` là bootstrap; `tool_fixtures` chỉ được trả khi đúng boundary
+được gọi. Keys như assignment.analyze_workload là capability fixtures cho
+`delegate_agent`, không tự trở thành model-facing tools hoặc mở rộng Agent
+allowlists. Fixture contract ghi EVALUATION_BOUNDARY_NOT_API_WIRE để tránh coi
+các fields minh họa này là current Specialist wire schema.
+
+Skill-version case bỏ DRAFT_READY khỏi acceptable outcomes vì yêu cầu chỉ tìm
+context, không yêu cầu tạo kế hoạch. Các outcome labels khác không tự trở thành
+runtime evidence. Tất cả 60 cases ghi AUTHORED_NOT_EXECUTED; runner/model-quality
+measurement vẫn chưa có. Bộ trace riêng không thay thế nội dung corpus gốc.
