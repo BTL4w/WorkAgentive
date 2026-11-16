@@ -29,13 +29,13 @@ __all__ = ["pytestmark", "retrieval_harness"]
 @pytest.mark.asyncio
 async def test_card_validation_completes_with_one_database_connection(
     retrieval_harness: RetrievalHarness,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     h = retrieval_harness
+    monkeypatch.delenv("APP_DATABASE_URL", raising=False)
     await h.sql("UPDATE memberships SET role='MANAGER' WHERE id=:id", {"id": h.actor.membership_id})
     actor = replace(h.actor, role=MembershipRole.MANAGER)
-    engine = create_async_engine(
-        os.environ["APP_DATABASE_URL"], pool_size=1, max_overflow=0, pool_timeout=0.1
-    )
+    engine = create_async_engine(h.engine.url, pool_size=1, max_overflow=0, pool_timeout=0.1)
     sessions = create_session_factory(engine)
     planning = PostgreSQLPlanningRunTransactionFactory(sessions)
     now = datetime.now(UTC)

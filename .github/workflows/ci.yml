@@ -60,8 +60,18 @@ jobs:
       - name: Run unit tests
         run: make test
 
+      - name: Prepare PostgreSQL for AI evaluation
+        run: make db-up migrate
+
       - name: Check isolated AI package
+        env:
+          RUN_POSTGRES_INTEGRATION: "1"
+          APP_DATABASE_URL: postgresql+psycopg://work_management:work_management@localhost:5432/work_management
         run: make ai
+
+      - name: Stop test services
+        if: always()
+        run: docker compose down --volumes
 
   migrations:
     name: Database migrations
