@@ -46,7 +46,9 @@ for _logger_name in (
 
 
 @contextmanager
-def _private_image_request() -> Generator[None]:
+def private_provider_request() -> Generator[None]:
+    """Suppress SDK tracing and body/error dumps for a private provider call."""
+
     token = _private_media_call.set(True)
     try:
         with tracing_context(enabled=False):
@@ -150,7 +152,7 @@ class OpenAIModelGateway:
             # Keep structured safe traces at the Harness, never export image bytes.
             with (
                 tracing_context(enabled=False),
-                _private_image_request() if has_images else nullcontext(),
+                private_provider_request() if has_images else nullcontext(),
             ):
                 async with asyncio.timeout(request.timeout_seconds):
                     raw_output = await structured_model.ainvoke(messages)

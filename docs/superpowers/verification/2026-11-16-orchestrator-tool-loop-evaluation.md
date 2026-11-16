@@ -201,3 +201,68 @@ Verification:
   hosted_status NOT_RUN. Run separately because make ai stopped at core eval.
 - Diff reviewed: only Task 1 files and this verification note staged. Production
   registration/admission, specialist implementations and v1 contracts unchanged.
+
+
+## Task 2 — Hosted native tool adapter (offline verified)
+
+Added `model_gateway/openai_tools.py`: OpenAINativeToolGateway implements
+NativeToolGateway.generate_step with constructor-injected model name/key/factory.
+Shared private_provider_request in the existing adapter suppresses SDK dumps/
+tracing; legacy structured generation retains its existing transport/behavior.
+No model configuration, title model, dependency, production admission or
+Specialist changes. No hosted API call was made.
+
+Native transport is Chat Completions through the installed ChatOpenAI adapter:
+full typed history, assistant tool_calls IDs and ToolMessage.tool_call_id are
+rebuilt each request, store=False, max_retries=0. No previous_response_id or
+provider-hosted session/opaque reasoning is retained. This is distinct from the
+unchanged Responses path of structured v1. A configured model must support this
+transport plus strict functions and final JSON schema; otherwise return typed
+unavailable, without changing model or weakening the request.
+
+Strict compiler preserves supported validation keywords, removes defaults and
+requires every declared property (nullable types stay nullable). Open maps,
+unknown schema keywords and non-object roots fail before provider creation.
+Tools require the registered Pydantic input contract. Unsupported schemas are
+not silently loosened or dropped. Binding uses strict=True and
+parallel_tool_calls=False with strict final response_format. Local validation
+rejects unknown/reused calls, malformed arguments/final, multiple calls,
+call+typed-final, refusal/incomplete output and contradictory finish reasons.
+Errors expose a fresh normalized exception with fixed text and suppressed raw
+cause, including when a provider raises an existing gateway exception. Usage is
+preserved on invalid output when available; tool text is not double-encoded.
+
+### Compatibility gate discovered
+
+The current public OrchestratorFinalResponse schema includes open dictionaries
+and discriminated unions that this strict subset does not support. A dedicated
+test verifies unavailability before provider construction. Task 10 must supply
+a bounded model-facing final schema plus verified projection to existing public
+blocks, and an actual-adapter compatibility test, before candidate admission.
+This adapter passing with bounded test schemas does NOT prove the current
+public block union or configured hosted model works. No change to public API or
+silent conversion of oneOf to anyOf was made here.
+
+### Official sources and inspected versions
+
+Checked 2026-11-16:
+
+- [OpenAI Function calling](https://developers.openai.com/api/docs/guides/function-calling): native calls/results and IDs; strict declarations and disabling parallel calls. Adopt these controls, retain WorkCrew policy guards separately.
+- [OpenAI Structured outputs](https://developers.openai.com/api/docs/guides/structured-outputs): supported subset, required fields, nullable optional fields and closed objects. Reject unsupported contracts instead of dropping their constraints.
+- Installed source: langchain-openai 1.4.1 `chat_models/base.py` bind_tools/response_format; langchain-core 1.5.3 function_calling.py strict conversion; OpenAI SDK 2.52.1 and Pydantic 2.13.4. Versions remain pinned by ai/uv.lock. No upgrade.
+
+### Verification
+
+- RED initially: missing openai_tools module. Additional negative tests observed
+  raw text escaping via an already-normalized provider error, inconsistent
+  finish metadata and double-encoded text observation before fixes.
+- Targeted new native + existing gateway/media tests: 61 PASS (28 native).
+- Includes two tests traversing the real installed LangChain/OpenAI SDK stack
+  via httpx.MockTransport: captured stateless HTTP payload, strict schemas,
+  output cap and call/result IDs; normalized provider tool call or typed final.
+  These are offline transport tests, not hosted model quality measurements.
+- make ai: lint/format PASS, pyright 0 errors, 604 passed / 3 live-provider tests
+  deselected. Core eval still exits nonzero: progressive planning 14 PASS and
+  6 DB cases NOT_RUN, other six core gates PASS; full AI gate not green.
+- make -C ai eval-retrieve separately: PASS, required_total 28, safety 0,
+  hosted NOT_RUN. No database reset or hosted smoke (reserved for Task 15).
