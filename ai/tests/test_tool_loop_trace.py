@@ -14,6 +14,14 @@ def test_authored_trace_scenarios_are_valid_but_not_runtime_evidence() -> None:
     assert len(rows) == 4
     for trace in rows:
         assert trace["evidence_origin"] == "AUTHORED_NOT_RUNTIME_CAPTURE"
+        context = trace["initial_context"]
+        assert context["project_binding"]["title"] in trace["prompt"]
+        assert context["workload_preloaded"] is False
+        snapshot = trace["events"][3]["output"]
+        assert snapshot["project_id"] == context["project_binding"]["id"]
+        workload = snapshot["workloads"][0]
+        assert workload["membership_id"] == context["member_binding"]["membership_id"]
+        assert workload["project_week_id"] == context["week_binding"]["project_week_id"]
         assert validate_tool_loop_trace(trace) == ()
 
 

@@ -114,3 +114,42 @@ Skill-version case bỏ DRAFT_READY khỏi acceptable outcomes vì yêu cầu ch
 context, không yêu cầu tạo kế hoạch. Các outcome labels khác không tự trở thành
 runtime evidence. Tất cả 60 cases ghi AUTHORED_NOT_EXECUTED; runner/model-quality
 measurement vẫn chưa có. Bộ trace riêng không thay thế nội dung corpus gốc.
+
+
+## Correction — yêu cầu người dùng phải có nghĩa khi đọc
+
+Bỏ mã giả `SAFE-12` khỏi prompt và dữ liệu hiện hành của cả 60 cases. Mỗi
+request độc lập nói rõ công việc, ví dụ đào tạo an toàn lao động, kiểm tra thiết
+bị bảo hộ hoặc tổ chức buổi thực hành sơ cứu. Các câu nối tiếp có
+`initial_context.conversation_history` Việt/Anh tương ứng; câu hỏi đang chờ có
+run/question/version trong `environment.pending_inputs`. Case UI có payload
+`verified_action` riêng, không giả làm yêu cầu chat phải route qua model.
+Tên kho, người và công ty đều là dữ liệu synthetic, không phải thông tin của
+người dùng. Giữ nguyên IDs, scenario intents, original_prompt và safety bằng 0.
+
+Case thiếu mục tiêu giờ là:
+
+> Tháng 12 tôi muốn tổ chức một buổi đào tạo cho nhân viên kho Bình Tân. Bạn giúp tôi lên kế hoạch nhé.
+
+Việc cần lập kế hoạch là tổ chức đào tạo; phần còn thiếu là chủ đề/kết quả mong
+muốn, số người và thời điểm cụ thể. Backend seed không còn giấu sẵn một dự án
+đào tạo an toàn có đầy đủ mục tiêu rồi bắt model hỏi lại: search không có
+candidate, không có read_project_context. Chấp nhận ASK_USER để làm rõ nhu cầu,
+không tự bịa chủ đề đào tạo an toàn. Case optional_budget có đủ mục tiêu và cho
+phép ước tính chi phí nên không chặn chỉ vì ngân sách chưa chốt.
+
+Case context mới có snapshot chứa nội dung đã đọc, source/version, ràng buộc và
+lịch hai nhóm, thay vì chỉ một reference. Quyền bị thu hồi trả FORBIDDEN; nguồn
+hết hạn không trả payload cũ. Conversation/snapshot không cấp quyền: runtime
+vẫn phải kiểm tra quyền thật ở mỗi boundary khi được triển khai.
+
+Cả bốn authored traces cũng dùng câu hỏi có tên dự án, người và tuần cụ thể;
+identity bindings nối Lan/project/week với các ID trong snapshot. Capacity và
+allocated hours chỉ xuất hiện trong tool result. Objective giao Assignment chỉ
+đọc workload; quyền quyết định gọi Planning tiếp vẫn ở Orchestrator.
+
+Kiểm chứng: năm assertions mới/sửa đã fail trên corpus cũ; sau sửa, 13 tests
+corpus/trace PASS. AI suite 553 passed, 3 deselected; Ruff lint/format PASS và
+pyright 0 errors. Rà diff xác nhận 60/60 prompt thay đổi, không mất ID hoặc
+original_prompt. Đây là kiểm chứng cấu trúc và tính nhất quán fixture; chưa đo
+hosted model, chưa chứng minh native driver chạy và chưa đóng full AI gate.
