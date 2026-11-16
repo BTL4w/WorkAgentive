@@ -133,6 +133,13 @@ class AssistantTurnModel(Base):
         ),
         UniqueConstraint("organization_id", "id"),
         UniqueConstraint("organization_id", "id", "actor_membership_id"),
+        UniqueConstraint(
+            "organization_id",
+            "id",
+            "conversation_id",
+            "actor_membership_id",
+            name="uq_session_turn_scope",
+        ),
         UniqueConstraint("organization_id", "user_message_id"),
         CheckConstraint("locale IN ('vi', 'en')", name="locale"),
         CheckConstraint(
@@ -234,6 +241,9 @@ class OrchestrationRunModel(Base):
         ),
         UniqueConstraint("organization_id", "id"),
         UniqueConstraint("organization_id", "turn_id"),
+        UniqueConstraint(
+            "organization_id", "id", "turn_id", "actor_membership_id", name="uq_session_run_scope"
+        ),
         CheckConstraint(
             "status IN ('QUEUED', 'RUNNING', 'AWAITING_INPUT', 'AWAITING_HUMAN', "
             "'COMPLETED', 'FAILED')",
@@ -595,6 +605,9 @@ class AssistantJobModel(Base):
         ),
         UniqueConstraint("organization_id", "id"),
         UniqueConstraint("organization_id", "orchestration_run_id", "job_type"),
+        UniqueConstraint(
+            "organization_id", "id", "orchestration_run_id", name="uq_session_job_scope"
+        ),
         CheckConstraint(
             "job_type IN ('assistant.turn.execute', 'assistant.conversation.title')",
             name="job_type",

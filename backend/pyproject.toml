@@ -31,7 +31,7 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers"
-pythonpath = ["."]
+pythonpath = [".", "../ai/tests"]
 testpaths = ["tests", "../ai/tests", "../ai/src/work_management_ai/agents"]
 markers = [
     "redis_integration: requires explicitly enabled task-owned Redis/PostgreSQL",
@@ -41,7 +41,7 @@ markers = [
 
 [tool.pyright]
 include = ["app", "tests", "../ai/src", "../ai/tests"]
-extraPaths = ["../ai/src"]
+extraPaths = ["../ai/src", "../ai/tests"]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
 venv = ".venv"

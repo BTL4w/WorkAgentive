@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import get_settings
 from app.core.database import Base, create_database_engine
-from app.modules.assistant.adapters import daily_update_usage_models
+from app.modules.assistant.adapters import daily_update_usage_models, session_models
 from app.modules.assistant.adapters import database_models as assistant_models
 from app.modules.audit.adapters import database_models as audit_models
 from app.modules.automations.adapters import database_models as automation_models
@@ -42,6 +42,7 @@ from app.modules.work.planning.assignment.adapters import database_models as tea
 from app.modules.work.planning.assignment.adapters import recommendation_models
 
 _MODEL_MODULES = (
+    session_models,
     optimization_models,
     retrieval_models,
     reporting_usage_models,

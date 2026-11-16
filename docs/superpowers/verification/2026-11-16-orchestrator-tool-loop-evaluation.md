@@ -266,3 +266,94 @@ Checked 2026-11-16:
   6 DB cases NOT_RUN, other six core gates PASS; full AI gate not green.
 - make -C ai eval-retrieve separately: PASS, required_total 28, safety 0,
   hosted NOT_RUN. No database reset or hosted smoke (reserved for Task 15).
+
+
+## Task 3 — Durable private journal and safe payload store
+
+Migration `20261116_orch_session` follows actual head `f9128a14d001` and adds:
+
+- orchestration_session_events: typed scalar/ID headers, ordered per run,
+  immutable at DB and role-grant boundaries; no arbitrary JSON metadata.
+- orchestration_session_payloads: immutable raw-context payloads, max 30 days,
+  capped by parent run retention; existing app_retention cleanup scrubs body.
+- orchestration_runtime_states: exact driver/agent/schema/prompt/catalog/model
+  pins, cursor, checkpoint payload reference and fenced lease. Checkpoint body
+  is an expiring payload, never a long-lived raw-context copy in this row.
+
+Composite keys/FKs bind tenant, run, turn, conversation, actor and lease job.
+All three tables FORCE RLS. Runtime writes use SET LOCAL ROLE app_runtime and
+current actor/tenant context; owner membership/user activity is checked again
+in application code and RLS. New source unique constraints are additive. No
+legacy row backfill or public API/SSE contract change. Explicit initialize is
+required; runs without v2 state remain legacy. Rollback keeps additive schema
+and disables candidate admission; destructive downgrade is deliberately blocked.
+
+SessionLogPort has append/read/checkpoint/claim/renew, scoped payload access and
+invocation receipt/settlement methods. Backend domain/application own their
+records/ports, services own short transactions, adapters map AI contracts and
+SQL. No provider/framework types enter backend domain and no SQL enters AI.
+Receipts are projections over immutable request/result events, not a fourth
+mutable receipt table. Event + cursor commit atomically. A DEFERRED receipt
+uses run.waiting/wait IDs, can acquire a later terminal result after restart,
+and cannot be mislabeled completed. Terminal result identity/dedupe is stable.
+Repeated identical checkpoints preserve payload ID. Reads never execute tools.
+
+Only RAW_CONTEXT payload classification is implemented here; no raw data can
+be relabeled a 90-day redacted trace. Safe operational header IDs/pins are
+separate from raw context. History projection/source permission rechecks are
+Task 5; conserved budget reservations are Task 4; business effect receipts and
+fences remain Tasks 6/9. This step does not claim exactly-once business effects.
+
+Backend test discovery/type paths now include ai/tests: the prior native fake
+imports were valid in isolated ai but failed from the integrated backend root.
+Schema inventory/head tests were updated for exactly the three new tables and
+single additive head, preserving the previous migration as direct parent.
+
+### Source research
+
+Re-inspected DSH at 39163dd30f703a79079e2d2446545cff3c453738:
+[session types](https://github.com/deepseek-ai/deepseek-harness/blob/39163dd30f703a79079e2d2446545cff3c453738/packages/core/session/src/types.ts)
+and [tool history projection](https://github.com/deepseek-ai/deepseek-harness/blob/39163dd30f703a79079e2d2446545cff3c453738/packages/core/session/src/tool-history.ts),
+2026-11-16. Adopt versioned event identities and immutable history projections;
+retain WorkCrew application ownership, authorization, PostgreSQL RLS, FK,
+fencing and bounded retention. The initially guessed session.ts path returned
+404; the source tree supplied actual types.ts/tool-history.ts paths. No DSH
+runtime/framework dependency was added.
+
+### Verification and rollout evidence
+
+All DB work used a task-owned postgres:18.4 tmpfs container on loopback 55433,
+not the normal development DB. A second fresh DB was migrated to the previous
+head, seeded with one synthetic legacy run, upgraded to the new head and
+compared by full-row SHA256: unchanged, no v2 state backfill. Fresh migration
+head check and Alembic metadata check both PASS (no drift).
+
+- Initial RED: missing session repository/recorder. Further RED cases caught
+  incomplete tool-request headers, deferred acknowledgment treated as final,
+  checkpoint retry changing payload identity, JSON null treated as expiry, and
+  raw SQL values appearing in storage errors. Corrected and tested GREEN.
+- 22 PostgreSQL integration tests PASS: 16 new journal cases plus existing
+  Assistant/identity schema cases. Covers runtime-role RLS/default deny, owner/
+  tenant/FK boundaries, immutable headers, private/public separation, membership
+  revocation, lease takeover, stale fencing, concurrent sequence conflict,
+  receipt replay, deferred completion, TTL/purge and safe storage errors.
+- Backend non-integration suite: 1560 PASS; one existing LangSmith beta warning.
+- AI: 609 PASS, 3 live-provider tests deselected; 5 new envelope tests.
+- Full make ai with RUN_POSTGRES_INTEGRATION=1 and the isolated DB: PASS,
+  including all seven core gates and retrieve evaluation (safety violations 0).
+  Without the PostgreSQL flag the six DB cases remain NOT_RUN by design.
+- Backend/AI Ruff lint/format PASS; backend pyright including AI: 0 errors.
+- No hosted model calls, model changes, candidate enablement or Task 4 work.
+
+Reproduce using a separately created disposable PostgreSQL database migrated to
+head, then from backend:
+
+```bash
+RUN_POSTGRES_INTEGRATION=1 APP_DATABASE_URL="$TASK_DATABASE_URL" uv run --locked pytest tests/test_orchestrator_session_log_integration.py tests/test_assistant_schema_integration.py tests/test_identity_schema_integration.py -q -m integration
+APP_DATABASE_URL="$TASK_DATABASE_URL" uv run --locked alembic current --check-heads
+APP_DATABASE_URL="$TASK_DATABASE_URL" uv run --locked alembic check
+```
+
+TASK_DATABASE_URL must identify that task-owned synthetic database; no reset
+commands were used. Migration runs before deploying code that consumes v2 state;
+production driver admission remains off until the later activation gates.
