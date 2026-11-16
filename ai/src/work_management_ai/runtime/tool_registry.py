@@ -4,6 +4,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
+from pydantic import BaseModel
+
+from work_management_ai.model_gateway.tool_contracts import ToolSchema
 from work_management_ai.runtime.contracts import RiskLevel
 from work_management_ai.runtime.manifests import (
     ToolManifest,
@@ -55,3 +58,27 @@ class ToolRegistry:
             return self._entries[reference]
         except KeyError as exc:
             raise ToolRegistryError("TOOL_NOT_REGISTERED") from exc
+
+    def candidate_schemas(self, references: tuple[str, ...]) -> tuple[ToolSchema, ...]:
+        """Strict typed native declarations; legacy registry parsing is unchanged."""
+        result: list[ToolSchema] = []
+        aliases: set[str] = set()
+        for reference in sorted(references):
+            registered = self.resolve(reference)
+            input_type = resolve_contract(registered.manifest.input_contract)
+            output_type = resolve_contract(registered.manifest.output_contract)
+            if not (
+                isinstance(input_type, type)
+                and issubclass(input_type, BaseModel)
+                and isinstance(output_type, type)
+                and issubclass(output_type, BaseModel)
+            ):
+                raise ToolRegistryError("TOOL_CONTRACT_INVALID")
+            schema = ToolSchema(
+                reference=reference, description=registered.manifest.name, input_contract=input_type
+            )
+            if schema.wire_name in aliases:
+                raise ToolRegistryError("TOOL_ALIAS_COLLISION")
+            aliases.add(schema.wire_name)
+            result.append(schema)
+        return tuple(result)

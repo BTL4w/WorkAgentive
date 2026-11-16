@@ -46,6 +46,10 @@ type PayloadKind = Literal[
 ]
 
 
+class InvocationStartedError(ValueError):
+    """A concurrent executor owns dispatch; rejection must not close its receipt."""
+
+
 class _Contract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, revalidate_instances="always")
 
@@ -87,6 +91,7 @@ class EventDraft(_Contract):
     schema_version: Literal["1.0"] = "1.0"
     event_id: UUID
     kind: EventKind
+    safe_code: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]{0,99}$")
     payload_ref: PayloadReference | None = None
     invocation: InvocationDescriptor | None = None
     settlement: SettledInvocation | None = None
@@ -96,6 +101,10 @@ class EventDraft(_Contract):
 
     @model_validator(mode="after")
     def invocation_shape(self) -> Self:
+        if self.safe_code is not None and (
+            self.kind != "tool.denied" or self.settlement is not None
+        ):
+            raise ValueError("DIAGNOSTIC_EVENT_INVALID")
         if (
             self.kind in {"tool.requested", "tool.completed", "tool.failed"}
             and self.invocation is None
@@ -157,6 +166,12 @@ class SessionLogPort(Protocol):
     async def get_invocation(
         self, scope: RunScope, invocation_id: UUID
     ) -> InvocationReceipt | None: ...
+    async def start_invocation(
+        self, scope: RunScope, receipt: InvocationReceipt, *, lease: RunLease
+    ) -> bool:
+        """Atomically claim first dispatch; False permits reconciliation only."""
+        ...
+
     async def settle_invocation(
         self,
         scope: RunScope,

@@ -72,7 +72,7 @@ class RunUsageService:
             return balances(await repo.usage_entries(scope))
 
     @staticmethod
-    def _entry(entries: tuple[UsageEntry, ...], operation_id: UUID) -> UsageEntry:
+    def entry(entries: tuple[UsageEntry, ...], operation_id: UUID) -> UsageEntry:
         entry = next((e for e in entries if e.operation_id == operation_id), None)
         if entry is None:
             raise SessionError("BUDGET_OPERATION_NOT_FOUND")
@@ -88,7 +88,7 @@ class RunUsageService:
     ) -> float:
         if interval_id is None:
             raise SessionError("ACTIVE_INTERVAL_REQUIRED")
-        entry = RunUsageService._entry(entries, interval_id)
+        entry = RunUsageService.entry(entries, interval_id)
         if (
             entry.kind != "INTERVAL"
             or entry.closed
@@ -163,7 +163,7 @@ class RunUsageService:
             attempt_parent = retry_of or repair_of
             attempt_kind = "RETRY" if retry_of else "REPAIR" if repair_of else None
             if attempt_parent:
-                parent = self._entry(entries, attempt_parent)
+                parent = self.entry(entries, attempt_parent)
                 cap = pool.amount["retry_per_invocation" if retry_of else "repair_per_response"]
                 if (
                     not cap
@@ -185,7 +185,7 @@ class RunUsageService:
             if allocation_id is None:
                 _, available = balances(entries)
             else:
-                allocation = self._entry(entries, allocation_id)
+                allocation = self.entry(entries, allocation_id)
                 if allocation.kind != "ALLOCATION" or allocation.closed:
                     raise SessionError("ALLOCATION_CLOSED")
                 spent = vector()
@@ -253,7 +253,7 @@ class RunUsageService:
     ) -> None:
         async with self.transaction(scope, lease) as repo:
             entries = await repo.usage_entries(scope)
-            allocation = self._entry(entries, allocation_id)
+            allocation = self.entry(entries, allocation_id)
             if allocation.kind != "ALLOCATION":
                 raise SessionError("ALLOCATION_INVALID")
             if allocation.closed:
@@ -272,7 +272,7 @@ class RunUsageService:
     ) -> None:
         async with self.transaction(scope, lease) as repo:
             entries = await repo.usage_entries(scope)
-            entry = self._entry(entries, operation_id)
+            entry = self.entry(entries, operation_id)
             if entry.fingerprint != request_fingerprint or entry.kind in {"POOL", "ALLOCATION"}:
                 raise SessionError("RESERVATION_CONFLICT")
             if entry.kind != "MODEL" and usage is not None:
@@ -312,12 +312,38 @@ class RunUsageService:
 
     @staticmethod
     async def guard_effect(
-        repo: UsageRepository, scope: SessionScope, lease: SessionLease, operation_id: UUID
+        repo: UsageRepository,
+        scope: SessionScope,
+        lease: SessionLease,
+        operation_id: UUID,
+        *,
+        interval_id: UUID | None = None,
     ) -> None:
         """Call inside the effect's application transaction, before its own policy/write."""
         await SessionService.locked(repo, scope, lease)
         entries = await repo.usage_entries(scope)
-        entry = RunUsageService._entry(entries, operation_id)
+        entry = RunUsageService.entry(entries, operation_id)
         if entry.kind not in {"TOOL", "HANDOFF"} or entry.closed:
             raise SessionError("EFFECT_RESERVATION_INVALID")
-        await RunUsageService.active(repo, entries, entry.interval_id, entry.allocation_id, lease)
+        history = await repo.events(scope, invocation_id=operation_id)
+        requested = next((r for r in history if r.event.kind == "tool.requested"), None)
+        if requested is not None:
+            started = next((r for r in history if r.event.kind == "tool.started"), None)
+            if (
+                started is None
+                or started.event.correlation_id != lease.lease_id
+                or any(
+                    r.event.settlement_status is not None or r.event.wait_id is not None
+                    for r in history
+                )
+            ):
+                raise SessionError("EFFECT_INVOCATION_INVALID")
+            if requested.event.payload_id is None or not await repo.payload_live(
+                scope, requested.event.payload_id
+            ):
+                raise SessionError("CONTEXT_EXPIRED")
+        elif interval_id is not None and interval_id != entry.interval_id:
+            raise SessionError("EFFECT_INVOCATION_INVALID")
+        await RunUsageService.active(
+            repo, entries, interval_id or entry.interval_id, entry.allocation_id, lease
+        )

@@ -85,6 +85,18 @@ class RemainingBudget(_Contract):
 
 
 class RunBudgetPort(Protocol):
+    async def recover_tool(
+        self,
+        scope: RunScope,
+        operation_id: UUID,
+        *,
+        lease: RunLease,
+        interval_id: UUID,
+        allocation_id: UUID | None,
+    ) -> BudgetReceipt:
+        """Recover a tool's original reservation without charging a resumed interval."""
+        ...
+
     async def reserve(
         self, scope: RunScope, reservation: UsageReservation, *, lease: RunLease
     ) -> BudgetReceipt: ...

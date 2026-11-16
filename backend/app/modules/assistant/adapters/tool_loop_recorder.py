@@ -23,6 +23,7 @@ from work_management_ai.runtime.session_log import (
     EventDraft,
     InvocationDescriptor,
     InvocationReceipt,
+    InvocationStartedError,
     PayloadKind,
     SessionRecord,
     SettledInvocation,
@@ -93,7 +94,7 @@ def _event(event: EventDraft) -> SessionEvent:
         resource_version=wait.resource_version if wait else None,
         policy_fingerprint=wait.policy_fingerprint if wait else None,
         source_fingerprint=wait.source_fingerprint if wait else None,
-        safe_code=settlement.safe_code if settlement else None,
+        safe_code=settlement.safe_code if settlement else event.safe_code,
         agent_run_id=event.agent_run_id,
         causation_id=event.causation_id,
         correlation_id=event.correlation_id,
@@ -255,6 +256,7 @@ class PostgreSQLToolLoopRecorder:
                 "occurred_at": value.occurred_at,
                 "event_id": event.event_id,
                 "kind": event.kind,
+                "safe_code": event.safe_code if settlement is None else None,
                 "payload_ref": ref,
                 "invocation": invocation,
                 "settlement": settlement,
@@ -333,6 +335,34 @@ class PostgreSQLToolLoopRecorder:
             settled_event_id=result.event_id if result else None,
         )
 
+    async def start_invocation(
+        self, scope: RunScope, receipt: InvocationReceipt, *, lease: RunLease
+    ) -> bool:
+        if receipt.scope != scope:
+            raise SessionError("INVOCATION_CONFLICT")
+        records = await self.read(scope, after_sequence=0)
+        original = next((r for r in records if r.event_id == receipt.requested_event_id), None)
+        if (
+            original is None
+            or original.invocation != receipt.descriptor
+            or original.payload_ref != receipt.arguments_ref
+        ):
+            raise SessionError("INVOCATION_CONFLICT")
+        event = EventDraft(
+            event_id=uuid5(receipt.descriptor.invocation_id, "started"),
+            kind="tool.started",
+            correlation_id=lease.lease_id,
+            invocation=receipt.descriptor,
+            causation_id=receipt.requested_event_id,
+        )
+        return await self.service.start_invocation(
+            self._actor,
+            session_scope(scope),
+            _event(original),
+            _event(event),
+            lease=session_lease(lease),
+        )
+
     async def settle_invocation(
         self,
         scope: RunScope,
@@ -386,11 +416,16 @@ class PostgreSQLToolLoopRecorder:
             settlement=value,
             causation_id=receipt.requested_event_id,
         )
-        result = await self.service.settle(
-            self._actor,
-            session_scope(scope),
-            original.event,
-            _event(draft),
-            lease=session_lease(lease),
-        )
+        try:
+            result = await self.service.settle(
+                self._actor,
+                session_scope(scope),
+                original.event,
+                _event(draft),
+                lease=session_lease(lease),
+            )
+        except SessionError as exc:
+            if str(exc) == "INVOCATION_ALREADY_STARTED":
+                raise InvocationStartedError("INVOCATION_ALREADY_STARTED") from None
+            raise
         return await self._record(scope, result)

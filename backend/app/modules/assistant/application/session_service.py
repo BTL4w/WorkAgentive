@@ -371,6 +371,37 @@ class SessionService:
             state = await self.locked(repo, scope, lease)
             return await self._append(repo, state, event, expected_sequence)
 
+    async def start_invocation(
+        self,
+        actor: AuthenticatedActor,
+        scope: SessionScope,
+        requested: SessionEvent,
+        event: SessionEvent,
+        *,
+        lease: SessionLease,
+    ) -> bool:
+        """One dispatch owner even for two executors sharing the current lease."""
+        async with self._transaction(actor, scope) as repo:
+            state = await self.locked(repo, scope, lease)
+            history = await repo.events(scope, invocation_id=requested.invocation_id)
+            original = next((r for r in history if r.event.kind == "tool.requested"), None)
+            if (
+                original is None
+                or original.event != requested
+                or event.kind != "tool.started"
+                or event.invocation_id != requested.invocation_id
+            ):
+                raise SessionError("INVOCATION_CONFLICT")
+            if any(
+                r.event.kind == "tool.started"
+                or r.event.settlement_status is not None
+                or r.event.wait_id is not None
+                for r in history
+            ):
+                return False
+            await self._append(repo, state, event, state.sequence)
+            return True
+
     async def read(
         self,
         actor: AuthenticatedActor,
@@ -405,6 +436,10 @@ class SessionService:
             original = next((r for r in history if r.event.kind == "tool.requested"), None)
             if original is None or original.event != requested:
                 raise SessionError("INVOCATION_CONFLICT")
+            if event.settlement_status == "REJECTED" and any(
+                r.event.kind == "tool.started" for r in history
+            ):
+                raise SessionError("INVOCATION_ALREADY_STARTED")
             existing = next(
                 (
                     r

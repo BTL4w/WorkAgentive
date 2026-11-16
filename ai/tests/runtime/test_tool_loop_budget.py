@@ -78,6 +78,18 @@ class Budget:
         self.settlements: list[ModelUsage | None] = []
         self.reject = False
 
+    async def recover_tool(
+        self,
+        scope: RunScope,
+        operation_id: UUID,
+        *,
+        lease: RunLease,
+        interval_id: UUID,
+        allocation_id: UUID | None,
+    ) -> BudgetReceipt:
+        reservation = next(r for r in self.reservations if r.operation_id == operation_id)
+        return BudgetReceipt(scope=scope, lease=lease, reservation=reservation, replayed=True)
+
     async def remaining(self, scope: RunScope) -> RemainingBudget:
         return RemainingBudget(
             usage=ToolLoopUsage(),

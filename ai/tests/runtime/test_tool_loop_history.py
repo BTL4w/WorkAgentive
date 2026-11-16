@@ -10,6 +10,7 @@ from work_management_ai.runtime.session_history import (
     HistoryLimits,
     HistoryReference,
     RevalidatedContext,
+    RevalidatedSkills,
     SessionHistory,
 )
 from work_management_ai.runtime.session_log import (
@@ -47,6 +48,11 @@ class Access:
     ) -> RevalidatedContext:
         self.calls += 1
         return RevalidatedContext(allowed=not self.revoked, references=refs)
+
+    async def revalidate_skills(
+        self, scope: RunScope, pins: tuple[VersionPin, ...]
+    ) -> RevalidatedSkills:
+        return RevalidatedSkills(allowed=not self.revoked, pins=pins)
 
 
 class Fixture:
@@ -123,6 +129,7 @@ class Fixture:
             tuple(self.records),
             checkpoint=self.checkpoint,
             access=access or self.access,
+            skill_access=self.access,
             limits=limits or HistoryLimits(),
         )
 

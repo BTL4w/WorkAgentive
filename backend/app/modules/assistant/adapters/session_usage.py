@@ -44,6 +44,47 @@ class PostgreSQLRunBudget:
     def __init__(self, sessions: async_sessionmaker[AsyncSession], actor: AuthenticatedActor):
         self.service = RunUsageService(PostgreSQLUsageTransactionFactory(sessions), actor)
 
+    async def recover_tool(
+        self,
+        scope: RunScope,
+        operation_id: UUID,
+        *,
+        lease: RunLease,
+        interval_id: UUID,
+        allocation_id: UUID | None,
+    ) -> BudgetReceipt:
+        async with self.service.transaction(session_scope(scope), session_lease(lease)) as repo:
+            entries = await repo.usage_entries(session_scope(scope))
+            entry = next((e for e in entries if e.operation_id == operation_id), None)
+            if entry is None or entry.kind not in {"TOOL", "HANDOFF"}:
+                raise SessionError("EFFECT_RESERVATION_INVALID")
+            if entry.allocation_id != allocation_id:
+                raise SessionError("BUDGET_SCOPE_MISMATCH")
+            active_seconds = await self.service.active(
+                repo,
+                entries,
+                interval_id,
+                allocation_id,
+                session_lease(lease),
+            )
+            state = await repo.state(session_scope(scope))
+            assert state is not None and state.lease is not None
+            seconds = (state.lease.expires_at - await repo.now()).total_seconds()
+            if seconds <= 0:
+                raise SessionError("LEASE_LOST")
+            return BudgetReceipt(
+                scope=scope,
+                lease=lease,
+                replayed=True,
+                seconds_remaining=min(seconds, active_seconds),
+                reservation=UsageReservation(
+                    operation_id=operation_id,
+                    kind="TOOL" if entry.kind == "TOOL" else "HANDOFF",
+                    allocation_id=entry.allocation_id,
+                    interval_id=entry.interval_id,
+                ),
+            )
+
     async def reserve(
         self, scope: RunScope, reservation: UsageReservation, *, lease: RunLease
     ) -> BudgetReceipt:

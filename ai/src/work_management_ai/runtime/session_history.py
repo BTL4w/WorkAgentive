@@ -57,6 +57,18 @@ class ContextAccessPort(Protocol):
     ) -> RevalidatedContext: ...
 
 
+class RevalidatedSkills(_Contract):
+    allowed: bool = Field(strict=True)
+    pins: tuple[VersionPin, ...]
+    fresh: bool = Field(default=True, strict=True)
+
+
+class SkillPinAccessPort(Protocol):
+    async def revalidate_skills(
+        self, scope: RunScope, pins: tuple[VersionPin, ...]
+    ) -> RevalidatedSkills: ...
+
+
 class HistoryPayloadPort(Protocol):
     async def get_payload(self, scope: RunScope, reference: PayloadReference) -> object: ...
 
@@ -80,6 +92,8 @@ class ToolArgumentsPayload(_Contract):
     kind: Literal["TOOL_ARGUMENTS"] = "TOOL_ARGUMENTS"
     arguments: dict[str, JsonValue]
     references: tuple[ContextReference, ...] = ()
+    policy_version: str | None = Field(default=None, min_length=1, max_length=128)
+    tool_fingerprint: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class ToolResultPayload(_Contract):
@@ -158,6 +172,25 @@ class SessionHistory:
         self.now = now or (lambda: datetime.now(UTC))
 
     @staticmethod
+    async def _skill_access(
+        scope: RunScope, pins: tuple[VersionPin, ...], access: SkillPinAccessPort | None
+    ) -> None:
+        if not pins:
+            return
+        if access is None:
+            raise _Stop("CONTEXT_UNAVAILABLE")
+        try:
+            verdict = RevalidatedSkills.model_validate(await access.revalidate_skills(scope, pins))
+        except Exception:
+            raise _Stop("CONTEXT_UNAVAILABLE") from None
+        if verdict.pins != pins:
+            raise _Stop("HISTORY_INVALID")
+        if not verdict.allowed:
+            raise _Stop("CONTEXT_REVOKED")
+        if not verdict.fresh:
+            raise _Stop("CONTEXT_STALE")
+
+    @staticmethod
     async def _access(
         scope: RunScope, refs: tuple[HistoryReference, ...], access: ContextAccessPort
     ) -> None:
@@ -208,6 +241,7 @@ class SessionHistory:
         limits: HistoryLimits,
         checkpoint: ToolLoopCheckpoint,
         prior_turns: tuple[PriorTurn, ...] = (),
+        skill_access: SkillPinAccessPort | None = None,
     ) -> ModelHistory:
         """Return READY only when every retained pair/payload passed current gates."""
         checkpoint = ToolLoopCheckpoint.model_validate(checkpoint)
@@ -305,6 +339,7 @@ class SessionHistory:
                     if pending_wait is not None and pending_wait != logged_wait:
                         raise _Stop("HISTORY_INVALID")
                     pending_wait = logged_wait
+            await self._skill_access(scope, checkpoint.skill_versions, skill_access)
             # context.selected is a complete selected-context snapshot, not a
             # delta. Superseded snapshots are never fetched (even after expiry).
             latest_context = max(
@@ -524,6 +559,7 @@ class SessionHistory:
             for ref in refs:
                 if ref.expires_at <= self.now():
                     raise _Stop("CONTEXT_EXPIRED", ref)
+            await self._skill_access(scope, checkpoint.skill_versions, skill_access)
             validate_history(items)
             if pending_wait is not None and pending_wait.source_invocation_id in terminals:
                 pending_wait = None

@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator,
 
 from work_management_ai.runtime.activation import WEB_CAPABILITIES, WEB_TOOLS
 from work_management_ai.runtime.contracts import AgentId, RiskLevel
+from work_management_ai.runtime.tool_loop_contracts import ToolLoopLimits
 
 _SEMANTIC_VERSION = re.compile(
     r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
@@ -206,8 +207,7 @@ def load_agent_manifest_resource(package: str, resource: str) -> AnyAgentManifes
     return adapter.validate_python(loaded)
 
 
-class SkillManifest(_ManifestModel):
-    schema_version: Literal["1.0"]
+class _SkillManifestFields(_ManifestModel):
     name: str = Field(pattern=r"^[a-z][a-z0-9_.-]*$", max_length=100)
     version: str
     owner: str = Field(min_length=1, max_length=100)
@@ -240,7 +240,7 @@ class SkillManifest(_ManifestModel):
         return _contract_path(value)
 
     @model_validator(mode="after")
-    def validate_unique_declarations(self) -> "SkillManifest":
+    def validate_unique_declarations(self) -> Self:
         declarations = (
             self.runnable_by_agents,
             self.allowed_tools,
@@ -252,6 +252,117 @@ class SkillManifest(_ManifestModel):
         )
         if any(len(values) != len(set(values)) for values in declarations):
             raise ValueError("skill manifest declarations must be unique")
+        return self
+
+
+class SkillManifest(_SkillManifestFields):
+    """Legacy skill schema and canonical fingerprint remain unchanged."""
+
+    schema_version: Literal["1.0"]
+
+
+class SkillResourceManifest(_ManifestModel):
+    id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    path: str = Field(min_length=1, max_length=200)
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    size_bytes: int = Field(ge=1, le=16384, strict=True)
+    media_type: Literal["text/plain", "text/markdown", "application/json"]
+
+    @field_validator("path")
+    @classmethod
+    def approved_relative_path(cls, value: str) -> str:
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", value)
+            or any(part in {".", ".."} for part in value.split("/"))
+            or not value.endswith((".md", ".txt", ".json"))
+        ):
+            raise ValueError("SKILL_RESOURCE_PATH_INVALID")
+        return value
+
+
+class SkillManifestV2(_SkillManifestFields):
+    schema_version: Literal["2.0"]
+    instructions: SkillResourceManifest
+    resources: tuple[SkillResourceManifest, ...] = Field(default=(), max_length=16)
+
+    @model_validator(mode="after")
+    def approved_resource_index(self) -> Self:
+        entries = (self.instructions, *self.resources)
+        if (
+            self.instructions.id != "instructions"
+            or len({v.id for v in entries}) != len(entries)
+            or len({v.path for v in entries}) != len(entries)
+        ):
+            raise ValueError("SKILL_RESOURCE_INDEX_INVALID")
+        return self
+
+
+type AnySkillManifest = Annotated[
+    SkillManifest | SkillManifestV2, Field(discriminator="schema_version")
+]
+
+
+class ToolLoopRuntimeManifest(_ManifestModel):
+    workflow: str = Field(min_length=1, max_length=100)
+    checkpoint: Literal["durable"]
+    model_policy: str = Field(min_length=1, max_length=100)
+    limits: ToolLoopLimits = Field(default_factory=ToolLoopLimits)
+
+
+class ToolLoopAgentManifest(_ManifestModel):
+    """Candidate-only schema; separate from legacy runtime attempts/budgets."""
+
+    schema_version: Literal["3.0"]
+    agent: AgentMetadata
+    capabilities: tuple[str, ...] = Field(min_length=1)
+    contracts: AgentContractManifest
+    permissions: AgentPermissionManifest
+    runtime: ToolLoopRuntimeManifest
+    allowed_skills: tuple[str, ...] = ()
+    allowed_tools: tuple[str, ...] = ()
+    approval: AgentApprovalManifest
+    fallback: AgentFallbackManifest
+    evaluators: tuple[str, ...] = Field(min_length=1)
+    stop_conditions: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def bounded_orchestrator_only(self) -> Self:
+        root_tools = {
+            "load_skill@1",
+            "delegate_agent@1",
+            "explore_projects@1",
+            "read_project_context@1",
+            "read_actor_context@1",
+            "automation.preview@1",
+        }
+        if (
+            self.agent.id is not AgentId.ORCHESTRATOR
+            or not self.agent.version.startswith("2.")
+            or self.permissions.risk_ceiling is RiskLevel.EXPLICIT_WRITE
+            or self.approval.produced_writes != "NEVER"
+            or not set(self.allowed_tools).issubset(root_tools)
+            or not set(self.capabilities).issubset(
+                {
+                    "orchestration.plan",
+                    "orchestration.delegate",
+                    "orchestration.synthesize",
+                    "orchestration.explore",
+                }
+            )
+        ):
+            raise ValueError("TOOL_LOOP_AGENT_BOUNDARY_INVALID")
+        for values in (
+            self.capabilities,
+            self.allowed_skills,
+            self.allowed_tools,
+            self.evaluators,
+            self.permissions.roles,
+            self.stop_conditions,
+        ):
+            if len(values) != len(set(values)):
+                raise ValueError("manifest declarations must be unique")
+        for reference in (*self.allowed_skills, *self.allowed_tools, *self.evaluators):
+            _versioned_reference(reference)
         return self
 
 

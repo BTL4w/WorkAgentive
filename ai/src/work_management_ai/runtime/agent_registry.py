@@ -2,13 +2,18 @@
 
 from dataclasses import dataclass
 
+from pydantic import BaseModel
+
 from work_management_ai.runtime.activation import ActivationContext, capability_enabled
 from work_management_ai.runtime.contracts import AgentId, RiskLevel
 from work_management_ai.runtime.manifests import (
     AnyAgentManifest,
     CapabilityAgentManifest,
+    SkillManifestV2,
+    ToolLoopAgentManifest,
     canonical_manifest_fingerprint,
     load_agent_manifest_resource,
+    load_yaml_resource,
     resolve_contract,
 )
 from work_management_ai.runtime.skill_registry import (
@@ -16,6 +21,7 @@ from work_management_ai.runtime.skill_registry import (
     SkillRegistry,
     SkillRegistryError,
 )
+from work_management_ai.runtime.tool_loop_contracts import VersionPin
 from work_management_ai.runtime.tool_registry import (
     RegisteredTool,
     ToolRegistry,
@@ -52,6 +58,7 @@ class AgentRegistry:
         self._tool_registry = tool_registry
         self._evaluator_ids = evaluator_ids
         self._entries: dict[tuple[AgentId, str], RegisteredAgent] = {}
+        self._tool_loop_entries: dict[str, RegisteredToolLoopAgent] = {}
 
     def register_resource(self, package: str, resource: str) -> RegisteredAgent:
         manifest = load_agent_manifest_resource(package, resource)
@@ -140,6 +147,82 @@ class AgentRegistry:
             raise AgentRegistryError("AGENT_CAPABILITY_INACTIVE")
         return registered
 
+    def register_tool_loop_resource(self, package: str, resource: str) -> "RegisteredToolLoopAgent":
+        return self.register_tool_loop(load_yaml_resource(package, resource, ToolLoopAgentManifest))
+
+    def register_tool_loop(self, manifest: ToolLoopAgentManifest) -> "RegisteredToolLoopAgent":
+        manifest = ToolLoopAgentManifest.model_validate(manifest.model_dump())
+        for path in (
+            manifest.contracts.input,
+            manifest.contracts.output,
+            manifest.contracts.handoff,
+        ):
+            try:
+                contract = resolve_contract(path)
+                if not isinstance(contract, type) or not issubclass(contract, BaseModel):
+                    raise ValueError("AGENT_CONTRACT_INVALID")
+            except (AttributeError, ImportError, ValueError):
+                raise AgentRegistryError("AGENT_CONTRACT_INVALID") from None
+        for ref in manifest.allowed_tools:
+            try:
+                tool = self._tool_registry.resolve(ref)
+                self._tool_registry.candidate_schemas((ref,))
+            except ToolRegistryError:
+                raise AgentRegistryError("AGENT_TOOL_NOT_REGISTERED") from None
+            if (
+                _RISK_ORDER[tool.manifest.risk_level]
+                > _RISK_ORDER[manifest.permissions.risk_ceiling]
+            ):
+                raise AgentRegistryError("AGENT_TOOL_RISK_INCOMPATIBLE")
+            if tool.manifest.roles and not set(manifest.permissions.roles).intersection(
+                tool.manifest.roles
+            ):
+                raise AgentRegistryError("AGENT_TOOL_ROLE_INCOMPATIBLE")
+        skill_pins: list[VersionPin] = []
+        for ref in manifest.allowed_skills:
+            try:
+                skill = self._skill_registry.resolve(ref)
+            except SkillRegistryError:
+                raise AgentRegistryError("AGENT_SKILL_NOT_REGISTERED") from None
+            skill_pins.append(
+                VersionPin(
+                    reference=ref, version=skill.manifest.version, fingerprint=skill.fingerprint
+                )
+            )
+            if not isinstance(skill.manifest, SkillManifestV2):
+                raise AgentRegistryError("AGENT_SKILL_SCHEMA_INCOMPATIBLE")
+            if manifest.agent.id not in skill.manifest.runnable_by_agents:
+                raise AgentRegistryError("AGENT_SKILL_PERMISSION_INCOMPATIBLE")
+            if (
+                _RISK_ORDER[skill.manifest.risk_level]
+                > _RISK_ORDER[manifest.permissions.risk_ceiling]
+            ):
+                raise AgentRegistryError("AGENT_SKILL_RISK_INCOMPATIBLE")
+            if not set(skill.manifest.allowed_tools).issubset(manifest.allowed_tools):
+                raise AgentRegistryError("AGENT_SKILL_TOOL_INCOMPATIBLE")
+            if not set(skill.manifest.evaluators).issubset(self._evaluator_ids):
+                raise AgentRegistryError("AGENT_SKILL_EVALUATOR_NOT_REGISTERED")
+        if not set(manifest.evaluators).issubset(self._evaluator_ids):
+            raise AgentRegistryError("AGENT_EVALUATOR_NOT_REGISTERED")
+        result = RegisteredToolLoopAgent(
+            manifest, canonical_manifest_fingerprint(manifest), tuple(skill_pins)
+        )
+        prior = self._tool_loop_entries.get(manifest.agent.version)
+        if prior is not None and prior != result:
+            raise AgentRegistryError("AGENT_VERSION_ALREADY_REGISTERED")
+        self._tool_loop_entries[manifest.agent.version] = result
+        return result
+
+    def resolve_tool_loop(
+        self, version: str, active_phase: int, *, enabled: bool = False
+    ) -> "RegisteredToolLoopAgent":
+        result = self._tool_loop_entries.get(version)
+        if result is None:
+            raise AgentRegistryError("AGENT_VERSION_NOT_REGISTERED")
+        if enabled is not True or result.manifest.agent.activation_phase > active_phase:
+            raise AgentRegistryError("AGENT_PHASE_INACTIVE")
+        return result
+
     def planning_catalog(
         self,
         *,
@@ -170,3 +253,10 @@ class AgentRegistry:
                 }
             )
         return tuple(sorted(catalog, key=lambda item: str(item["agent_id"])))
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredToolLoopAgent:
+    manifest: ToolLoopAgentManifest
+    fingerprint: str
+    skill_pins: tuple[VersionPin, ...] = ()

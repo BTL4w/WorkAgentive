@@ -202,11 +202,14 @@ class BackendToolResult(_Contract):
     output: SerializeAsAny[BaseModel] | None = None
     wait_ref: WaitReference | None = None
     evidence: tuple[ContextReference, ...] = ()
+    loaded_skill: VersionPin | None = None
 
     @model_validator(mode="after")
     def output_or_wait(self) -> Self:
         if (self.output is None) == (self.wait_ref is None):
             raise ValueError("BACKEND_RESULT_REQUIRES_OUTPUT_OR_WAIT")
+        if self.wait_ref is not None and self.loaded_skill is not None:
+            raise ValueError("LOADED_SKILL_REQUIRES_COMPLETED_READ")
         return self
 
 
