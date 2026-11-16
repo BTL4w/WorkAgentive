@@ -153,3 +153,51 @@ corpus/trace PASS. AI suite 553 passed, 3 deselected; Ruff lint/format PASS và
 pyright 0 errors. Rà diff xác nhận 60/60 prompt thay đổi, không mất ID hoặc
 original_prompt. Đây là kiểm chứng cấu trúc và tính nhất quán fixture; chưa đo
 hosted model, chưa chứng minh native driver chạy và chưa đóng full AI gate.
+
+
+## Task 1 — Native protocol và v2 state contracts
+
+Scope: contracts/mock/test fakes only. Added provider-neutral ToolSchema,
+ToolCall, ToolItem, ToolModelRequest/Response and NativeToolGateway alongside
+unchanged structured v1 API. Valid responses carry one tool_call or one typed
+final; commentary alone, multiple calls, tool+final, mismatched finish, orphan/
+duplicate/unsettled history and alias collisions fail validation. Wire alias
+`automation__preview` maps from canonical `automation.preview@1` and is not an
+alternate audit identity. Registered input contracts validate mock arguments;
+JSON schema alone is declaration metadata, not an authorization check.
+
+RunScope/RunLease, limits/usage, version pins, expiring payload/wait references,
+ToolLoopState/Checkpoint, AdmittedToolSet and typed backend outcomes are shared
+interfaces for later tasks. Checkpoint has no raw prompt/context/approval/role
+fields. Scope checks reject payload/wait references from another scope; actual
+RLS, leases, budget reservation and policy enforcement remain later work.
+PublishedResponse preserves the four existing statuses. SuspendedWorkflow has
+WORKFLOW_RESULT wait/activity/cursor and cannot claim a terminal public status.
+
+MockModelGateway.generate_step consumes independent native scripts by invocation
+key, captures deep copies of requests and exposes assert_complete. Legacy
+sequence_fixtures and native tool_sequence_fixtures have separate queues; fixtures
+and captures cannot be changed by later caller mutation. Fake clock/checkpoint
+store/backend live only in tests, not production runtime. Tests manually supply
+observations to gateway requests: no claim that a real driver generated them.
+
+Research: re-inspected [DSH agent.ts at 39163dd3](https://github.com/deepseek-ai/deepseek-harness/blob/39163dd30f703a79079e2d2446545cff3c453738/packages/core/agent-loop/src/agent.ts),
+2026-11-16. Adopt provider-neutral history and step-scoped admitted tools; adapt
+to WorkCrew one-call steps and tenant-owned contracts. No SDK/framework import,
+model change or DSH child/backend activation. A guessed adjacent types.ts URL
+returned 404 and was not used as evidence.
+
+Verification:
+
+- Initial targeted RED: missing tool_contracts module. Added fake boundary test
+  also exposed BaseModel serialization losing output fields; SerializeAsAny now
+  preserves registered typed backend output/canonical arguments.
+- Targeted native + existing gateway: 31 passed (23 new, 8 existing).
+- make ai: Ruff lint/format PASS, pyright 0 errors, unit suite 576 passed /
+  3 live-provider tests deselected. Core gate exits nonzero: progressive planning
+  has 14 PASS and 6 PostgreSQL cases NOT_RUN, same baseline gap; other six gates
+  pass. Full AI gate is not claimed green; no DB reset or hosted invocation.
+- make -C ai eval-retrieve: PASS, required_total 28, safety violations 0,
+  hosted_status NOT_RUN. Run separately because make ai stopped at core eval.
+- Diff reviewed: only Task 1 files and this verification note staged. Production
+  registration/admission, specialist implementations and v1 contracts unchanged.
