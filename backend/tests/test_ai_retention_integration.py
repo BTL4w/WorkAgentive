@@ -86,7 +86,9 @@ async def test_every_classified_copy_is_purged(report_harness: ReportHarness):
 
     from sqlalchemy import insert
 
+    from app.core.database import Base
     from app.modules.assistant.adapters import database_models as assistant
+    from app.modules.assistant.adapters import session_models as native_session
     from app.modules.feedback.adapters.payload_repository import RetentionTransactions
     from app.modules.feedback.application.retention_service import RetentionService
     from app.modules.feedback.domain.retention import PAYLOAD_FIELDS
@@ -108,7 +110,7 @@ async def test_every_classified_copy_is_purged(report_harness: ReportHarness):
     member = h.actor.membership_id
     conversation, message, turn, agent, workflow, evidence, extraction = [uuid4() for _ in range(7)]
     raw = {"private": "expired-runtime-copy"}
-    rows = [
+    rows: list[tuple[type[Base], dict[str, object]]] = [
         (
             assistant.AssistantConversationModel,
             dict(id=conversation, owner_membership_id=member, locale="en"),
@@ -337,6 +339,53 @@ async def test_every_classified_copy_is_purged(report_harness: ReportHarness):
             ),
         ),
     ]
+    # Native session context is a real additional retained copy, not an
+    # inventory exception. Seed its same-tenant/run FK chain before cleanup.
+    native_run = uuid4()
+    rows.extend(
+        [
+            (
+                assistant.OrchestrationRunModel,
+                dict(
+                    id=native_run,
+                    turn_id=turn,
+                    actor_membership_id=member,
+                    orchestrator_version="2.0.0",
+                    orchestrator_fingerprint="native-fixture",
+                    execution_plan={},
+                    budget={},
+                ),
+            ),
+            (
+                native_session.OrchestrationRuntimeStateModel,
+                dict(
+                    orchestration_run_id=native_run,
+                    conversation_id=conversation,
+                    turn_id=turn,
+                    membership_id=member,
+                    driver="tool_loop",
+                    schema_version="2.0",
+                    driver_version="2.0.0",
+                    prompt_version="tool-loop.v1",
+                    catalog_fingerprint="native-fixture",
+                    agent_version="2.0.0",
+                ),
+            ),
+            (
+                native_session.OrchestrationSessionPayloadModel,
+                dict(
+                    id=uuid4(),
+                    orchestration_run_id=native_run,
+                    kind="TOOL_RESULT",
+                    classification="RAW_CONTEXT",
+                    body=raw,
+                    fingerprint="a" * 64,
+                    created_at=now,
+                    expires_at=now + timedelta(days=1),
+                ),
+            ),
+        ]
+    )
     async with h.engine.begin() as conn:
         for model, values in rows:
             await conn.execute(insert(model).values(organization_id=org, **values))

@@ -173,6 +173,7 @@ class PostgreSQLToolLoopRecorder:
             raise SessionError("PAYLOAD_REFERENCE_MISMATCH")
 
     async def get_payload(self, scope: RunScope, reference: PayloadReference) -> JsonValue:
+        """Live scoped bytes; history must additionally revalidate resource access."""
         await self._check_reference(scope, reference)
         payload = await self.service.payload(
             self._actor, session_scope(scope), reference.payload_id
@@ -296,6 +297,7 @@ class PostgreSQLToolLoopRecorder:
         return await self._record(scope, value)
 
     async def read(self, scope: RunScope, *, after_sequence: int) -> tuple[SessionRecord, ...]:
+        """Safe headers survive expiry; never feed their payloads to a model directly."""
         values = await self.service.read(
             self._actor, session_scope(scope), after_sequence=after_sequence
         )

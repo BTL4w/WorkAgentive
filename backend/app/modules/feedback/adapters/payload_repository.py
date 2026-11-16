@@ -14,7 +14,13 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from app.core.config import get_settings
 
-from ..domain.retention import PAYLOAD_FIELDS, PayloadClass, PayloadLocator, PurgeRecord
+from ..domain.retention import (
+    PAYLOAD_FIELDS,
+    SESSION_CONTEXT_STORAGE,
+    PayloadClass,
+    PayloadLocator,
+    PurgeRecord,
+)
 from .payload_models import RetentionPayloadModel
 
 
@@ -110,6 +116,26 @@ class SQLRetentionRepository:
             kind = row["storage_kind"]
             if kind not in PAYLOAD_FIELDS:
                 raise ValueError("UNKNOWN_PAYLOAD_STORAGE")
+            if kind in {SESSION_CONTEXT_STORAGE, "orchestration_runs"}:
+                run_id = row["run_id"] if kind == SESSION_CONTEXT_STORAGE else row["owner_id"]
+                has_state = await self.session.scalar(
+                    text(
+                        "SELECT EXISTS(SELECT 1 FROM orchestration_runtime_states "
+                        "WHERE organization_id=:org AND orchestration_run_id=:run)"
+                    ),
+                    {"org": organization_id, "run": run_id},
+                )
+                if has_state:
+                    locked_run = await self.session.scalar(
+                        text(
+                            "SELECT orchestration_run_id FROM orchestration_runtime_states "
+                            "WHERE organization_id=:org AND orchestration_run_id=:run "
+                            "FOR UPDATE SKIP LOCKED"
+                        ),
+                        {"org": organization_id, "run": run_id},
+                    )
+                    if locked_run is None:
+                        continue
             if kind in {"retrieval_source_snapshots", "assistant_messages"}:
                 # Shares a transaction lock with public source consumption without
                 # granting UPDATE on immutable snapshots to the application role.
@@ -195,6 +221,22 @@ class SQLRetentionRepository:
         return PurgeRecord(locator.owner_id, fence + 1)
 
     async def _invalidate(self, locator: PayloadLocator) -> None:
+        if locator.storage_kind in {SESSION_CONTEXT_STORAGE, "orchestration_runs"}:
+            # Same cleanup transaction as scrub/tombstone. A loaded worker cannot
+            # settle budget, checkpoint or commit an effect with its old lease.
+            run_id = (
+                locator.run_id
+                if locator.storage_kind == SESSION_CONTEXT_STORAGE
+                else locator.owner_id
+            )
+            await self.session.execute(
+                text(
+                    "UPDATE orchestration_runtime_states SET fence=fence+1,"
+                    "lease_id=NULL,lease_job_id=NULL,lease_owner=NULL,lease_until=NULL "
+                    "WHERE organization_id=:org AND orchestration_run_id=:run"
+                ),
+                {"org": self.organization_id, "run": run_id},
+            )
         # Business approvals awaiting a decision keep their identity/node and manual path.
         if locator.storage_kind == "orchestration_runs":
             await self.session.execute(

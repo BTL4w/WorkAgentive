@@ -79,6 +79,7 @@ class SessionService:
             or current.expires_at <= await repo.now()
         ):
             raise SessionError("LEASE_LOST")
+        await repo.retention_deadline(scope)
         return state
 
     @staticmethod

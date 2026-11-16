@@ -418,3 +418,67 @@ are deliberately not copied); OpenClaw
 for persisted child lineage/depth. These files do not establish a shared durable
 SQL token ledger; conservation, tenant ownership and fencing here are WorkCrew
 adaptations to its approved spec.
+
+## Task 5 — Scoped model-history projection and context expiry
+
+Added `SessionHistory.project` with explicit visible payload schemas, canonical
+ordered tool-call/result pairing, exact tool/skill version pins, required current
+context and bounded optional prior user/final pairs. Child transcript bodies,
+stored system prompts/hidden fields, orphan results and incomplete calls cannot
+become provider-ready history. Pending call/wait identity is recovered before
+reading expiring bodies; reference overflow retains the active call's reference.
+No tools/model calls or LLM compaction occur while projecting history.
+
+`ContextAccessPort` is mandatory. Its trusted implementation must check payload
+liveness plus business-resource authorization, versions and freshness; returned
+reference sets are checked exactly, tenant boundaries validated and access
+rechecked before returning. No permissive production adapter was introduced.
+`context.selected` means a complete selected-context snapshot: latest snapshot
+supersedes older bodies; required canonical tool pairs are retained whole.
+Production composition/admission remains OFF pending later tasks.
+
+Session payload storage already used the retention registry from Task 3. Cleanup
+now atomically scrubs the body, invalidates the v2 lease/fence, writes the
+registry tombstone and records count-only audit/outbox evidence. Cleanup skips
+v2 runs locked by active fenced transactions. Narrow tenant-scoped grants and a
+trigger allow cleanup-role fence updates only for expired, not-yet-purged
+context; an old tombstone cannot justify another update. Safe event headers,
+usage, business approval/audit/outbox history survive. Session payloads remain
+RAW_CONTEXT-only <=30 days, capped by parent run; no redaction relabeling or
+90-day prompt store. Existing policy tests verify the redacted-trace 90-day ceiling.
+
+Validation (synthetic task-owned PostgreSQL 18.4, loopback `55435`, fresh database
+`workcrew_orch_task5_verified`; no existing app DB reset):
+
+- **21 AI history tests PASS**, covering pair identity/dedup/order, unresolved
+  calls, permission revocation including during reads, cross-tenant evidence,
+  expiry without raw replay, active waits under budget/expiry, required-pair
+  overflow, superseded context, bounded prior turns, checkpoint-only objective,
+  hidden/system/child context rejection, stale context and skill version pins.
+- **52 PostgreSQL integration tests PASS**: 7 new session-retention, 3 existing
+  retention races, 9 full retention/business-history cases, 16 session-journal
+  and 17 conserved-budget tests. The all-copy inventory fixture now seeds a real
+  native run/state/payload FK chain; inventory equality was not weakened.
+- Backend suite **1,591 PASS**, 611 deselected, one existing LangSmith beta warning.
+  Isolated `make ai` **640 PASS**, 3 hosted tests excluded; all seven core gates
+  and retrieve evaluation PASS, reported safety violations zero. Hosted quality
+  remains NOT_RUN. Suite counts overlap; they are not additive unique tests.
+- Ruff lint/format and strict Pyright PASS; fresh full upgrade reaches
+  `20261116_orch_retention`; Alembic check reports no upgrade operations. Migration
+  first, then code rollout; rollback retains additive protections and disables
+  candidate admission. No API/frontend/schema payload-copy store was added.
+
+Observed RED→GREEN failures included loaded-worker writes after purge, cleanup
+lock waits, reusing an old tombstone to fence again, child/system/hidden replay,
+omitted checkpoint objective and lost pending refs/waits on a stopped projection.
+Manual proposal approve/reject/edit paths remain covered by the existing suite.
+
+Research used official DeepSeek Harness at commit
+`39163dd30f703a79079e2d2446545cff3c453738`:
+[tool-history.ts](https://github.com/deepseek-ai/deepseek-harness/blob/39163dd30f703a79079e2d2446545cff3c453738/packages/core/session/src/tool-history.ts)
+for ordered immutable historical-tool projection and
+[types.ts](https://github.com/deepseek-ai/deepseek-harness/blob/39163dd30f703a79079e2d2446545cff3c453738/packages/core/session/src/types.ts)
+for typed sequence/session-format/recovery compatibility. WorkCrew adapts these
+patterns with its own tenant/permission/expiry/prompt-privacy and SQL fencing
+requirements; those two source files do not establish equivalent policies.
+Root `orchestrator.md` contains the code-reading guide and remains unstaged.
