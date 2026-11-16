@@ -49,12 +49,12 @@ def test_metadata_has_stable_constraint_naming_convention() -> None:
     assert NAMING_CONVENTION["fk"].startswith("fk_%(table_name)s")
 
 
-def test_alembic_environment_has_one_session_log_head() -> None:
+def test_alembic_environment_has_one_usage_head() -> None:
     backend_root = Path(__file__).resolve().parents[1]
     config = Config(backend_root / "alembic.ini")
     scripts = ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ["20261116_orch_session"]
-    revision = scripts.get_revision("20261116_orch_session")
-    assert revision is not None and revision.down_revision == "f9128a14d001"
+    assert scripts.get_heads() == ["20261116_orch_usage"]
+    revision = scripts.get_revision("20261116_orch_usage")
+    assert revision is not None and revision.down_revision == "20261116_orch_session"
     assert scripts.get_bases() == ["0001"]

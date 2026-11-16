@@ -24,6 +24,7 @@ from app.modules.assistant.adapters.session_models import (
 from app.modules.assistant.adapters.session_models import (
     OrchestrationSessionPayloadModel as PayloadRow,
 )
+from app.modules.assistant.adapters.session_usage_models import OrchestrationUsageModel
 from app.modules.assistant.adapters.transaction import PostgreSQLAssistantTransactionFactory
 from app.modules.assistant.domain.session import (
     RuntimeState,
@@ -35,6 +36,7 @@ from app.modules.assistant.domain.session import (
     SessionScope,
     StoredSessionEvent,
 )
+from app.modules.assistant.domain.session_usage import POOL_ID
 from app.modules.feedback.adapters.payload_models import RetentionPayloadModel
 from app.modules.feedback.adapters.payload_repository import live_payload
 from app.modules.identity.adapters.database_models import UserModel
@@ -117,6 +119,24 @@ class PostgreSQLSessionRepository:
 
     async def create_state(self, state: RuntimeState) -> None:
         self.session.add(StateRow(**asdict(state.scope), **asdict(state.pins)))
+        await self.session.flush()
+
+    async def initialize_budget(self, scope: SessionScope, limits: dict[str, int]) -> None:
+        from app.modules.assistant.application.session_service import fingerprint
+
+        self.session.add(
+            OrchestrationUsageModel(
+                organization_id=scope.organization_id,
+                orchestration_run_id=scope.orchestration_run_id,
+                operation_id=POOL_ID,
+                kind="POOL",
+                amount=limits,
+                fingerprint=fingerprint(limits),
+                fence=0,
+                started_at=await self.now(),
+                closed=False,
+            )
+        )
         await self.session.flush()
 
     async def save_state(self, state: RuntimeState) -> None:

@@ -25,6 +25,7 @@ from app.modules.assistant.domain.session import (
     SessionScope,
     StoredSessionEvent,
 )
+from app.modules.assistant.domain.session_usage import limits_from_checkpoint
 from app.modules.identity.domain.auth import AuthenticatedActor
 
 
@@ -63,7 +64,7 @@ class SessionService:
             await tx.commit()
 
     @staticmethod
-    async def _locked(
+    async def locked(
         repo: SessionRepository, scope: SessionScope, lease: SessionLease
     ) -> RuntimeState:
         state = await repo.state(scope, lock=True)
@@ -194,6 +195,7 @@ class SessionService:
         self, actor: AuthenticatedActor, scope: SessionScope, pins: SessionPins, body: object
     ) -> None:
         self._checkpoint_body(body, scope, pins, 0)
+        limits = limits_from_checkpoint(body)
         async with self._transaction(actor, scope) as repo:
             await repo.authorize(scope, actor, lock=True)
             existing = await repo.state(scope, lock=True)
@@ -203,6 +205,7 @@ class SessionService:
                 return
             state = RuntimeState(scope, pins)
             await repo.create_state(state)
+            await repo.initialize_budget(scope, limits)
             payload = await self._put(repo, scope, body, "CHECKPOINT", None)
             await repo.save_state(replace(state, checkpoint_payload_id=payload.id))
 
@@ -257,7 +260,7 @@ class SessionService:
     ) -> SessionLease:
         self._lease_options(lease.worker_id, lease_seconds)
         async with self._transaction(actor, scope) as repo:
-            state = await self._locked(repo, scope, lease)
+            state = await self.locked(repo, scope, lease)
             renewed = replace(lease, expires_at=await repo.now() + timedelta(seconds=lease_seconds))
             await repo.save_state(replace(state, lease=renewed))
             return renewed
@@ -273,7 +276,7 @@ class SessionService:
         ttl_seconds: int | None = None,
     ) -> SessionPayload:
         async with self._transaction(actor, scope) as repo:
-            await self._locked(repo, scope, lease)
+            await self.locked(repo, scope, lease)
             return await self._put(repo, scope, body, kind, ttl_seconds)
 
     async def payload(
@@ -305,7 +308,7 @@ class SessionService:
     ) -> None:
         self._checkpoint_body(body, scope, pins, sequence)
         async with self._transaction(actor, scope) as repo:
-            state = await self._locked(repo, scope, lease)
+            state = await self.locked(repo, scope, lease)
             if pins != state.pins:
                 raise SessionError("PIN_CONFLICT")
             if sequence != state.sequence or sequence < state.checkpoint_sequence:
@@ -364,7 +367,7 @@ class SessionService:
         if event.settlement_status is not None or event.wait_id is not None:
             raise SessionError("USE_SETTLE_INVOCATION")
         async with self._transaction(actor, scope) as repo:
-            state = await self._locked(repo, scope, lease)
+            state = await self.locked(repo, scope, lease)
             return await self._append(repo, state, event, expected_sequence)
 
     async def read(
@@ -390,7 +393,7 @@ class SessionService:
         lease: SessionLease,
     ) -> StoredSessionEvent:
         async with self._transaction(actor, scope) as repo:
-            state = await self._locked(repo, scope, lease)
+            state = await self.locked(repo, scope, lease)
             if (
                 requested.invocation_id is None
                 or event.invocation_id != requested.invocation_id

@@ -357,3 +357,64 @@ APP_DATABASE_URL="$TASK_DATABASE_URL" uv run --locked alembic check
 TASK_DATABASE_URL must identify that task-owned synthetic database; no reset
 commands were used. Migration runs before deploying code that consumes v2 state;
 production driver admission remains off until the later activation gates.
+
+## Task 4 — Conserved run budgets and fenced admission
+
+Implemented one PostgreSQL usage ledger with immutable pool/reservation identity,
+child allocations drawn from the parent pool, idempotent settlement and lease
+checks under the session runtime row lock. Initial budget and initial checkpoint
+commit atomically. Legacy pre-ledger sessions fail closed without backfill or a
+fresh grant. Provider wrappers cover native and structured calls only inside a
+runtime-owned candidate binding; production admission and configured models stay
+unchanged. Recording `tool.requested` charges a tool/handoff reservation before
+appending the event inside that binding.
+
+Limits remain 8 root/24 total model requests, 12 tools, 6 handoffs, 48,000/8,000
+tokens, 4 segments, 180 seconds per executing worker interval and 720 active
+seconds shared by all workers. Child intervals count toward those same four
+segments. Unknown usage and lost-worker time retain conservative reservations.
+Closing an allocation returns unused holds without charging child usage twice.
+Explicit retry/repair lineage is bounded once per base attempt; later driver and
+Specialist integration must supply that lineage. No hidden SDK retries are added.
+
+Validation on task-owned PostgreSQL 18.4 (`127.0.0.1:55434`,
+`workcrew_orch_task4_fresh`, synthetic tmpfs data; no app DB reset):
+
+- AI budget wrapper: **10 passed**, including pre-provider denial, schema/framing
+  allowance, native/legacy behavior, unknown/oversized usage, replay, invalid
+  timeout and missing media bound. Invalid timeout was observed RED then GREEN.
+- PostgreSQL: **39 passed** = 17 Task 4 + 16 session log + 6 existing schema tests.
+  Covers all counter ceilings, concurrent token reservations, persisted usage,
+  child allocation conservation/resume, retry/repair limits, pending interval
+  close rejection, active time/waits, stale lease, expiry before commit, real
+  provider capture stopped at eight requests, tenant/RLS and foreign-allocation
+  composite FK rejection. Expiry-before-commit was observed RED then GREEN;
+  the synthetic SQL effect rolls back.
+- Backend non-integration suite: **1,570 passed**, 604 deselected; one existing
+  LangSmith beta warning. Isolated `make ai`: **619 passed**, 3 hosted cases
+  deselected; all seven core gates and retrieve evaluation PASS with PostgreSQL
+  opt-in. Existing synthetic negative cases are not hosted-model accuracy.
+- Ruff lint/format and strict Pyright pass across backend/AI. Fresh full migration
+  succeeds through `20261116_orch_usage`; Alembic detects no upgrade operations.
+  Migration is additive and forward-only; ordinary rollback retains the schema
+  and disables candidate. Application role has FORCE RLS/no BYPASSRLS, cannot
+  change reservation identity, delete the ledger or rewrite settled entries.
+
+The effect guard is an application-transaction boundary, not permission or
+approval. Business services must additionally enforce their authorization,
+approval/version/idempotency/outbox/audit in that same transaction. Task 6/10
+must integrate the guards and interval/receipt lifecycle; this task does not
+claim production tool-loop execution or business E2E behavior. Hosted calls were
+not run. Root `orchestrator.md` contains the learning guide and remains unstaged
+as requested.
+
+Source comparison used exact revisions: DSH agent-loop `agent.ts` at
+[`39163dd30f703a79079e2d2446545cff3c453738`](https://github.com/deepseek-ai/deepseek-harness/blob/39163dd30f703a79079e2d2446545cff3c453738/packages/core/agent-loop/src/agent.ts)
+for step/session/admission boundaries; Hermes
+[`0309b005235ba6f7c4d6f8518411aabd00dbf346`](https://github.com/NousResearch/hermes-agent/blob/0309b005235ba6f7c4d6f8518411aabd00dbf346/agent/iteration_budget.py)
+for lock-protected per-agent consume/refund counters (independent child budgets
+are deliberately not copied); OpenClaw
+[`96ad377596cac884a558cb94a9888aa197f07078`](https://github.com/openclaw/openclaw/blob/96ad377596cac884a558cb94a9888aa197f07078/src/agents/subagents/spawn/subagent-depth-policy.ts)
+for persisted child lineage/depth. These files do not establish a shared durable
+SQL token ledger; conservation, tenant ownership and fencing here are WorkCrew
+adaptations to its approved spec.

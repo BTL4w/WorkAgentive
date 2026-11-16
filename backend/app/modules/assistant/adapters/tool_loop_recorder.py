@@ -18,6 +18,7 @@ from app.modules.assistant.domain.session import (
 )
 from app.modules.identity.domain.auth import AuthenticatedActor
 from work_management_ai.runtime.contracts import JsonValue
+from work_management_ai.runtime.run_budget import UsageReservation, current_candidate_budget
 from work_management_ai.runtime.session_log import (
     EventDraft,
     InvocationDescriptor,
@@ -35,13 +36,13 @@ from work_management_ai.runtime.tool_loop_contracts import (
 )
 
 
-def _scope(scope: RunScope) -> SessionScope:
+def session_scope(scope: RunScope) -> SessionScope:
     return SessionScope(**scope.model_dump())
 
 
-def _lease(lease: RunLease) -> SessionLease:
+def session_lease(lease: RunLease) -> SessionLease:
     return SessionLease(
-        _scope(lease.scope),
+        session_scope(lease.scope),
         lease.lease_id,
         lease.job_id,
         lease.worker_id,
@@ -117,7 +118,7 @@ class PostgreSQLToolLoopRecorder:
         if state.scope != scope:
             raise SessionError("CHECKPOINT_SCOPE_MISMATCH")
         await self.service.initialize(
-            self._actor, _scope(scope), _pins(state), state.model_dump(mode="json")
+            self._actor, session_scope(scope), _pins(state), state.model_dump(mode="json")
         )
 
     async def claim(
@@ -125,7 +126,7 @@ class PostgreSQLToolLoopRecorder:
     ) -> RunLease:
         value = await self.service.claim(
             self._actor,
-            _scope(scope),
+            session_scope(scope),
             job_id=job_id,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
@@ -134,7 +135,7 @@ class PostgreSQLToolLoopRecorder:
 
     async def renew(self, scope: RunScope, lease: RunLease, *, lease_seconds: int) -> RunLease:
         value = await self.service.renew(
-            self._actor, _scope(scope), _lease(lease), lease_seconds=lease_seconds
+            self._actor, session_scope(scope), session_lease(lease), lease_seconds=lease_seconds
         )
         return RunLease.model_validate({**asdict(value), "scope": scope})
 
@@ -153,10 +154,10 @@ class PostgreSQLToolLoopRecorder:
         body = TypeAdapter[JsonValue](JsonValue).validate_python(body)
         value = await self.service.put_payload(
             self._actor,
-            _scope(scope),
+            session_scope(scope),
             body,
             kind=kind,
-            lease=_lease(lease),
+            lease=session_lease(lease),
             ttl_seconds=ttl_seconds,
         )
         return _reference(value)
@@ -166,14 +167,16 @@ class PostgreSQLToolLoopRecorder:
         if reference.organization_id != scope.organization_id:
             raise SessionError("SESSION_NOT_FOUND")
         metadata = await self.service.payload(
-            self._actor, _scope(scope), reference.payload_id, live=False
+            self._actor, session_scope(scope), reference.payload_id, live=False
         )
         if _reference(metadata) != reference:
             raise SessionError("PAYLOAD_REFERENCE_MISMATCH")
 
     async def get_payload(self, scope: RunScope, reference: PayloadReference) -> JsonValue:
         await self._check_reference(scope, reference)
-        payload = await self.service.payload(self._actor, _scope(scope), reference.payload_id)
+        payload = await self.service.payload(
+            self._actor, session_scope(scope), reference.payload_id
+        )
         return cast(JsonValue, payload.body)
 
     async def checkpoint(
@@ -188,16 +191,16 @@ class PostgreSQLToolLoopRecorder:
                 await self._check_reference(scope, ref)
         await self.service.checkpoint(
             self._actor,
-            _scope(scope),
+            session_scope(scope),
             _pins(state),
             state.model_dump(mode="json"),
             state.sequence,
-            lease=_lease(lease),
+            lease=session_lease(lease),
             references=tuple(ref.payload_id for ref in refs if ref is not None),
         )
 
     async def load_checkpoint(self, scope: RunScope) -> ToolLoopCheckpoint | None:
-        value = await self.service.load_checkpoint(self._actor, _scope(scope))
+        value = await self.service.load_checkpoint(self._actor, session_scope(scope))
         return None if value is None else ToolLoopCheckpoint.model_validate(value.body)
 
     async def _record(self, scope: RunScope, value: StoredSessionEvent) -> SessionRecord:
@@ -205,7 +208,9 @@ class PostgreSQLToolLoopRecorder:
         ref = None
         if event.payload_id is not None:
             ref = _reference(
-                await self.service.payload(self._actor, _scope(scope), event.payload_id, live=False)
+                await self.service.payload(
+                    self._actor, session_scope(scope), event.payload_id, live=False
+                )
             )
         invocation = None
         if event.invocation_id is not None:
@@ -264,24 +269,43 @@ class PostgreSQLToolLoopRecorder:
         event = EventDraft.model_validate(event)
         if event.payload_ref is not None:
             await self._check_reference(scope, event.payload_ref)
+        binding = current_candidate_budget()
+        if binding is not None and event.kind == "tool.requested":
+            if binding.scope != scope or binding.lease != lease:
+                raise SessionError("BUDGET_SCOPE_MISMATCH")
+            assert event.invocation is not None
+            await binding.store.reserve(
+                scope,
+                UsageReservation(
+                    operation_id=event.invocation.invocation_id,
+                    kind="HANDOFF"
+                    if event.invocation.tool_reference.rsplit("@", 1)[0] == "delegate_agent"
+                    else "TOOL",
+                    allocation_id=binding.allocation_id,
+                    interval_id=binding.interval_id,
+                ),
+                lease=lease,
+            )
         value = await self.service.append(
             self._actor,
-            _scope(scope),
+            session_scope(scope),
             _event(event),
             expected_sequence=expected_sequence,
-            lease=_lease(lease),
+            lease=session_lease(lease),
         )
         return await self._record(scope, value)
 
     async def read(self, scope: RunScope, *, after_sequence: int) -> tuple[SessionRecord, ...]:
-        values = await self.service.read(self._actor, _scope(scope), after_sequence=after_sequence)
+        values = await self.service.read(
+            self._actor, session_scope(scope), after_sequence=after_sequence
+        )
         return tuple([await self._record(scope, value) for value in values])
 
     async def get_invocation(
         self, scope: RunScope, invocation_id: UUID
     ) -> InvocationReceipt | None:
         values = await self.service.read(
-            self._actor, _scope(scope), after_sequence=0, invocation_id=invocation_id
+            self._actor, session_scope(scope), after_sequence=0, invocation_id=invocation_id
         )
         requested = next((v for v in values if v.event.kind == "tool.requested"), None)
         if requested is None:
@@ -328,7 +352,7 @@ class PostgreSQLToolLoopRecorder:
             await self._check_reference(scope, value.payload_ref)
         records = await self.service.read(
             self._actor,
-            _scope(scope),
+            session_scope(scope),
             after_sequence=0,
             invocation_id=receipt.descriptor.invocation_id,
         )
@@ -361,6 +385,10 @@ class PostgreSQLToolLoopRecorder:
             causation_id=receipt.requested_event_id,
         )
         result = await self.service.settle(
-            self._actor, _scope(scope), original.event, _event(draft), lease=_lease(lease)
+            self._actor,
+            session_scope(scope),
+            original.event,
+            _event(draft),
+            lease=session_lease(lease),
         )
         return await self._record(scope, result)

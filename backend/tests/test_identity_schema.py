@@ -4,7 +4,7 @@ from sqlalchemy import ForeignKeyConstraint, UniqueConstraint
 
 from app.core.database import Base
 from app.modules.assistant.adapters import database_models as assistant_models
-from app.modules.assistant.adapters import session_models
+from app.modules.assistant.adapters import session_models, session_usage_models
 from app.modules.audit.adapters import database_models as audit_models
 from app.modules.automations.adapters import database_models as automation_models
 from app.modules.automations.adapters import delivery_models
@@ -25,6 +25,7 @@ from app.modules.work.adapters import database_models as work_models
 
 _MODEL_MODULES = (
     session_models,
+    session_usage_models,
     reporting_models,
     feedback_models,
     automation_models,
@@ -47,6 +48,7 @@ _MODEL_MODULES = (
 def test_active_phase_tables_are_registered() -> None:
     assert set(Base.metadata.tables) == {
         "orchestration_runtime_states",
+        "orchestration_usage",
         "orchestration_session_events",
         "orchestration_session_payloads",
         "planning_drafts",
