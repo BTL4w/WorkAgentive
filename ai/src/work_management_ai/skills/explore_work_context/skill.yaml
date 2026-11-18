@@ -1,6 +1,6 @@
 schema_version: "2.0"
 name: explore_work_context
-version: "1.0.1"
+version: "1.0.2"
 owner: ai-runtime
 # Compatibility mirror of explore-work-context/SKILL.md frontmatter.
 description: "Discover permission-scoped Projects or current-actor facts when that context is needed to continue a request."
@@ -10,7 +10,31 @@ risk_level: READ_ONLY
 input_contract: work_management_ai.skills.explore_work_context.contracts.ExploreWorkContextInput
 output_contract: work_management_ai.skills.explore_work_context.contracts.ExploreWorkContextOutput
 evaluators: [context_exploration@1]
-evaluation_cases: [context_hello_en@1, context_hello_vi@1, context_unique@1, context_ambiguous@1, context_partial_stale@1, context_injection@1]
+evaluation_cases:
+  - context_hello_vi@1
+  - context_hello_en@1
+  - context_mixed_vi@1
+  - context_mixed_en@1
+  - context_unique_vi@1
+  - context_unique_en@1
+  - context_ambiguous_vi@1
+  - context_ambiguous_en@1
+  - context_missing_vi@1
+  - context_missing_en@1
+  - context_partial_vi@1
+  - context_partial_en@1
+  - context_stale_vi@1
+  - context_stale_en@1
+  - context_injection_vi@1
+  - context_injection_en@1
+  - context_unsupported_vi@1
+  - context_unsupported_en@1
+  - context_overflow_vi@1
+  - context_overflow_en@1
+  - context_cross_scope_vi@1
+  - context_cross_scope_en@1
+  - context_actor_vi@1
+  - context_actor_en@1
 triggers: ["vi:thiếu context Project hoặc current actor", "en:missing Project or current-actor context"]
 required_context: [authenticated_actor, activated_tool_catalog, current_objective, remaining_budget]
 approval: NONE

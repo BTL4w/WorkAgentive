@@ -1,5 +1,6 @@
 """Validated exact-version Agent registry."""
 
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 
 from pydantic import BaseModel
@@ -33,6 +34,9 @@ class AgentRegistryError(ValueError):
     pass
 
 
+type CandidateEvaluator = Callable[[], Awaitable[object]]
+
+
 _RISK_ORDER = {
     RiskLevel.READ_ONLY: 0,
     RiskLevel.PROPOSAL_ONLY: 1,
@@ -53,10 +57,12 @@ class AgentRegistry:
         skill_registry: SkillRegistry,
         tool_registry: ToolRegistry,
         evaluator_ids: frozenset[str],
+        evaluator_bindings: Mapping[str, CandidateEvaluator] | None = None,
     ) -> None:
         self._skill_registry = skill_registry
         self._tool_registry = tool_registry
         self._evaluator_ids = evaluator_ids
+        self._evaluator_bindings = dict(evaluator_bindings or {})
         self._entries: dict[tuple[AgentId, str], RegisteredAgent] = {}
         self._tool_loop_entries: dict[str, RegisteredToolLoopAgent] = {}
 
@@ -150,6 +156,12 @@ class AgentRegistry:
     def register_tool_loop_resource(self, package: str, resource: str) -> "RegisteredToolLoopAgent":
         return self.register_tool_loop(load_yaml_resource(package, resource, ToolLoopAgentManifest))
 
+    def resolve_candidate_evaluator(self, reference: str) -> CandidateEvaluator:
+        evaluator = self._evaluator_bindings.get(reference)
+        if evaluator is None or not callable(evaluator):
+            raise AgentRegistryError("AGENT_EVALUATOR_NOT_REGISTERED")
+        return evaluator
+
     def register_tool_loop(self, manifest: ToolLoopAgentManifest) -> "RegisteredToolLoopAgent":
         manifest = ToolLoopAgentManifest.model_validate(manifest.model_dump())
         for path in (
@@ -206,10 +218,13 @@ class AgentRegistry:
                 raise AgentRegistryError("AGENT_SKILL_RISK_INCOMPATIBLE")
             if not set(skill.manifest.allowed_tools).issubset(manifest.allowed_tools):
                 raise AgentRegistryError("AGENT_SKILL_TOOL_INCOMPATIBLE")
-            if not set(skill.manifest.evaluators).issubset(self._evaluator_ids):
-                raise AgentRegistryError("AGENT_SKILL_EVALUATOR_NOT_REGISTERED")
-        if not set(manifest.evaluators).issubset(self._evaluator_ids):
-            raise AgentRegistryError("AGENT_EVALUATOR_NOT_REGISTERED")
+            for evaluator in skill.manifest.evaluators:
+                try:
+                    self.resolve_candidate_evaluator(evaluator)
+                except AgentRegistryError:
+                    raise AgentRegistryError("AGENT_SKILL_EVALUATOR_NOT_REGISTERED") from None
+        for evaluator in manifest.evaluators:
+            self.resolve_candidate_evaluator(evaluator)
         result = RegisteredToolLoopAgent(
             manifest, canonical_manifest_fingerprint(manifest), tuple(skill_pins), tool_pins
         )

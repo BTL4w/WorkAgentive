@@ -521,3 +521,43 @@ def _registry_manifest_dict() -> dict[str, object]:
     loaded = yaml.safe_load(_agent_manifest_yaml())
     assert isinstance(loaded, dict)
     return cast(dict[str, object], loaded)
+
+
+@pytest.mark.asyncio
+async def test_candidate_requires_callable_bindings_instead_of_legacy_ids() -> None:
+    from work_management_ai.evaluation.context_exploration import (
+        CONTEXT_EXPLORATION_EVALUATORS,
+        TOOL_RESOURCES,
+        evaluate_context_exploration,
+    )
+
+    from .catalog_fakes import FIXTURE_EVALUATOR_BINDINGS, candidate_manifest
+
+    skill_registry = SkillRegistry.from_resources(
+        (("work_management_ai.skills.explore_work_context", "skill.yaml"),)
+    )
+    tools = ToolRegistry.from_resources(TOOL_RESOURCES)
+    ids = frozenset({"orchestrator_plan@1", "context_exploration@1"})
+    manifest = candidate_manifest(
+        tools=("explore_projects@1", "read_project_context@1", "read_actor_context@1"),
+        skills=("explore_work_context@1",),
+    )
+    registry = AgentRegistry(
+        skill_registry=skill_registry,
+        tool_registry=tools,
+        evaluator_ids=ids,
+        evaluator_bindings=FIXTURE_EVALUATOR_BINDINGS,
+    )
+    with pytest.raises(AgentRegistryError, match="AGENT_SKILL_EVALUATOR_NOT_REGISTERED"):
+        registry.register_tool_loop(manifest)
+    registry = AgentRegistry(
+        skill_registry=skill_registry,
+        tool_registry=tools,
+        evaluator_ids=ids,
+        evaluator_bindings={**FIXTURE_EVALUATOR_BINDINGS, **CONTEXT_EXPLORATION_EVALUATORS},
+    )
+    registry.register_tool_loop(manifest)
+    resolved = registry.resolve_candidate_evaluator("context_exploration@1")
+    assert resolved is evaluate_context_exploration
+    report = await evaluate_context_exploration()
+    assert report.passed

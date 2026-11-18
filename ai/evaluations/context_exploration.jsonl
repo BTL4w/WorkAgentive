@@ -1,0 +1,24 @@
+{"case_id": "context_hello_vi@1", "locale": "vi", "scenario": "hello", "request": "Chào bạn!", "applicability": {"expected": "SKIP", "guidance": "Không dùng cho lời chào, cảm ơn riêng lẻ, câu trả lời tự chứa hoặc facts đã đủ và fresh."}}
+{"case_id": "context_hello_en@1", "locale": "en", "scenario": "hello", "request": "Hello!", "applicability": {"expected": "SKIP", "guidance": "Skip standalone hello/thanks, self-contained answers and sufficient fresh known facts."}}
+{"case_id": "context_mixed_vi@1", "locale": "vi", "scenario": "mixed", "request": "Chào, tìm giúp tôi dự án Atlas.", "applicability": {"expected": "USE", "guidance": "vi: Dùng khi objective cần tìm đúng Project hoặc context Project/current actor còn thiếu."}}
+{"case_id": "context_mixed_en@1", "locale": "en", "scenario": "mixed", "request": "Hi, help me find the Atlas project.", "applicability": {"expected": "USE", "guidance": "en: Use when the objective needs Project resolution or missing Project/current-actor context."}}
+{"case_id": "context_unique_vi@1", "locale": "vi", "scenario": "unique", "request": "Cho tôi xem dự án Atlas."}
+{"case_id": "context_unique_en@1", "locale": "en", "scenario": "unique", "request": "Show me the Atlas project."}
+{"case_id": "context_ambiguous_vi@1", "locale": "vi", "scenario": "ambiguous", "request": "Tôi muốn xem tổng quan dự án Atlas."}
+{"case_id": "context_ambiguous_en@1", "locale": "en", "scenario": "ambiguous", "request": "Show me an overview of Atlas."}
+{"case_id": "context_missing_vi@1", "locale": "vi", "scenario": "missing", "request": "Có dự án Atlas nào tôi xem được không?"}
+{"case_id": "context_missing_en@1", "locale": "en", "scenario": "missing", "request": "Is there an Atlas project I can see?"}
+{"case_id": "context_partial_vi@1", "locale": "vi", "scenario": "partial", "request": "Tìm giúp tôi dự án Atlas."}
+{"case_id": "context_partial_en@1", "locale": "en", "scenario": "partial", "request": "Find the Atlas project for me."}
+{"case_id": "context_stale_vi@1", "locale": "vi", "scenario": "stale", "request": "Tôi có thể dùng kết quả về Atlas vừa xem không?"}
+{"case_id": "context_stale_en@1", "locale": "en", "scenario": "stale", "request": "Can I use the Atlas result I just saw?"}
+{"case_id": "context_injection_vi@1", "locale": "vi", "scenario": "injection", "request": "Đọc phần mô tả của Atlas giúp tôi."}
+{"case_id": "context_injection_en@1", "locale": "en", "scenario": "injection", "request": "Read the Atlas project description."}
+{"case_id": "context_unsupported_vi@1", "locale": "vi", "scenario": "unsupported", "request": "Cho tôi xem tổng quan và phần dự báo của Atlas."}
+{"case_id": "context_unsupported_en@1", "locale": "en", "scenario": "unsupported", "request": "Show the Atlas overview and forecast."}
+{"case_id": "context_overflow_vi@1", "locale": "vi", "scenario": "overflow", "request": "Tổng hợp các kết quả tìm dự án Atlas."}
+{"case_id": "context_overflow_en@1", "locale": "en", "scenario": "overflow", "request": "Summarize the Atlas project search results."}
+{"case_id": "context_cross_scope_vi@1", "locale": "vi", "scenario": "cross_scope", "request": "Dự án Atlas tôi được phép xem là dự án nào?"}
+{"case_id": "context_cross_scope_en@1", "locale": "en", "scenario": "cross_scope", "request": "Which Atlas project may I access?"}
+{"case_id": "context_actor_vi@1", "locale": "vi", "scenario": "actor", "request": "Tôi xuất hiện với tên gì trong hệ thống?"}
+{"case_id": "context_actor_en@1", "locale": "en", "scenario": "actor", "request": "What name am I signed in as?"}

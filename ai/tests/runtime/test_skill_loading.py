@@ -20,7 +20,7 @@ from work_management_ai.runtime.skill_loading import (
 from work_management_ai.runtime.skill_registry import SkillRegistry
 from work_management_ai.tools.skills.contracts import LoadSkillInput
 
-from .catalog_fakes import CatalogFixture
+from .catalog_fakes import FIXTURE_EVALUATOR_BINDINGS, CatalogFixture
 
 
 class CountingResources(ApprovedPackageResources):
@@ -607,6 +607,7 @@ def test_catalog_and_first_load_pin_approved_skill_dependency(
         skill_registry=replacement,
         tool_registry=f.tools,
         evaluator_ids=frozenset({"orchestrator_plan@1", "fixture@1"}),
+        evaluator_bindings=FIXTURE_EVALUATOR_BINDINGS,
     )
     agent = registry.register_tool_loop(f.agent.manifest)
     changed = ToolCatalog(agent=agent, tools=f.tools, access=f.access, readiness=f.readiness)

@@ -16,6 +16,7 @@ WORKDIR /workspace/ai
 COPY pyproject.toml uv.lock ./
 COPY src ./src
 COPY tests ./tests
+COPY evaluations ./evaluations
 
 RUN uv sync --locked
 

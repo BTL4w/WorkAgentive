@@ -19,7 +19,7 @@ from work_management_ai.runtime.tool_catalog import ToolCatalog, ToolCatalogErro
 from work_management_ai.runtime.tool_registry import ToolRegistry, ToolRegistryError
 from work_management_ai.tools.context import contracts as context_contracts
 
-from .catalog_fakes import CatalogFixture, candidate_manifest, load_tool
+from .catalog_fakes import FIXTURE_EVALUATOR_BINDINGS, CatalogFixture, candidate_manifest, load_tool
 
 
 def test_stable_metadata_schema_copy_and_closed_selection():
@@ -218,6 +218,7 @@ def test_candidate_rejects_three_attempt_tool_policy():
         skill_registry=f.skills,
         tool_registry=tools,
         evaluator_ids=frozenset({"orchestrator_plan@1"}),
+        evaluator_bindings=FIXTURE_EVALUATOR_BINDINGS,
     ).register_tool_loop(f.agent.manifest)
     catalog = ToolCatalog(agent=agent, tools=tools, access=f.access, readiness=f.readiness)
     with pytest.raises(ToolCatalogError, match="TOOL_CATALOG_INCOMPATIBLE"):

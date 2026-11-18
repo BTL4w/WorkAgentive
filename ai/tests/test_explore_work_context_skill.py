@@ -61,6 +61,6 @@ def test_read_tool_manifests_register_typed_read_only_surface():
     entry = SkillRegistry.from_resources(
         (("work_management_ai.skills.explore_work_context", "skill.yaml"),)
     ).resolve("explore_work_context@1")
-    assert entry.manifest.version == "1.0.1"
+    assert entry.manifest.version == "1.0.2"
     assert entry.bundle is not None
     assert entry.bundle.name == "explore-work-context"

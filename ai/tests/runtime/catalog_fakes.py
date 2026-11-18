@@ -17,6 +17,16 @@ from work_management_ai.runtime.tool_loop_contracts import RunScope
 from work_management_ai.runtime.tool_registry import ToolRegistry
 
 
+async def fixture_evaluator() -> object:
+    return "test binding"
+
+
+FIXTURE_EVALUATOR_BINDINGS = {
+    "orchestrator_plan@1": fixture_evaluator,
+    "fixture@1": fixture_evaluator,
+}
+
+
 def candidate_manifest(
     *, tools: tuple[str, ...] = ("load_skill@1",), skills: tuple[str, ...] = ()
 ) -> ToolLoopAgentManifest:
@@ -90,6 +100,7 @@ class CatalogFixture:
             skill_registry=self.skills,
             tool_registry=self.tools,
             evaluator_ids=frozenset({"orchestrator_plan@1", "fixture@1"}),
+            evaluator_bindings=FIXTURE_EVALUATOR_BINDINGS,
         )
         self.agent: RegisteredToolLoopAgent = self.registry.register_tool_loop(
             candidate_manifest(
