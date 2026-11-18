@@ -4,9 +4,9 @@ from dataclasses import replace
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
-from work_management_ai.runtime.agent_registry import AgentRegistryError
+from work_management_ai.runtime.agent_registry import AgentRegistry, AgentRegistryError
 from work_management_ai.runtime.contracts import AgentId
 from work_management_ai.runtime.manifests import (
     AgentManifest,
@@ -15,8 +15,9 @@ from work_management_ai.runtime.manifests import (
     canonical_manifest_fingerprint,
     load_yaml_resource,
 )
-from work_management_ai.runtime.tool_catalog import ToolCatalogError
+from work_management_ai.runtime.tool_catalog import ToolCatalog, ToolCatalogError
 from work_management_ai.runtime.tool_registry import ToolRegistry, ToolRegistryError
+from work_management_ai.tools.context import contracts as context_contracts
 
 from .catalog_fakes import CatalogFixture, candidate_manifest, load_tool
 
@@ -103,6 +104,32 @@ def test_wire_alias_collision_is_rejected_before_selection():
         registry.candidate_schemas(("scope.read@1", "scope__read@1"))
 
 
+def test_tool_catalog_rejects_same_major_replacement_after_agent_registration():
+    f = CatalogFixture()
+    prior = f.tools.resolve("load_skill@1").manifest
+    replacement = ToolRegistry(
+        [
+            prior.model_copy(update={"version": "1.0.2"}),
+            f.tools.resolve("read_actor_context@1").manifest,
+        ]
+    )
+    catalog = ToolCatalog(agent=f.agent, tools=replacement, access=f.access, readiness=f.readiness)
+    with pytest.raises(ToolCatalogError, match="TOOL_VERSION_CONFLICT"):
+        catalog.prepare(f.scope, model_ref="m")
+
+
+def test_tool_catalog_rejects_contract_drift_at_same_manifest_version(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class ChangedActorInput(BaseModel):
+        sections: tuple[str, ...] = Field(description="Altered declaration for the same tool.")
+
+    f = CatalogFixture()
+    monkeypatch.setattr(context_contracts, "ReadActorInput", ChangedActorInput)
+    with pytest.raises(ToolCatalogError, match="TOOL_VERSION_CONFLICT"):
+        f.catalog.prepare(f.scope, model_ref="m")
+
+
 def test_candidate_agent_is_orchestrator_only_and_opt_in():
     f = CatalogFixture()
     with pytest.raises(AgentRegistryError):
@@ -179,18 +206,21 @@ def test_candidate_registration_rejects_legacy_skill_without_resource_contract()
         CatalogFixture(skill_registry=SkillRegistry([legacy]))
 
 
-def test_candidate_rejects_legacy_three_attempt_tool_policy():
+def test_candidate_rejects_three_attempt_tool_policy():
     f = CatalogFixture()
-    from work_management_ai.runtime.tool_catalog import ToolCatalog
-
     tools = ToolRegistry(
         [
             load_tool().model_copy(update={"max_attempts": 3}),
-            load_tool().model_copy(update={"name": "read_actor_context"}),
+            f.tools.resolve("read_actor_context@1").manifest,
         ]
     )
-    catalog = ToolCatalog(agent=f.agent, tools=tools, access=f.access, readiness=f.readiness)
-    with pytest.raises(ToolCatalogError):
+    agent = AgentRegistry(
+        skill_registry=f.skills,
+        tool_registry=tools,
+        evaluator_ids=frozenset({"orchestrator_plan@1"}),
+    ).register_tool_loop(f.agent.manifest)
+    catalog = ToolCatalog(agent=agent, tools=tools, access=f.access, readiness=f.readiness)
+    with pytest.raises(ToolCatalogError, match="TOOL_CATALOG_INCOMPATIBLE"):
         catalog.prepare(f.scope, model_ref="m")
 
 

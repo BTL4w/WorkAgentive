@@ -1,6 +1,6 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: explore_projects
-version: "1.0.0"
+version: "1.0.1"
 owner: ai-runtime
 tenant_scope: actor_membership
 roles: [ADMIN, MANAGER, EMPLOYEE]
@@ -13,3 +13,8 @@ retry_policy: NONE
 idempotency: NOT_APPLICABLE
 audit: SAFE_METADATA
 trace_metadata: [tool_id, duration_ms, result_status]
+description: >-
+  Search authorized Projects when a name or search phrase identifies an unresolved Project.
+  Provide a query and optionally a cursor and page size. Returns scoped candidates, resolution,
+  and coverage. Ask for clarification when ambiguous. A partial page does not establish
+  uniqueness, and an empty result also covers resources the current actor cannot see.

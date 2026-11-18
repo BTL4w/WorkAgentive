@@ -166,7 +166,6 @@ class AgentRegistry:
         for ref in manifest.allowed_tools:
             try:
                 tool = self._tool_registry.resolve(ref)
-                self._tool_registry.candidate_schemas((ref,))
             except ToolRegistryError:
                 raise AgentRegistryError("AGENT_TOOL_NOT_REGISTERED") from None
             if (
@@ -178,6 +177,13 @@ class AgentRegistry:
                 tool.manifest.roles
             ):
                 raise AgentRegistryError("AGENT_TOOL_ROLE_INCOMPATIBLE")
+        try:
+            tool_pins = tuple(
+                definition.pin
+                for definition in self._tool_registry.candidate_definitions(manifest.allowed_tools)
+            )
+        except ToolRegistryError:
+            raise AgentRegistryError("AGENT_TOOL_DECLARATION_INVALID") from None
         skill_pins: list[VersionPin] = []
         for ref in manifest.allowed_skills:
             try:
@@ -205,7 +211,7 @@ class AgentRegistry:
         if not set(manifest.evaluators).issubset(self._evaluator_ids):
             raise AgentRegistryError("AGENT_EVALUATOR_NOT_REGISTERED")
         result = RegisteredToolLoopAgent(
-            manifest, canonical_manifest_fingerprint(manifest), tuple(skill_pins)
+            manifest, canonical_manifest_fingerprint(manifest), tuple(skill_pins), tool_pins
         )
         prior = self._tool_loop_entries.get(manifest.agent.version)
         if prior is not None and prior != result:
@@ -260,3 +266,4 @@ class RegisteredToolLoopAgent:
     manifest: ToolLoopAgentManifest
     fingerprint: str
     skill_pins: tuple[VersionPin, ...] = ()
+    tool_pins: tuple[VersionPin, ...] = ()

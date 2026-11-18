@@ -374,8 +374,8 @@ class ToolLoopAgentManifest(_ManifestModel):
         return self
 
 
-class ToolManifest(_ManifestModel):
-    schema_version: Literal["1.0"]
+class _ToolManifestFields[SchemaVersion: str](_ManifestModel):
+    schema_version: SchemaVersion
     name: str = Field(pattern=r"^[a-z][a-z0-9_.-]*$", max_length=100)
     version: str
     owner: str = Field(min_length=1, max_length=100)
@@ -404,6 +404,33 @@ class ToolManifest(_ManifestModel):
     @classmethod
     def validate_contract_paths(cls, value: str) -> str:
         return _contract_path(value)
+
+
+class ToolManifest(_ToolManifestFields[Literal["1.0"]]):
+    pass
+
+
+class ToolManifestV2(_ToolManifestFields[Literal["2.0"]]):
+    description: str = Field(min_length=1, max_length=4000)
+
+    @model_validator(mode="after")
+    def validate_description(self) -> Self:
+        words = re.sub(r"[^\w]+|_", "", self.description.casefold())
+        name = re.sub(r"[^\w]+|_", "", self.name)
+        if not words or words in {name, name + self.version.split(".", 1)[0]}:
+            raise ValueError("TOOL_DESCRIPTION_INVALID")
+        return self
+
+
+type AnyToolManifest = Annotated[
+    ToolManifest | ToolManifestV2, Field(discriminator="schema_version")
+]
+
+
+def load_tool_manifest_resource(package: str, resource: str) -> AnyToolManifest:
+    loaded = yaml.safe_load(files(package).joinpath(resource).read_text(encoding="utf-8"))
+    adapter: TypeAdapter[AnyToolManifest] = TypeAdapter(AnyToolManifest)
+    return adapter.validate_python(loaded)
 
 
 def load_yaml_resource[ManifestT: BaseModel](

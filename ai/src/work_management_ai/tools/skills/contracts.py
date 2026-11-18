@@ -12,8 +12,16 @@ class _Contract(BaseModel):
 
 
 class LoadSkillInput(_Contract):
-    skill_ref: str = Field(pattern=r"^[a-z][a-z0-9_.-]*@[1-9][0-9]*$", max_length=100)
-    resource_id: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_-]{0,63}$")
+    skill_ref: str = Field(
+        pattern=r"^[a-z][a-z0-9_.-]*@[1-9][0-9]*$",
+        max_length=100,
+        description="Exact name@major reference shown in the current Skill catalog.",
+    )
+    resource_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-z][a-z0-9_-]{0,63}$",
+        description="Null for instructions, or a declared companion ID from the loaded Skill.",
+    )
 
 
 class SkillResourceInfo(_Contract):

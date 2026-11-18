@@ -24,6 +24,9 @@ from work_management_ai.model_gateway.tool_contracts import (
     ToolModelRequest,
     ToolSchema,
 )
+from work_management_ai.runtime.manifests import ToolManifestV2, load_tool_manifest_resource
+from work_management_ai.runtime.tool_registry import ToolRegistry
+from work_management_ai.tools.context import contracts as context_contracts
 
 
 class Answer(BaseModel):
@@ -320,8 +323,28 @@ async def test_unbounded_schema_fails_before_provider_creation() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("with_call", [False, True])
-async def test_installed_sdk_sends_strict_stateless_payload_offline(with_call: bool) -> None:
+async def test_installed_sdk_sends_strict_stateless_payload_offline(
+    with_call: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     captured: list[dict[str, object]] = []
+
+    class DocumentedSection(BaseModel):
+        key: str = Field(description="Section key from the available catalog.")
+
+    class DocumentedInput(BaseModel):
+        sections: list[DocumentedSection] = Field(description="Sections to inspect.")
+
+    monkeypatch.setattr(context_contracts, "DocumentedInput", DocumentedInput, raising=False)
+    actor = load_tool_manifest_resource("work_management_ai.tools.context", "actor.yaml")
+    assert isinstance(actor, ToolManifestV2)
+    nested = actor.model_copy(
+        update={
+            "name": "test_documented_nested",
+            "input_contract": "work_management_ai.tools.context.contracts.DocumentedInput",
+        }
+    )
+    registry = ToolRegistry([actor, nested])
+    schemas = registry.candidate_schemas(("read_actor_context@1", "test_documented_nested@1"))
 
     def respond(req: httpx.Request) -> httpx.Response:
         assert req.url.path.endswith("/chat/completions")
@@ -384,6 +407,7 @@ async def test_installed_sdk_sends_strict_stateless_payload_offline(with_call: b
         )
         req = request().model_copy(
             update={
+                "tools": (*request().tools, *schemas),
                 "items": (
                     *request().items,
                     ToolItem(kind="tool_call", call=previous),
@@ -392,7 +416,7 @@ async def test_installed_sdk_sends_strict_stateless_payload_offline(with_call: b
                         call_id="call-previous",
                         content={"goal": "20 employees"},
                     ),
-                )
+                ),
             }
         )
         result = await adapter.generate_step(req)
@@ -408,6 +432,28 @@ async def test_installed_sdk_sends_strict_stateless_payload_offline(with_call: b
     assert "previous_response_id" not in payload
     assert "reasoning" not in payload
     assert payload["max_completion_tokens"] == 120
+    functions = {
+        function["name"]: function
+        for row in cast(list[dict[str, object]], payload["tools"])
+        for function in (cast(dict[str, object], row["function"]),)
+    }
+    actor_wire = functions["read_actor_context"]
+    assert actor_wire["description"] == actor.description
+    assert actor_wire["strict"] is True
+    actor_parameters = cast(dict[str, object], actor_wire["parameters"])
+    assert actor_parameters["required"] == ["sections"]
+    assert actor_parameters["additionalProperties"] is False
+    actor_fields = cast(dict[str, dict[str, object]], actor_parameters["properties"])
+    assert actor_fields["sections"]["description"] == (
+        context_contracts.ReadActorInput.model_fields["sections"].description
+    )
+    nested_wire = cast(dict[str, object], functions["test_documented_nested"]["parameters"])
+    nested_defs = cast(dict[str, dict[str, object]], nested_wire["$defs"])
+    nested_object = nested_defs["DocumentedSection"]
+    assert nested_object["required"] == ["key"]
+    assert nested_object["additionalProperties"] is False
+    nested_fields = cast(dict[str, dict[str, object]], nested_object["properties"])
+    assert nested_fields["key"]["description"] == "Section key from the available catalog."
     messages = cast(list[dict[str, object]], payload["messages"])
     calls = cast(list[dict[str, object]], messages[-2]["tool_calls"])
     assert calls[0]["id"] == messages[-1]["tool_call_id"] == "call-previous"

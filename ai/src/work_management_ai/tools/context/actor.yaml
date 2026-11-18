@@ -1,6 +1,6 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: read_actor_context
-version: "1.0.0"
+version: "1.0.1"
 owner: ai-runtime
 tenant_scope: actor_membership
 roles: [ADMIN, MANAGER, EMPLOYEE]
@@ -13,3 +13,7 @@ retry_policy: NONE
 idempotency: NOT_APPLICABLE
 audit: SAFE_METADATA
 trace_metadata: [tool_id, duration_ms, result_status]
+description: >-
+  Read identity context about the authenticated actor when the request depends on who is asking
+  or their organization. Provide the requested sections. Returns scoped identity facts, coverage,
+  and gaps for unsupported sections. Use authorized Project discovery for Project context.

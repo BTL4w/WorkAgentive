@@ -375,7 +375,7 @@ async def test_actual_loader_uses_pipeline_and_records_history_pin(
         tool_versions=(
             VersionPin(
                 reference="load_skill@1",
-                version="1.0.0",
+                version=admitted.resolve("load_skill").version,
                 fingerprint=admitted.resolve("load_skill").fingerprint,
             ),
         ),

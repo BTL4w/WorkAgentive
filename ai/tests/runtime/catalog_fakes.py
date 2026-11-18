@@ -7,7 +7,8 @@ from work_management_ai.runtime.agent_registry import AgentRegistry, RegisteredT
 from work_management_ai.runtime.manifests import (
     AgentManifest,
     ToolLoopAgentManifest,
-    ToolManifest,
+    ToolManifestV2,
+    load_tool_manifest_resource,
     load_yaml_resource,
 )
 from work_management_ai.runtime.skill_registry import SkillRegistry
@@ -37,8 +38,10 @@ def candidate_manifest(
     return ToolLoopAgentManifest.model_validate(value)
 
 
-def load_tool() -> ToolManifest:
-    return load_yaml_resource("work_management_ai.tools.skills", "load.yaml", ToolManifest)
+def load_tool() -> ToolManifestV2:
+    manifest = load_tool_manifest_resource("work_management_ai.tools.skills", "load.yaml")
+    assert isinstance(manifest, ToolManifestV2)
+    return manifest
 
 
 class Access:
@@ -78,9 +81,9 @@ class CatalogFixture:
         self.scope = RunScope(**{name: uuid4() for name in RunScope.model_fields})
         self.access, self.readiness = Access(self.scope), Readiness()
         loader = load_tool()
-        reader = loader.model_copy(
-            update={"name": "read_actor_context", "roles": ("ADMIN", "MANAGER")}
-        )
+        reader = load_tool_manifest_resource("work_management_ai.tools.context", "actor.yaml")
+        assert isinstance(reader, ToolManifestV2)
+        reader = reader.model_copy(update={"roles": ("ADMIN", "MANAGER")})
         self.tools = ToolRegistry([loader, reader])
         self.skills = skill_registry or SkillRegistry()
         self.registry = AgentRegistry(

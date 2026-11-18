@@ -20,18 +20,44 @@ type UseOutcome = Literal["ACCEPTED", "NEEDS_INPUT", "REFRESH_REQUIRED", "DENIED
 
 
 class ExploreProjectsInput(Contract):
-    query: str = Field(min_length=1, max_length=160)
-    cursor: str | None = Field(default=None, max_length=2048)
-    page_size: int = Field(default=10, ge=1, le=20, strict=True)
+    query: str = Field(min_length=1, max_length=160, description="Project name or search phrase.")
+    cursor: str | None = Field(
+        default=None,
+        max_length=2048,
+        description="Next-page cursor for the same query and page size, or null on the first page.",
+    )
+    page_size: int = Field(
+        default=10,
+        ge=1,
+        le=20,
+        strict=True,
+        description="Maximum candidates on this page, from 1 to 20.",
+    )
 
 
 class ReadProjectInput(Contract):
-    reference: UUID
-    sections: tuple[str, ...] = Field(default=("overview",), min_length=1, max_length=8)
+    reference: UUID = Field(
+        description="UUID of a Project already identified by authorized evidence."
+    )
+    sections: tuple[str, ...] = Field(
+        default=("overview",),
+        min_length=1,
+        max_length=8,
+        description=(
+            "Project sections to read. Use 'overview'; other names return NOT_SUPPORTED gaps."
+        ),
+    )
 
 
 class ReadActorInput(Contract):
-    sections: tuple[str, ...] = Field(default=("identity",), min_length=1, max_length=8)
+    sections: tuple[str, ...] = Field(
+        default=("identity",),
+        min_length=1,
+        max_length=8,
+        description=(
+            "Current-actor sections to read. Use 'identity'; other names return NOT_SUPPORTED gaps."
+        ),
+    )
 
 
 class ContextRef(Contract):
@@ -97,7 +123,14 @@ class ContextReadObservation(Contract):
     objective_ref: UUID
     invocation_id: UUID
     tool_reference: Literal["explore_projects@1", "read_project_context@1", "read_actor_context@1"]
-    tool_version: Literal["1.0.0"]
+    tool_version: str = Field(
+        pattern=(
+            r"^1\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+            r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+            r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+        ),
+        max_length=64,
+    )
     observed_at: AwareDatetime
     outcome: DataOutcome
     context_refs: tuple[ContextRef, ...] = Field(default=(), max_length=20)

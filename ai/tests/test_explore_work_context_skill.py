@@ -47,15 +47,12 @@ def test_actor_input_cannot_name_someone_else_or_grant_scope():
 
 
 def test_read_tool_manifests_register_typed_read_only_surface():
-    from work_management_ai.runtime.manifests import ToolManifest
     from work_management_ai.runtime.skill_registry import SkillRegistry
     from work_management_ai.runtime.tool_registry import ToolRegistry
 
-    registry = ToolRegistry(
-        tuple(
-            load_yaml_resource("work_management_ai.tools.context", f"{name}.yaml", ToolManifest)
-            for name in ("projects", "project", "actor")
-        )
+    registry = ToolRegistry.from_resources(
+        ("work_management_ai.tools.context", f"{name}.yaml")
+        for name in ("projects", "project", "actor")
     )
     schemas = registry.candidate_schemas(
         ("explore_projects@1", "read_project_context@1", "read_actor_context@1")

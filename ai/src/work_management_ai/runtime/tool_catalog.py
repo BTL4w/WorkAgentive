@@ -11,12 +11,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Literal, Protocol
 
-from pydantic import BaseModel
-
 from work_management_ai.model_gateway.tool_contracts import ToolSchema
 from work_management_ai.runtime.agent_registry import RegisteredToolLoopAgent
 from work_management_ai.runtime.contracts import RiskLevel
-from work_management_ai.runtime.manifests import resolve_contract
 from work_management_ai.runtime.tool_loop_contracts import AdmittedTool, RunScope
 from work_management_ai.runtime.tool_pipeline import ToolPolicyError
 from work_management_ai.runtime.tool_registry import ToolRegistry, ToolRegistryError
@@ -139,13 +136,15 @@ class ToolCatalog:
         facts = self.context(scope)
         manifest = self.agent.manifest
         try:
-            schemas = self.tools.candidate_schemas(manifest.allowed_tools)
+            definitions = self.tools.candidate_definitions(manifest.allowed_tools)
         except (ToolRegistryError, ValueError, ImportError, AttributeError):
             raise ToolCatalogError("TOOL_CATALOG_INVALID") from None
         admitted: list[AdmittedTool] = []
-        for schema in schemas:
-            registered = self.tools.resolve(schema.reference)
-            metadata = registered.manifest
+        for definition in definitions:
+            schema = definition.schema
+            metadata = self.tools.resolve(schema.reference).manifest
+            if definition.pin not in self.agent.tool_pins:
+                raise ToolCatalogError("TOOL_VERSION_CONFLICT")
             if (
                 _RISKS[metadata.risk_level] > _RISKS[manifest.permissions.risk_ceiling]
                 or metadata.max_attempts > 2
@@ -159,24 +158,14 @@ class ToolCatalog:
                 continue
             if not self._available(scope, schema.reference, model_ref):
                 continue
-            output = resolve_contract(metadata.output_contract)
-            if not isinstance(output, type) or not issubclass(output, BaseModel):
-                raise ToolCatalogError("TOOL_CATALOG_INVALID")
             assert schema.input_contract is not None
-            fingerprint = _digest(
-                {
-                    "manifest": registered.fingerprint,
-                    "input": schema.parameters,
-                    "output": output.model_json_schema(),
-                }
-            )
             admitted.append(
                 AdmittedTool(
                     schema=schema,
                     input_contract=schema.input_contract,
-                    output_contract=output,
-                    version=metadata.version,
-                    fingerprint=fingerprint,
+                    output_contract=definition.output_contract,
+                    version=definition.pin.version,
+                    fingerprint=definition.pin.fingerprint,
                     risk=metadata.risk_level,
                     timeout_seconds=metadata.timeout_seconds,
                     retry_limit=metadata.max_attempts - 1,
@@ -194,6 +183,7 @@ class ToolCatalog:
                 "activation_revision": facts.activation_revision,
                 "agent": self.agent.fingerprint,
                 "skill_dependencies": [p.model_dump(mode="json") for p in self.agent.skill_pins],
+                "tool_dependencies": [p.model_dump(mode="json") for p in self.agent.tool_pins],
                 "model_ref": model_ref,
                 "tools": [(v.reference, v.version, v.fingerprint) for v in admitted],
             }

@@ -331,11 +331,17 @@ class SkillLoaderBackend:
     def __init__(self, loader: SkillLoader):
         self.loader = loader
 
+    def _check(self, context: ToolInvocationContext) -> None:
+        if context.tool_reference != "load_skill@1" or not any(
+            pin.reference == context.tool_reference and pin.version == context.tool_version
+            for pin in self.loader.tools.agent.tool_pins
+        ):
+            raise SkillLoadingError("SKILL_TOOL_IDENTITY_INVALID", stop_segment=True)
+
     async def execute(
         self, context: ToolInvocationContext, arguments: BaseModel
     ) -> BackendToolResult:
-        if context.tool_reference != "load_skill@1" or context.tool_version != "1.0.0":
-            raise SkillLoadingError("SKILL_TOOL_IDENTITY_INVALID", stop_segment=True)
+        self._check(context)
         value = LoadSkillInput.model_validate(arguments.model_dump())
         output = self.loader.load(context.scope, value)
         return BackendToolResult(output=output, loaded_skill=output.pin)
@@ -343,6 +349,7 @@ class SkillLoaderBackend:
     async def revalidate_result(
         self, context: ToolInvocationContext, result: BackendToolResult
     ) -> None:
+        self._check(context)
         if not isinstance(result.output, LoadedSkill):
             raise SkillLoadingError("SKILL_RESULT_INVALID", stop_segment=True)
         value = LoadSkillInput.model_validate(context.canonical_arguments.model_dump())
