@@ -5,7 +5,7 @@ import importlib
 import json
 import re
 from importlib.resources import files
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Final, Literal, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
@@ -23,6 +23,8 @@ _VERSIONED_REFERENCE = re.compile(r"^[a-z][a-z0-9_.-]*@(0|[1-9]\d*)$")
 _CONTRACT_PATH = re.compile(
     r"^work_management_ai(?:\.[A-Za-z_][A-Za-z0-9_]*)+\.[A-Za-z_][A-Za-z0-9_]*$"
 )
+# Whole approved Skill resource (frontmatter + body), counted in UTF-8 bytes.
+SKILL_RESOURCE_MAX_BYTES: Final = 16384
 
 
 class _ManifestModel(BaseModel):
@@ -265,7 +267,7 @@ class SkillResourceManifest(_ManifestModel):
     id: str = Field(pattern=r"^[a-z][a-z0-9_-]{0,63}$")
     path: str = Field(min_length=1, max_length=200)
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
-    size_bytes: int = Field(ge=1, le=16384, strict=True)
+    size_bytes: int = Field(ge=1, le=SKILL_RESOURCE_MAX_BYTES, strict=True)
     media_type: Literal["text/plain", "text/markdown", "application/json"]
 
     @field_validator("path")

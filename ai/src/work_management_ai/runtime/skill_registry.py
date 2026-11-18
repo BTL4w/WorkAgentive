@@ -4,7 +4,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from work_management_ai.runtime.contracts import RiskLevel
 from work_management_ai.runtime.manifests import (
@@ -12,6 +12,12 @@ from work_management_ai.runtime.manifests import (
     SkillManifestV2,
     canonical_manifest_fingerprint,
     resolve_contract,
+)
+from work_management_ai.runtime.skill_bundle import (
+    SkillBundleDescriptor,
+    SkillBundleError,
+    bundle_name_for,
+    read_skill_bundle,
 )
 
 
@@ -24,10 +30,48 @@ class RegisteredSkill:
     reference: str
     manifest: SkillManifest | SkillManifestV2
     fingerprint: str
+    # Canonical SKILL.md metadata indexed at trusted registration. The manifest
+    # fingerprint already pins the instructions digest, so it is not re-hashed here.
+    bundle: SkillBundleDescriptor | None = None
+
+
+def _verified_bundle(
+    manifest: SkillManifest | SkillManifestV2, descriptor: SkillBundleDescriptor
+) -> SkillBundleDescriptor:
+    if not isinstance(manifest, SkillManifestV2):
+        raise SkillRegistryError("SKILL_BUNDLE_MANIFEST_INCOMPATIBLE")
+    try:
+        descriptor = SkillBundleDescriptor.model_validate(descriptor.model_dump())
+    except ValidationError as exc:
+        raise SkillRegistryError("SKILL_BUNDLE_INVALID") from exc
+    if descriptor.name != bundle_name_for(manifest.name):
+        raise SkillRegistryError("SKILL_BUNDLE_IDENTITY_MISMATCH")
+    if descriptor.instructions != manifest.instructions or descriptor.resources != (
+        manifest.resources
+    ):
+        raise SkillRegistryError("SKILL_BUNDLE_RESOURCE_MISMATCH")
+    # Re-derive from the approved bytes so a forged descriptor cannot inject metadata.
+    try:
+        derived = read_skill_bundle(
+            package=descriptor.package,
+            instructions=manifest.instructions,
+            resources=manifest.resources,
+        )
+    except SkillBundleError as exc:
+        raise SkillRegistryError(exc.code) from exc
+    if derived != descriptor:
+        raise SkillRegistryError("SKILL_BUNDLE_DESCRIPTOR_MISMATCH")
+    return derived
 
 
 class SkillRegistry:
-    def __init__(self, manifests: Iterable[SkillManifest | SkillManifestV2] = ()) -> None:
+    def __init__(
+        self,
+        manifests: Iterable[SkillManifest | SkillManifestV2] = (),
+        *,
+        bundles: Mapping[str, SkillBundleDescriptor] | None = None,
+    ) -> None:
+        pending = dict(bundles or {})
         entries: dict[str, RegisteredSkill] = {}
         for manifest in manifests:
             if isinstance(manifest, SkillManifestV2):
@@ -49,11 +93,15 @@ class SkillRegistry:
             reference = f"{manifest.name}@{major}"
             if reference in entries:
                 raise SkillRegistryError("SKILL_MAJOR_ALREADY_REGISTERED")
+            descriptor = pending.pop(reference, None)
             entries[reference] = RegisteredSkill(
                 reference=reference,
                 manifest=manifest,
                 fingerprint=canonical_manifest_fingerprint(manifest),
+                bundle=None if descriptor is None else _verified_bundle(manifest, descriptor),
             )
+        if pending:
+            raise SkillRegistryError("SKILL_BUNDLE_NOT_REGISTERED")
         self._entries: Mapping[str, RegisteredSkill] = MappingProxyType(entries)
 
     def resolve(self, reference: str) -> RegisteredSkill:
