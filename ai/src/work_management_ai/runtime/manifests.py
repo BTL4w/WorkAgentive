@@ -304,6 +304,12 @@ type AnySkillManifest = Annotated[
 ]
 
 
+def load_skill_manifest_resource(package: str, resource: str) -> AnySkillManifest:
+    loaded = yaml.safe_load(files(package).joinpath(resource).read_text(encoding="utf-8"))
+    adapter: TypeAdapter[AnySkillManifest] = TypeAdapter(AnySkillManifest)
+    return adapter.validate_python(loaded)
+
+
 class ToolLoopRuntimeManifest(_ManifestModel):
     workflow: str = Field(min_length=1, max_length=100)
     checkpoint: Literal["durable"]

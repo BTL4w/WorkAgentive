@@ -30,7 +30,11 @@ from work_management_ai.runtime.contracts import (
     ToolExecutionResult,
     ToolExecutorPort,
 )
-from work_management_ai.runtime.manifests import AgentManifest, SkillManifest, load_yaml_resource
+from work_management_ai.runtime.manifests import (
+    AgentManifest,
+    load_skill_manifest_resource,
+    load_yaml_resource,
+)
 from work_management_ai.tools.assignment.assign_task.adapter import AssignTaskToolAdapter
 from work_management_ai.tools.assignment.assign_task.contracts import (
     AssignTaskApplicationPort,
@@ -363,7 +367,7 @@ def test_assignment_skills_declare_versioned_evaluation_cases() -> None:
         "work_management_ai.skills.recommend_project_team",
         "work_management_ai.skills.analyze_workload",
     ):
-        manifest = load_yaml_resource(package, "skill.yaml", SkillManifest)
+        manifest = load_skill_manifest_resource(package, "skill.yaml")
         assert manifest.evaluation_cases
         assert all("@" in case for case in manifest.evaluation_cases)
 

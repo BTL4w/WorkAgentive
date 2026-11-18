@@ -8,8 +8,8 @@ from work_management_ai.observability.safe_trace import SafeTraceRecord
 from work_management_ai.runtime.agent_registry import AgentRegistry, AgentRegistryError
 from work_management_ai.runtime.contracts import AgentBudget, AgentId
 from work_management_ai.runtime.manifests import (
-    SkillManifest,
     ToolManifest,
+    load_skill_manifest_resource,
     load_yaml_resource,
 )
 from work_management_ai.runtime.skill_registry import SkillRegistry
@@ -18,7 +18,7 @@ from work_management_ai.runtime.tool_registry import ToolRegistry
 
 def test_reporting_manifest_and_bounds():
     skills = SkillRegistry(
-        load_yaml_resource(f"work_management_ai.skills.{name}", "skill.yaml", SkillManifest)
+        load_skill_manifest_resource(f"work_management_ai.skills.{name}", "skill.yaml")
         for name in ("summarize_verified_project_metrics", "draft_management_report")
     )
     tools = ToolRegistry(

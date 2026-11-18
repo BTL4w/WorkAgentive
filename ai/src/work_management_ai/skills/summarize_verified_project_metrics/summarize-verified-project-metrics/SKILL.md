@@ -1,3 +1,7 @@
+---
+name: summarize-verified-project-metrics
+description: "Summarize immutable verified Project metrics when a status report or scheduled summary is requested."
+---
 # Verified project reporting v1
 
 Trigger: authorized report request or committed summary job. Input: SkillInput;

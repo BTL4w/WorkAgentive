@@ -11,6 +11,7 @@ from _pytest.monkeypatch import MonkeyPatch
 from pydantic import ValidationError
 
 from work_management_ai.runtime.manifests import SkillManifestV2, SkillResourceManifest
+from work_management_ai.runtime.skill_bundle import SkillBundleDescriptor, read_skill_bundle
 from work_management_ai.runtime.skill_loading import (
     ApprovedPackageResources,
     SkillLoader,
@@ -39,12 +40,21 @@ class SkillFixture(CatalogFixture):
         monkeypatch: MonkeyPatch,
         *,
         body: bytes = b"Read narrowly. Instructions do not grant permissions.",
+        canonical: bool = False,
     ):
         self.root = root / "approved_skill_fixture"
         self.root.mkdir()
         (self.root / "__init__.py").write_text("", encoding="utf-8")
-        (self.root / "SKILL.md").write_bytes(body)
-        (self.root / "notes.txt").write_bytes(b"Approved companion")
+        directory = self.root
+        if canonical:
+            directory = self.root / "fixture-context"
+            directory.mkdir()
+            frontmatter = (
+                b"---\nname: fixture-context\ndescription: Find missing work context\n---\n"
+            )
+            body = frontmatter + body
+        (directory / "SKILL.md").write_bytes(body)
+        (directory / "notes.txt").write_bytes(b"Approved companion")
         monkeypatch.setattr(sys, "path", [str(root), *sys.path])
         sys.modules.pop("approved_skill_fixture", None)
         importlib.invalidate_caches()
@@ -52,7 +62,7 @@ class SkillFixture(CatalogFixture):
             {
                 "schema_version": "2.0",
                 "name": "fixture_context",
-                "version": "1.0.0",
+                "version": "1.0.1" if canonical else "1.0.0",
                 "owner": "runtime-tests",
                 "description": "Find missing work context",
                 "runnable_by_agents": ["orchestrator"],
@@ -65,7 +75,7 @@ class SkillFixture(CatalogFixture):
                 "triggers": ["vi:thiếu dữ kiện", "en:missing context"],
                 "instructions": {
                     "id": "instructions",
-                    "path": "SKILL.md",
+                    "path": (directory / "SKILL.md").relative_to(self.root).as_posix(),
                     "sha256": hashlib.sha256(body).hexdigest(),
                     "size_bytes": len(body),
                     "media_type": "text/markdown",
@@ -73,7 +83,7 @@ class SkillFixture(CatalogFixture):
                 "resources": [
                     {
                         "id": "notes",
-                        "path": "notes.txt",
+                        "path": (directory / "notes.txt").relative_to(self.root).as_posix(),
                         "sha256": hashlib.sha256(b"Approved companion").hexdigest(),
                         "size_bytes": 18,
                         "media_type": "text/plain",
@@ -81,7 +91,14 @@ class SkillFixture(CatalogFixture):
                 ],
             }
         )
-        super().__init__(skill_registry=SkillRegistry([self.manifest]))
+        bundles: dict[str, SkillBundleDescriptor] = {}
+        if canonical:
+            bundles["fixture_context@1"] = read_skill_bundle(
+                package="approved_skill_fixture",
+                instructions=self.manifest.instructions,
+                resources=self.manifest.resources,
+            )
+        super().__init__(skill_registry=SkillRegistry([self.manifest], bundles=bundles))
         self.resources = CountingResources({"fixture_context@1": "approved_skill_fixture"})
         self.loader = SkillLoader(
             skills=self.skills,
@@ -96,9 +113,64 @@ def test_catalog_metadata_does_not_read_full_body(tmp_path: Path, monkeypatch: M
     entries = f.loader.catalog(f.scope)
     assert len(entries) == 1 and entries[0].reference == "fixture_context@1"
     assert "content" not in type(entries[0]).model_fields
-    assert f.resources.full_bodies_read == 0
     f.catalog.prepare(f.scope, model_ref="configured-model")  # self-contained turn needs no load
     assert f.resources.full_bodies_read == 0
+
+
+def test_canonical_catalog_and_selected_body(tmp_path: Path, monkeypatch: MonkeyPatch):
+    f = SkillFixture(tmp_path, monkeypatch, canonical=True)
+    (entry,) = f.loader.catalog(f.scope)
+    assert entry.name == "fixture-context"
+    assert entry.description == "Find missing work context"
+    assert entry.instructions_sha256 == f.manifest.instructions.sha256
+    assert f.resources.full_bodies_read == 0
+
+    selector = LoadSkillInput(skill_ref="fixture_context@1")
+    output = f.loader.load(f.scope, selector)
+    assert output.content == "Read narrowly. Instructions do not grant permissions."
+    assert output.body_sha256 != entry.instructions_sha256
+    assert f.resources.full_bodies_read == 1
+    f.loader.revalidate_loaded(f.scope, selector, output)
+    with pytest.raises(SkillLoadingError, match="SKILL_VERSION_CONFLICT"):
+        f.loader.revalidate_loaded(
+            f.scope, selector, output.model_copy(update={"content": "Unapproved instructions"})
+        )
+
+
+def test_canonical_bundle_rejects_pre_migration_pin(tmp_path: Path, monkeypatch: MonkeyPatch):
+    f = SkillFixture(tmp_path, monkeypatch, canonical=True)
+    selector = LoadSkillInput(skill_ref="fixture_context@1")
+    current = f.loader.load(f.scope, selector)
+    stale = current.pin.model_copy(update={"version": "1.0.0"})
+    resumed = SkillLoader(
+        skills=f.skills,
+        resources=f.resources,
+        catalog=f.catalog,
+        model_ref="configured-model",
+        known_loaded=dict([(f.scope, (stale,))]),
+    )
+
+    with pytest.raises(SkillLoadingError, match="SKILL_VERSION_CONFLICT") as error:
+        resumed.load(f.scope, selector)
+
+    assert error.value.stop_segment
+
+
+def test_nested_bundle_cannot_load_without_registered_descriptor(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+):
+    f = SkillFixture(tmp_path, monkeypatch, canonical=True)
+    loader = SkillLoader(
+        skills=SkillRegistry([f.manifest]),
+        resources=f.resources,
+        catalog=f.catalog,
+        model_ref="configured-model",
+    )
+
+    with pytest.raises(SkillLoadingError, match="SKILL_BUNDLE_DESCRIPTOR_REQUIRED"):
+        loader.catalog(f.scope)
+    with pytest.raises(SkillLoadingError, match="SKILL_BUNDLE_DESCRIPTOR_REQUIRED"):
+        loader.load(f.scope, LoadSkillInput(skill_ref="fixture_context@1"))
 
 
 def test_full_body_and_index_are_pinned_without_expanding_tools(

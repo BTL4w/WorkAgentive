@@ -22,7 +22,11 @@ from work_management_ai.runtime.contracts import (
     AgentRunStatus,
     ResolvedActorContext,
 )
-from work_management_ai.runtime.manifests import SkillManifest, ToolManifest, load_yaml_resource
+from work_management_ai.runtime.manifests import (
+    ToolManifest,
+    load_skill_manifest_resource,
+    load_yaml_resource,
+)
 from work_management_ai.runtime.policy_guard import PolicyGuard
 from work_management_ai.runtime.skill_registry import SkillRegistry
 from work_management_ai.runtime.tool_registry import ToolRegistry
@@ -31,7 +35,7 @@ from work_management_ai.runtime.tool_registry import ToolRegistry
 def registry() -> AgentRegistry:
     value = AgentRegistry(
         skill_registry=SkillRegistry(
-            load_yaml_resource(f"work_management_ai.skills.{name}", "skill.yaml", SkillManifest)
+            load_skill_manifest_resource(f"work_management_ai.skills.{name}", "skill.yaml")
             for name in (
                 "create_project_plan",
                 "revise_project_plan",

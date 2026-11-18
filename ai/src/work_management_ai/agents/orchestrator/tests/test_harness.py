@@ -40,8 +40,8 @@ from work_management_ai.runtime.contracts import (
 )
 from work_management_ai.runtime.manifests import (
     AgentManifest,
-    SkillManifest,
     ToolManifest,
+    load_skill_manifest_resource,
     load_yaml_resource,
 )
 from work_management_ai.runtime.policy_guard import PolicyGuard
@@ -280,7 +280,7 @@ def _phase3_registry() -> AgentRegistry:
     )
     registry = AgentRegistry(
         skill_registry=SkillRegistry(
-            load_yaml_resource(package, "skill.yaml", SkillManifest) for package in skill_packages
+            load_skill_manifest_resource(package, "skill.yaml") for package in skill_packages
         ),
         tool_registry=ToolRegistry(
             load_yaml_resource(package, "tool.yaml", ToolManifest) for package in tool_packages

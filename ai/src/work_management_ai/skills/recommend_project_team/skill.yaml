@@ -1,8 +1,9 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: recommend_project_team
-version: "1.0.0"
+version: "1.0.1"
 owner: assignment-agent
-description: Create or revise a deterministic Project Team proposal and explain verified results.
+# Compatibility mirror of recommend-project-team/SKILL.md frontmatter.
+description: "Prepare or revise a deterministic Project Team proposal when the user requests staffing recommendations."
 runnable_by_agents: [assignment]
 allowed_tools: [assignment.manage_team@1, assignment.read_workload@1]
 risk_level: PROPOSAL_ONLY
@@ -20,3 +21,10 @@ triggers:
 required_context: [authenticated_actor, tenant_scope, exact_project_or_recommendation, verified_ranking]
 approval: ALWAYS
 stop_conditions: [ambiguous_resource, stale_version, verifier_failure, tool_failure]
+instructions:
+  id: instructions
+  path: recommend-project-team/SKILL.md
+  sha256: 6b4e87db74798f28289533438020c2bae33e94d32a71a5d623cfb735e3c6af66
+  size_bytes: 855
+  media_type: text/markdown
+resources: []

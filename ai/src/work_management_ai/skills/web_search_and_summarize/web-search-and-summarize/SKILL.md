@@ -1,3 +1,7 @@
+---
+name: web-search-and-summarize
+description: "Find and summarize public evidence, or return evidence only, when the user requests a public web lookup."
+---
 # Public web search and grounded synthesis
 
 Owner: knowledge-retrieval. Version: 1.0.0. Trigger: public web questions in vi/en,

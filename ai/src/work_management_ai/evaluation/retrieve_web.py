@@ -46,7 +46,7 @@ from work_management_ai.runtime.contracts import (
     ToolExecutionRequest,
     ToolExecutionResult,
 )
-from work_management_ai.runtime.manifests import SkillManifest, ToolManifest, load_yaml_resource
+from work_management_ai.runtime.manifests import ToolManifest, load_yaml_resource
 from work_management_ai.runtime.policy_guard import PolicyGuard
 from work_management_ai.runtime.skill_registry import SkillRegistry
 from work_management_ai.runtime.tool_registry import ToolRegistry
@@ -163,8 +163,8 @@ def load_cases(path: Path | None = None) -> tuple[Case, ...]:
 
 
 def _registry() -> AgentRegistry:
-    skills = SkillRegistry(
-        load_yaml_resource(f"work_management_ai.skills.{name}", "skill.yaml", SkillManifest)
+    skills = SkillRegistry.from_resources(
+        (f"work_management_ai.skills.{name}", "skill.yaml")
         for name in (
             "answer_work_question",
             "create_project_plan",

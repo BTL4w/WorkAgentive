@@ -17,6 +17,7 @@ from work_management_ai.runtime.manifests import (
     SkillManifestV2,
     SkillResourceManifest,
     canonical_manifest_fingerprint,
+    load_skill_manifest_resource,
     load_yaml_resource,
 )
 from work_management_ai.runtime.skill_bundle import (
@@ -90,7 +91,7 @@ def _manifest(instructions: SkillResourceManifest, **overrides: Any) -> SkillMan
         "name": "fixture_context",
         "version": "1.0.0",
         "owner": "runtime-tests",
-        "description": "Sidecar governance metadata",
+        "description": DESCRIPTION,
         "runnable_by_agents": ["orchestrator"],
         "allowed_tools": ["read_actor_context@1"],
         "risk_level": "READ_ONLY",
@@ -615,9 +616,7 @@ def test_registry_rejects_unknown_or_legacy_bundle_targets(
         SkillRegistry([manifest], bundles={"missing_skill@1": descriptor})
     assert _code(exc) == "SKILL_BUNDLE_NOT_REGISTERED"
 
-    legacy = load_yaml_resource(
-        "work_management_ai.skills.analyze_workload", "skill.yaml", SkillManifest
-    )
+    legacy = load_yaml_resource("runtime", "legacy_analyze_workload.yaml", SkillManifest)
     with pytest.raises(SkillRegistryError) as exc:
         SkillRegistry([legacy], bundles={"analyze_workload@1": descriptor})
     assert _code(exc) == "SKILL_BUNDLE_MANIFEST_INCOMPATIBLE"
@@ -635,10 +634,25 @@ def test_registering_a_descriptor_does_not_activate_or_expand_skill(
     assert entry.manifest.runnable_by_agents == manifest.runnable_by_agents
 
 
+@pytest.mark.parametrize("from_resources", [False, True])
+def test_registry_rejects_description_mirror_drift(
+    tmp_path: Path, monkeypatch: MonkeyPatch, from_resources: bool
+) -> None:
+    f = BundleFixture(tmp_path, monkeypatch)
+    manifest = _manifest(f.instructions(), description="Obsolete mirror")
+    (f.root / "skill.yaml").write_text(manifest.model_dump_json())
+
+    with pytest.raises(SkillRegistryError, match="SKILL_BUNDLE_DESCRIPTION_MISMATCH"):
+        if from_resources:
+            SkillRegistry.from_resources(((PACKAGE, "skill.yaml"),))
+        else:
+            SkillRegistry([manifest], bundles={"fixture_context@1": f.read()})
+
+
 # --- legacy compatibility -----------------------------------------------------------------
 
 _LEGACY_FINGERPRINTS = {
-    ("work_management_ai.skills.analyze_workload", SkillManifest): (
+    ("runtime", SkillManifest): (
         "3bef158f4dbe17202b0cde06b0795d988fc32c08acc554eb68f3410be9d83ee5"
     ),
     # Pin the V2 fixture against the pre-Task-8.1 implementation without
@@ -658,10 +672,11 @@ def test_legacy_manifest_fingerprints_are_unchanged(
 ) -> None:
     package, model = key
     manifest = (
-        _manifest(_resource(VALID))
+        _manifest(_resource(VALID), description="Sidecar governance metadata")
         if package is None
-        else load_yaml_resource(package, "skill.yaml", model)
+        else load_skill_manifest_resource(package, "legacy_analyze_workload.yaml")
     )
+    assert isinstance(manifest, model)
     assert canonical_manifest_fingerprint(manifest) == expected
     entry = SkillRegistry([manifest]).resolve(f"{manifest.name}@1")
     assert entry.fingerprint == expected

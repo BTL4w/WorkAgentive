@@ -1,0 +1,15 @@
+schema_version: "1.0"
+name: read_actor_context
+version: "1.0.0"
+owner: ai-runtime
+tenant_scope: actor_membership
+roles: [ADMIN, MANAGER, EMPLOYEE]
+risk_level: READ_ONLY
+input_contract: work_management_ai.tools.context.contracts.ReadActorInput
+output_contract: work_management_ai.tools.context.contracts.ContextReadObservation
+timeout_seconds: 5
+max_attempts: 1
+retry_policy: NONE
+idempotency: NOT_APPLICABLE
+audit: SAFE_METADATA
+trace_metadata: [tool_id, duration_ms, result_status]

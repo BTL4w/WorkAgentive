@@ -1,6 +1,5 @@
 """Guarded Assignment Specialist Harness around deterministic application tools."""
 
-from importlib.resources import files
 from typing import cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -45,9 +44,12 @@ from work_management_ai.runtime.contracts import (
 )
 from work_management_ai.runtime.manifests import (
     AgentManifest,
-    SkillManifest,
     ToolManifest,
     load_yaml_resource,
+)
+from work_management_ai.runtime.skill_bundle import (
+    load_packaged_skill_manifest,
+    read_skill_instructions,
 )
 from work_management_ai.tools.assignment.assign_task.contracts import AssignTaskInput
 from work_management_ai.tools.assignment.manage_team.contracts import ManageTeamInput
@@ -167,8 +169,8 @@ class AssignmentAgentHarness:
         )
         package = _SKILL_PACKAGES[reference]
         try:
-            load_yaml_resource(package, "skill.yaml", SkillManifest)
-            instructions = files(package).joinpath("SKILL.md").read_text(encoding="utf-8")
+            skill = load_packaged_skill_manifest(package)
+            instructions = read_skill_instructions(package, skill)
         except (OSError, ValueError, ValidationError):
             return self._failure("ASSIGNMENT_SKILL_INVALID")
         if reference not in self._manifest.allowed_skills:

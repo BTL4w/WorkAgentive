@@ -19,7 +19,12 @@ from typing import Any, Final, Self, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from work_management_ai.runtime.manifests import SKILL_RESOURCE_MAX_BYTES, SkillResourceManifest
+from work_management_ai.runtime.manifests import (
+    SKILL_RESOURCE_MAX_BYTES,
+    SkillManifestV2,
+    SkillResourceManifest,
+    load_skill_manifest_resource,
+)
 
 _NAME = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _NAME_MAX: Final = 64
@@ -272,6 +277,15 @@ def _read_verified_text(root: Traversable, resource: SkillResourceManifest) -> s
     return text
 
 
+def _package_root(package: str) -> Traversable:
+    if _PACKAGE.fullmatch(package) is None:
+        raise SkillBundleError("SKILL_BUNDLE_PACKAGE_INVALID")
+    try:
+        return files(package)
+    except (ImportError, TypeError, ValueError):
+        raise SkillBundleError("SKILL_RESOURCE_UNAVAILABLE") from None
+
+
 def read_skill_bundle(
     *,
     package: str,
@@ -293,10 +307,7 @@ def read_skill_bundle(
     instructions = _revalidate(instructions)
     resources = tuple(_revalidate(resource) for resource in resources)
     bundle = _check_layout(instructions, resources)
-    try:
-        root = files(package)
-    except (ImportError, TypeError, ValueError):
-        raise SkillBundleError("SKILL_RESOURCE_UNAVAILABLE") from None
+    root = _package_root(package)
     frontmatter, _ = parse_skill_markdown(_read_verified_text(root, instructions))
     if frontmatter.name != bundle:
         raise SkillBundleError("SKILL_NAME_FOLDER_MISMATCH")
@@ -313,3 +324,24 @@ def read_skill_bundle(
         )
     except ValidationError:
         raise SkillBundleError("SKILL_BUNDLE_INVALID") from None
+
+
+def read_skill_instructions(package: str, manifest: SkillManifestV2) -> str:
+    """Read an approved instructions body without loading companion resources."""
+
+    instructions = _revalidate(manifest.instructions)
+    bundle = _check_layout(instructions, ())
+    root = _package_root(package)
+    frontmatter, body = parse_skill_markdown(_read_verified_text(root, instructions))
+    if frontmatter.name != bundle or frontmatter.name != bundle_name_for(manifest.name):
+        raise SkillBundleError("SKILL_BUNDLE_IDENTITY_MISMATCH")
+    if frontmatter.description != manifest.description:
+        raise SkillBundleError("SKILL_BUNDLE_DESCRIPTION_MISMATCH")
+    return body
+
+
+def load_packaged_skill_manifest(package: str, resource: str = "skill.yaml") -> SkillManifestV2:
+    manifest = load_skill_manifest_resource(package, resource)
+    if not isinstance(manifest, SkillManifestV2):
+        raise SkillBundleError("SKILL_MANIFEST_INCOMPATIBLE")
+    return manifest

@@ -18,6 +18,7 @@ from work_management_ai.runtime.manifests import (
     SkillManifest,
     ToolManifest,
     canonical_manifest_fingerprint,
+    load_skill_manifest_resource,
     load_yaml_resource,
 )
 from work_management_ai.runtime.skill_registry import SkillRegistry, SkillRegistryError
@@ -431,7 +432,7 @@ def test_assignment_agent_registers_only_at_phase3_with_exact_allowlists() -> No
         "work_management_ai.tools.assignment.assign_task",
     )
     skills = SkillRegistry(
-        [load_yaml_resource(package, "skill.yaml", SkillManifest) for package in skill_packages]
+        [load_skill_manifest_resource(package, "skill.yaml") for package in skill_packages]
     )
     tools = ToolRegistry(
         [load_yaml_resource(package, "tool.yaml", ToolManifest) for package in tool_packages]

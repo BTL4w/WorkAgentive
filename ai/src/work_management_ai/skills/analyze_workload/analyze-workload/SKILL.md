@@ -1,6 +1,6 @@
 ---
 name: analyze-workload
-description: Use for an authorized Manager or Admin request to explain deterministic Project workload.
+description: "Explain verified Project workload projections when asked who is overloaded or has capacity."
 ---
 
 # Analyze Workload

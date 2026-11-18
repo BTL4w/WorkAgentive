@@ -1,3 +1,7 @@
+---
+name: review-evidence-concerns
+description: "Explain verified evidence concerns when asked about discrepancies or gaps in a Daily Update."
+---
 Explain persisted risk and confirmed evidence warnings with exact source IDs.
 Separate observed facts, acknowledged warnings and advisory recommendations.
 An acknowledged warning is not evidence of dishonesty. Missing or unreadable

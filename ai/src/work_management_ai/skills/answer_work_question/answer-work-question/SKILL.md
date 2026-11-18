@@ -1,6 +1,6 @@
 ---
 name: answer-work-question
-description: Use when an authenticated user asks a bilingual question about permitted Projects, assigned Tasks, dependencies, deadlines, status, or Acceptance Criteria.
+description: "Answer bilingual questions about authorized Projects, assigned Tasks, dependencies, or acceptance criteria."
 ---
 
 # Answer Work Question

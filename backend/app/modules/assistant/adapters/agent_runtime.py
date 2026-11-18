@@ -90,7 +90,7 @@ from work_management_ai.runtime.execution_engine import (
     DurableSpecialistRunner,
     ExecutionRecorderPort,
 )
-from work_management_ai.runtime.manifests import SkillManifest, ToolManifest, load_yaml_resource
+from work_management_ai.runtime.manifests import ToolManifest, load_yaml_resource
 from work_management_ai.runtime.policy_guard import PolicyGuard
 from work_management_ai.runtime.skill_registry import SkillRegistry
 from work_management_ai.runtime.tool_registry import ToolRegistry
@@ -545,9 +545,7 @@ def build_agent_registry(
         if enabled
         else _AGENT_RESOURCES
     )
-    skill_registry = SkillRegistry(
-        load_yaml_resource(package, resource, SkillManifest) for package, resource in skills
-    )
+    skill_registry = SkillRegistry.from_resources(skills)
     tool_registry = ToolRegistry(
         load_yaml_resource(package, resource, ToolManifest) for package, resource in tools
     )

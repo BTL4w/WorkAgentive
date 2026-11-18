@@ -1,3 +1,7 @@
+---
+name: explain-verified-risk
+description: "Explain persisted, authorized risk observations when asked why a Project or Task is at risk."
+---
 Explain persisted risk and confirmed evidence warnings with exact source IDs.
 Separate observed facts, acknowledged warnings and advisory recommendations.
 An acknowledged warning is not evidence of dishonesty. Missing or unreadable

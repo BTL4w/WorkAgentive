@@ -1,6 +1,6 @@
 ---
 name: create-project-plan
-description: Create or refine a useful operational draft, then prepare an exact Manager-reviewed proposal.
+description: "Create an operational draft or prepare a Manager-reviewed proposal when asked for a new Project plan."
 ---
 
 # Create Project Plan

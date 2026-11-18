@@ -130,6 +130,11 @@ async def test_reporting_returns_verified_proposal_to_hub(locale: str):
         "reporting.read",
         "reporting.propose",
     ]
+    proposal = ReportingProposal.model_validate(tools.calls[-1].typed_input)
+    assert proposal.skill_versions == (
+        "summarize_verified_project_metrics@1.0.1",
+        "draft_management_report@1.0.1",
+    )
 
 
 @pytest.mark.asyncio
@@ -267,7 +272,11 @@ async def test_real_hub_handoff_runs_reporting_package(locale: Literal["vi", "en
     from work_management_ai.agents.orchestrator.contracts import OrchestratorTriggerInput
     from work_management_ai.agents.orchestrator.harness import OrchestratorHarness
     from work_management_ai.runtime.agent_registry import AgentRegistry
-    from work_management_ai.runtime.manifests import SkillManifest, ToolManifest, load_yaml_resource
+    from work_management_ai.runtime.manifests import (
+        ToolManifest,
+        load_skill_manifest_resource,
+        load_yaml_resource,
+    )
     from work_management_ai.runtime.policy_guard import PolicyGuard
     from work_management_ai.runtime.skill_registry import SkillRegistry
     from work_management_ai.runtime.tool_registry import ToolRegistry
@@ -286,7 +295,7 @@ async def test_real_hub_handoff_runs_reporting_package(locale: Literal["vi", "en
 
     registry = AgentRegistry(
         skill_registry=SkillRegistry(
-            load_yaml_resource(f"work_management_ai.skills.{name}", "skill.yaml", SkillManifest)
+            load_skill_manifest_resource(f"work_management_ai.skills.{name}", "skill.yaml")
             for name in ("summarize_verified_project_metrics", "draft_management_report")
         ),
         tool_registry=ToolRegistry(

@@ -11,6 +11,7 @@ from work_management_ai.runtime.manifests import (
     SkillManifest,
     SkillManifestV2,
     canonical_manifest_fingerprint,
+    load_skill_manifest_resource,
     resolve_contract,
 )
 from work_management_ai.runtime.skill_bundle import (
@@ -61,10 +62,32 @@ def _verified_bundle(
         raise SkillRegistryError(exc.code) from exc
     if derived != descriptor:
         raise SkillRegistryError("SKILL_BUNDLE_DESCRIPTOR_MISMATCH")
+    if derived.description != manifest.description:
+        raise SkillRegistryError("SKILL_BUNDLE_DESCRIPTION_MISMATCH")
     return derived
 
 
 class SkillRegistry:
+    @classmethod
+    def from_resources(cls, resources: Iterable[tuple[str, str]]) -> "SkillRegistry":
+        manifests: list[SkillManifest | SkillManifestV2] = []
+        bundles: dict[str, SkillBundleDescriptor] = {}
+        for package, resource in resources:
+            manifest = load_skill_manifest_resource(package, resource)
+            manifests.append(manifest)
+            if isinstance(manifest, SkillManifestV2):
+                try:
+                    descriptor = read_skill_bundle(
+                        package=package,
+                        instructions=manifest.instructions,
+                        resources=manifest.resources,
+                    )
+                except SkillBundleError as exc:
+                    raise SkillRegistryError(exc.code) from exc
+                reference = f"{manifest.name}@{manifest.version.split('.', maxsplit=1)[0]}"
+                bundles[reference] = descriptor
+        return cls(manifests, bundles=bundles)
+
     def __init__(
         self,
         manifests: Iterable[SkillManifest | SkillManifestV2] = (),

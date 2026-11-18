@@ -17,7 +17,6 @@ from work_management_ai.runtime.contracts import (
 )
 from work_management_ai.runtime.manifests import (
     AgentManifest,
-    SkillManifest,
     ToolManifest,
     canonical_manifest_fingerprint,
     load_yaml_resource,
@@ -46,12 +45,8 @@ def _registry() -> AgentRegistry:
         load_yaml_resource("work_management_ai.tools.web", name, ToolManifest)
         for name in ("search.yaml", "read_pages.yaml", "revalidate.yaml")
     )
-    skills = SkillRegistry(
-        [
-            load_yaml_resource(
-                "work_management_ai.skills.web_search_and_summarize", "skill.yaml", SkillManifest
-            )
-        ]
+    skills = SkillRegistry.from_resources(
+        (("work_management_ai.skills.web_search_and_summarize", "skill.yaml"),)
     )
     registry = AgentRegistry(
         skill_registry=skills,
@@ -218,7 +213,9 @@ def test_budget_tool_and_tenant_escalation_are_denied() -> None:
 
 
 def test_retrieve_cannot_use_ungated_legacy_manifest() -> None:
-    from work_management_ai.runtime.manifests import load_agent_manifest_resource
+    from work_management_ai.runtime.manifests import (
+        load_agent_manifest_resource,
+    )
 
     manifest = load_agent_manifest_resource("work_management_ai.agents.retrieve", "agent.yaml")
     forged = manifest.model_dump(exclude={"activation", "retrieval_limits"})

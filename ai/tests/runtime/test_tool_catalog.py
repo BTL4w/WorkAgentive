@@ -126,9 +126,7 @@ def test_legacy_manifest_fingerprints_remain_identical():
     agent = load_yaml_resource(
         "work_management_ai.agents.orchestrator", "agent.yaml", AgentManifest
     )
-    skill = load_yaml_resource(
-        "work_management_ai.skills.analyze_workload", "skill.yaml", SkillManifest
-    )
+    skill = load_yaml_resource("runtime", "legacy_analyze_workload.yaml", SkillManifest)
     assert (
         canonical_manifest_fingerprint(agent)
         == "34510dc199279165f220e1bd1d4c7ff0d3148157d7844d2511391b62ac16038f"

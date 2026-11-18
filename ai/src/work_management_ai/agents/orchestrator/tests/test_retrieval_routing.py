@@ -29,7 +29,11 @@ from work_management_ai.runtime.policy_guard import PolicyGuard
 def registry():
     # Combine actual core/web manifests; no fabricated capabilities.
     from work_management_ai.runtime.agent_registry import AgentRegistry
-    from work_management_ai.runtime.manifests import SkillManifest, ToolManifest, load_yaml_resource
+    from work_management_ai.runtime.manifests import (
+        ToolManifest,
+        load_skill_manifest_resource,
+        load_yaml_resource,
+    )
     from work_management_ai.runtime.skill_registry import SkillRegistry
     from work_management_ai.runtime.tool_registry import ToolRegistry
 
@@ -39,8 +43,8 @@ def registry():
     )
     skills = SkillRegistry(
         [
-            load_yaml_resource(
-                "work_management_ai.skills.web_search_and_summarize", "skill.yaml", SkillManifest
+            load_skill_manifest_resource(
+                "work_management_ai.skills.web_search_and_summarize", "skill.yaml"
             )
         ]
     )

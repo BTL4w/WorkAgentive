@@ -1,8 +1,9 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: draft_management_report
-version: "1.0.0"
+version: "1.0.1"
 owner: reporting-agent
-description: Prepare grounded advisory report narrative from immutable verified project metrics
+# Compatibility mirror of draft-management-report/SKILL.md frontmatter.
+description: "Draft a grounded management narrative when a report is requested or a scheduled summary is due."
 runnable_by_agents: [reporting]
 triggers: [report_request, summary_job]
 input_contract: work_management_ai.skills.draft_management_report.contracts.SkillInput
@@ -14,3 +15,10 @@ approval: ALWAYS
 evaluation_cases: [grounded_vi@1, grounded_en@1, unsupported_forecast@1, revoked_actor@1]
 evaluators: [reporting_numeric@1, reporting_grounding@1]
 stop_conditions: [invalid_snapshot, access_changed, verifier_rejected, budget_exhausted]
+instructions:
+  id: instructions
+  path: draft-management-report/SKILL.md
+  sha256: b31612d08eb80e24a7d439d0fadc2f417496bca2b30ab2d71eefc3cb4819e44b
+  size_bytes: 1348
+  media_type: text/markdown
+resources: []

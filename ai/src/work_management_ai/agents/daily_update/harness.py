@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-from importlib.resources import files
 from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
@@ -34,8 +33,12 @@ from work_management_ai.runtime.contracts import (
     ToolExecutorPort,
     VerifierResult,
 )
-from work_management_ai.runtime.manifests import AgentManifest, SkillManifest, load_yaml_resource
+from work_management_ai.runtime.manifests import AgentManifest, load_yaml_resource
 from work_management_ai.runtime.policy_guard import PolicyGuard
+from work_management_ai.runtime.skill_bundle import (
+    load_packaged_skill_manifest,
+    read_skill_instructions,
+)
 from work_management_ai.tools.daily_update.contracts import DailyUpdateToolInput
 
 
@@ -153,8 +156,8 @@ class DailyUpdateHarness:
             for reference in self.manifest.allowed_skills:
                 name = reference.split("@", maxsplit=1)[0]
                 package = f"work_management_ai.skills.{name}"
-                load_yaml_resource(package, "skill.yaml", SkillManifest)
-                instructions.append(files(package).joinpath("SKILL.md").read_text())
+                skill = load_packaged_skill_manifest(package)
+                instructions.append(read_skill_instructions(package, skill))
             state["instructions"] = "\n".join(instructions)
             state["tool_input"] = DailyUpdateToolInput(
                 action="CONTEXT",

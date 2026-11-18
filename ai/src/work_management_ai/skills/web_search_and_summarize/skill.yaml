@@ -1,8 +1,9 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: web_search_and_summarize
-version: "1.0.0"
+version: "1.0.1"
 owner: knowledge-retrieval
-description: Find public web evidence and return a grounded bilingual summary or evidence-only fallback.
+# Compatibility mirror of web-search-and-summarize/SKILL.md frontmatter.
+description: "Find and summarize public evidence, or return evidence only, when the user requests a public web lookup."
 runnable_by_agents: [retrieve]
 allowed_tools: [web.search@1, web.read_pages@1, web.revalidate@1]
 risk_level: READ_ONLY
@@ -16,3 +17,10 @@ triggers:
 required_context: [authenticated_actor, active_web_capability, validated_public_query, remaining_budget]
 approval: NONE
 stop_conditions: [actor_revoked, inactive_capability, forbidden_egress, budget_exhausted, cancelled]
+instructions:
+  id: instructions
+  path: web-search-and-summarize/SKILL.md
+  sha256: f28f446636d8bf5611e9eee154565496d4a871c43d6aae67f7f2312ba4db2006
+  size_bytes: 1945
+  media_type: text/markdown
+resources: []

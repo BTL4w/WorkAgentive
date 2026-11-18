@@ -1,8 +1,9 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: extract_daily_update
-version: "1.0.0"
+version: "1.0.1"
 owner: progress-agent
-description: Prepare an owner-reviewed daily report and compare claims with authorized originals.
+# Compatibility mirror of extract-daily-update/SKILL.md frontmatter.
+description: "Extract an owner-reviewed Daily Update draft from supplied progress and evidence when a user reports their work."
 runnable_by_agents: [daily_update]
 allowed_tools: [daily_update.prepare@1]
 risk_level: PROPOSAL_ONLY
@@ -14,3 +15,10 @@ triggers: [daily_report]
 required_context: [authenticated_actor, exact_task_version, original_evidence_versions]
 approval: ALWAYS
 stop_conditions: [invalid_contract, budget_exhausted, needs_input, await_owner]
+instructions:
+  id: instructions
+  path: extract-daily-update/SKILL.md
+  sha256: 86abc0af4345168d9d16061278d89683e2d9d45392a40ee8e8eaf81fe9af5848
+  size_bytes: 596
+  media_type: text/markdown
+resources: []

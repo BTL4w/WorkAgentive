@@ -1,8 +1,9 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: explain_verified_risk
-version: "1.0.0"
+version: "1.0.1"
 owner: risk-agent
-description: Explain authorized persisted observations
+# Compatibility mirror of explain-verified-risk/SKILL.md frontmatter.
+description: "Explain persisted, authorized risk observations when asked why a Project or Task is at risk."
 runnable_by_agents: [risk, work_intelligence]
 triggers: [risk_question, evidence_concern]
 input_contract: work_management_ai.skills.explain_verified_risk.contracts.SkillInput
@@ -13,3 +14,10 @@ risk_level: READ_ONLY
 approval: NONE
 evaluation_cases: [grounded_vi@1, grounded_en@1, revoked_actor@1, stale_source@1]
 evaluators: [risk_grounding@1]
+instructions:
+  id: instructions
+  path: explain-verified-risk/SKILL.md
+  sha256: b841f6f9ebd66ae9365a7bbeeeaa492d38e7b3c5ec4dfe7e33f8b2a7037aac67
+  size_bytes: 614
+  media_type: text/markdown
+resources: []

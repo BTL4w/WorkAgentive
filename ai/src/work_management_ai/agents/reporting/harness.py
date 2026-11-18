@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-from importlib.resources import files
 from time import monotonic
 from typing import cast
 from uuid import NAMESPACE_URL, uuid5
@@ -44,11 +43,14 @@ from work_management_ai.runtime.contracts import (
 )
 from work_management_ai.runtime.manifests import (
     AgentManifest,
-    SkillManifest,
     canonical_manifest_fingerprint,
     load_yaml_resource,
 )
 from work_management_ai.runtime.policy_guard import PolicyGuard
+from work_management_ai.runtime.skill_bundle import (
+    load_packaged_skill_manifest,
+    read_skill_instructions,
+)
 from work_management_ai.tools.reporting.contracts import ProposalReceipt
 
 
@@ -275,6 +277,7 @@ class _ReportingRun:
         self.harness, self.handoff = harness, handoff
         self.value: ReportingRequest | None = None
         self.instructions = ""
+        self.skill_versions: tuple[str, ...] = ()
         self.deadline = monotonic() + min(180, handoff.budget.timeout_seconds)
 
     async def authorize(self) -> None:
@@ -389,15 +392,18 @@ class _ReportingRun:
             await self.authorize()
             self.value = ReportingRequest.model_validate(self.handoff.typed_input)
             instructions: list[str] = []
+            skill_versions: list[str] = []
             for ref in self.harness.manifest.allowed_skills:
                 package = f"work_management_ai.skills.{ref.split('@')[0]}"
-                skill = load_yaml_resource(package, "skill.yaml", SkillManifest)
+                skill = load_packaged_skill_manifest(package)
                 if AgentId.REPORTING not in skill.runnable_by_agents or not set(
                     skill.allowed_tools
                 ).issubset(self.harness.manifest.allowed_tools):
                     raise ValueError("REPORTING_SKILL_DENIED")
-                instructions.append(files(package).joinpath("SKILL.md").read_text())
+                instructions.append(read_skill_instructions(package, skill))
+                skill_versions.append(f"{skill.name}@{skill.version}")
             self.instructions = "\n".join(instructions)
+            self.skill_versions = tuple(skill_versions)
             return
         value = self.value
         if value is None:
@@ -495,9 +501,7 @@ class _ReportingRun:
                 if context.snapshot.query_version == "daily-summary-conversion.v1"
                 else "reporting.system.v1",
                 manifest_fingerprint=canonical_manifest_fingerprint(self.harness.manifest),
-                skill_versions=tuple(
-                    f"{r.split('@')[0]}@1.0.0" for r in self.harness.manifest.allowed_skills
-                ),
+                skill_versions=self.skill_versions,
                 tool_versions=("reporting.read@1.0.0", "reporting.propose@1.0.0"),
                 model_refs=tuple(state.model_refs),
             )

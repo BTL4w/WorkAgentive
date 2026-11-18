@@ -1,8 +1,9 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: answer_work_question
-version: "1.0.0"
+version: "1.0.1"
 owner: work-intelligence
-description: Answer bilingual questions about permitted Projects, assigned Tasks, dependencies and acceptance criteria.
+# Compatibility mirror of answer-work-question/SKILL.md frontmatter.
+description: "Answer bilingual questions about authorized Projects, assigned Tasks, dependencies, or acceptance criteria."
 runnable_by_agents: [work_intelligence]
 allowed_tools: [work.read_my_tasks@1, work.read_resource@1, risk.read@1]
 risk_level: READ_ONLY
@@ -15,3 +16,10 @@ triggers:
 required_context: [authenticated_actor, tenant_scope, context_references]
 approval: NONE
 stop_conditions: [ambiguous_resource, invisible_resource, insufficient_evidence, tool_failure]
+instructions:
+  id: instructions
+  path: answer-work-question/SKILL.md
+  sha256: 60b4a68774fee9d13247086d844b1cf163680c88ae38315fc04a6c330c081247
+  size_bytes: 1379
+  media_type: text/markdown
+resources: []

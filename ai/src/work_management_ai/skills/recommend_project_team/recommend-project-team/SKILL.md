@@ -1,6 +1,6 @@
 ---
 name: recommend-project-team
-description: Use for an authorized Manager or Admin request to create or revise a deterministic Project Team proposal.
+description: "Prepare or revise a deterministic Project Team proposal when the user requests staffing recommendations."
 ---
 
 # Recommend Project Team

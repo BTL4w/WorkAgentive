@@ -1,8 +1,9 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: review_evidence_concerns
-version: "1.0.0"
+version: "1.0.1"
 owner: risk-agent
-description: Explain authorized persisted observations
+# Compatibility mirror of review-evidence-concerns/SKILL.md frontmatter.
+description: "Explain verified evidence concerns when asked about discrepancies or gaps in a Daily Update."
 runnable_by_agents: [risk, work_intelligence]
 triggers: [risk_question, evidence_concern]
 input_contract: work_management_ai.skills.review_evidence_concerns.contracts.SkillInput
@@ -13,3 +14,10 @@ risk_level: READ_ONLY
 approval: NONE
 evaluation_cases: [grounded_vi@1, grounded_en@1, revoked_actor@1, stale_source@1]
 evaluators: [risk_grounding@1]
+instructions:
+  id: instructions
+  path: review-evidence-concerns/SKILL.md
+  sha256: 0cfd9cf62612568d03b4bb827bbbb80d4b63ebfb257ab7a30f1ede7f2e6e8633
+  size_bytes: 617
+  media_type: text/markdown
+resources: []

@@ -1,8 +1,9 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: revise_project_plan
-version: "1.0.0"
+version: "1.0.1"
 owner: planning-agent
-description: Revise one exact immutable Planning proposal version for Manager review.
+# Compatibility mirror of revise-project-plan/SKILL.md frontmatter.
+description: "Revise one exact Planning proposal version when the user asks to change an existing plan for Manager review."
 runnable_by_agents: [planning]
 allowed_tools: [planning.manage_run@1]
 risk_level: PROPOSAL_ONLY
@@ -13,3 +14,10 @@ triggers: ["vi:chỉnh proposal kế hoạch", "en:revise this planning proposal
 required_context: [authenticated_actor, tenant_scope, context_references]
 approval: ALWAYS
 stop_conditions: [stale_base_version, verifier_failure, manager_decision_required, tool_failure]
+instructions:
+  id: instructions
+  path: revise-project-plan/SKILL.md
+  sha256: 665cb6ba8865af85aadb7672cddf41a2cfc784ebf5c4b22f79a74155537f2df3
+  size_bytes: 1232
+  media_type: text/markdown
+resources: []

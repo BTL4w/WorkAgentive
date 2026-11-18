@@ -1,6 +1,6 @@
 ---
 name: revise-project-plan
-description: Use when an authorized Manager or Admin requests changes to one exact immutable Planning proposal version.
+description: "Revise one exact Planning proposal version when the user asks to change an existing plan for Manager review."
 ---
 
 # Revise Project Plan

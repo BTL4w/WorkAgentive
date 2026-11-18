@@ -14,6 +14,11 @@ from pydantic import BaseModel
 from work_management_ai.runtime.contracts import AgentId
 from work_management_ai.runtime.manifests import SkillManifestV2, SkillResourceManifest
 from work_management_ai.runtime.session_history import RevalidatedSkills
+from work_management_ai.runtime.skill_bundle import (
+    SkillBundleError,
+    bundle_name_for,
+    parse_skill_markdown,
+)
 from work_management_ai.runtime.skill_registry import (
     RegisteredSkill,
     SkillRegistry,
@@ -58,14 +63,15 @@ class ApprovedPackageResources:
         try:
             root = files(package)
             path = root.joinpath(*resource.path.split("/"))
-            if isinstance(root, Path):
-                part = root
-                for name in resource.path.split("/"):
-                    part = part / name
-                    if part.is_symlink():
-                        raise SkillLoadingError("SKILL_RESOURCE_PATH_INVALID")
-                if not part.resolve().is_relative_to(root.resolve()):
+            if not isinstance(root, Path):
+                raise SkillLoadingError("SKILL_RESOURCE_PATH_INVALID")
+            part = root
+            for name in resource.path.split("/"):
+                part = part / name
+                if part.is_symlink():
                     raise SkillLoadingError("SKILL_RESOURCE_PATH_INVALID")
+            if not part.resolve().is_relative_to(root.resolve()):
+                raise SkillLoadingError("SKILL_RESOURCE_PATH_INVALID")
             if not path.is_file():
                 raise SkillLoadingError("SKILL_RESOURCE_UNAVAILABLE")
             return path
@@ -140,6 +146,8 @@ class SkillLoader:
         )
         if dependency not in self.tools.agent.skill_pins:
             raise SkillLoadingError("SKILL_VERSION_CONFLICT", stop_segment=True)
+        if entry.bundle is None and manifest.instructions.path != "SKILL.md":
+            raise SkillLoadingError("SKILL_BUNDLE_DESCRIPTOR_REQUIRED", stop_segment=True)
         if AgentId.ORCHESTRATOR not in manifest.runnable_by_agents:
             raise SkillLoadingError("SKILL_NOT_AVAILABLE", stop_segment=True)
         expected = _pin(entry, manifest)
@@ -184,10 +192,17 @@ class SkillLoader:
             or output.version != manifest.version
             or output.manifest_fingerprint != entry.fingerprint
             or output.pin != _pin(entry, manifest)
-            or output.body_sha256 != resource.sha256
             or output.media_type != resource.media_type
-            or hashlib.sha256(output.content.encode()).hexdigest() != resource.sha256
             or output.resources != expected_index
+        ):
+            raise SkillLoadingError("SKILL_VERSION_CONFLICT", stop_segment=True)
+        expected_digest = resource.sha256
+        if value.resource_id is None and entry.bundle is not None:
+            expected = self._content(entry, manifest, resource)
+            expected_digest = hashlib.sha256(expected.encode()).hexdigest()
+        if (
+            output.body_sha256 != expected_digest
+            or hashlib.sha256(output.content.encode()).hexdigest() != expected_digest
         ):
             raise SkillLoadingError("SKILL_VERSION_CONFLICT", stop_segment=True)
         current = self.tools.prepare(scope, model_ref=self.model_ref)
@@ -215,7 +230,12 @@ class SkillLoader:
                         SkillMetadata(
                             reference=reference,
                             version=manifest.version,
-                            description=manifest.description,
+                            name=entry.bundle.name
+                            if entry.bundle
+                            else bundle_name_for(manifest.name),
+                            description=(
+                                entry.bundle.description if entry.bundle else manifest.description
+                            ),
                             triggers=manifest.triggers,
                             manifest_fingerprint=entry.fingerprint,
                             instructions_sha256=manifest.instructions.sha256,
@@ -227,6 +247,32 @@ class SkillLoader:
                 admitted.close()
         except ToolCatalogError:
             raise SkillLoadingError("SKILL_CATALOG_UNAVAILABLE", stop_segment=True) from None
+
+    def _content(
+        self, entry: RegisteredSkill, manifest: SkillManifestV2, resource: SkillResourceManifest
+    ) -> str:
+        try:
+            text = self.resources.read(manifest, resource).decode("utf-8", errors="strict")
+        except UnicodeDecodeError:
+            raise SkillLoadingError("SKILL_RESOURCE_ENCODING") from None
+        if any(ord(c) < 32 and c not in "\r\n\t" for c in text):
+            raise SkillLoadingError("SKILL_RESOURCE_ENCODING")
+        if resource.media_type == "application/json":
+            try:
+                json.loads(text)
+            except (ValueError, RecursionError):
+                raise SkillLoadingError("SKILL_RESOURCE_INVALID") from None
+        if resource == manifest.instructions and entry.bundle is not None:
+            try:
+                frontmatter, text = parse_skill_markdown(text)
+            except SkillBundleError as exc:
+                raise SkillLoadingError(exc.code) from None
+            if (frontmatter.name, frontmatter.description) != (
+                entry.bundle.name,
+                entry.bundle.description,
+            ):
+                raise SkillLoadingError("SKILL_BUNDLE_DESCRIPTOR_MISMATCH")
+        return text
 
     def load(self, scope: RunScope, value: LoadSkillInput) -> LoadedSkill:
         value = LoadSkillInput.model_validate(value)
@@ -246,18 +292,7 @@ class SkillLoader:
                         raise SkillLoadingError("SKILL_INSTRUCTIONS_NOT_LOADED")
                 else:
                     resource = manifest.instructions
-                body = self.resources.read(manifest, resource)
-                try:
-                    text = body.decode("utf-8", errors="strict")
-                except UnicodeDecodeError:
-                    raise SkillLoadingError("SKILL_RESOURCE_ENCODING") from None
-                if any(ord(c) < 32 and c not in "\r\n\t" for c in text):
-                    raise SkillLoadingError("SKILL_RESOURCE_ENCODING")
-                if resource.media_type == "application/json":
-                    try:
-                        json.loads(text)
-                    except (ValueError, RecursionError):
-                        raise SkillLoadingError("SKILL_RESOURCE_INVALID") from None
+                text = self._content(entry, manifest, resource)
                 effective = tuple(
                     sorted(set(manifest.allowed_tools) & {v.reference for v in admitted.schemas})
                 )
@@ -270,7 +305,7 @@ class SkillLoader:
                     reference=entry.reference,
                     version=manifest.version,
                     manifest_fingerprint=entry.fingerprint,
-                    body_sha256=resource.sha256,
+                    body_sha256=hashlib.sha256(text.encode()).hexdigest(),
                     resource_id=value.resource_id,
                     content=text,
                     media_type=resource.media_type,

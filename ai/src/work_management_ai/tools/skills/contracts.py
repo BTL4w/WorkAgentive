@@ -26,6 +26,7 @@ class SkillResourceInfo(_Contract):
 class SkillMetadata(_Contract):
     reference: str
     version: str
+    name: str
     description: str
     triggers: tuple[str, ...]
     manifest_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")

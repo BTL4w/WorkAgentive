@@ -1,3 +1,7 @@
+---
+name: draft-management-report
+description: "Draft a grounded management narrative when a report is requested or a scheduled summary is due."
+---
 # Verified project reporting v1
 
 Trigger: authorized report request or committed summary job. Input: SkillInput;

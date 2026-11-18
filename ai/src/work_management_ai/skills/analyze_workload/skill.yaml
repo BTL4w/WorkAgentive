@@ -1,8 +1,9 @@
-schema_version: "1.0"
+schema_version: "2.0"
 name: analyze_workload
-version: "1.0.0"
+version: "1.0.1"
 owner: assignment-agent
-description: Explain a verified deterministic Project workload projection without changing it.
+# Compatibility mirror of analyze-workload/SKILL.md frontmatter.
+description: "Explain verified Project workload projections when asked who is overloaded or has capacity."
 runnable_by_agents: [assignment]
 allowed_tools: [assignment.read_workload@1]
 risk_level: READ_ONLY
@@ -19,3 +20,10 @@ triggers:
 required_context: [authenticated_actor, tenant_scope, exact_project, verified_workload]
 approval: NONE
 stop_conditions: [ambiguous_resource, verifier_failure, tool_failure]
+instructions:
+  id: instructions
+  path: analyze-workload/SKILL.md
+  sha256: 26f8586376e1ec82034fead36bd1392d5ef7510cb648624952f20c420754c624
+  size_bytes: 677
+  media_type: text/markdown
+resources: []
