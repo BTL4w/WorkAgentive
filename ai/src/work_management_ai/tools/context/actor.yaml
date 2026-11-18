@@ -1,6 +1,6 @@
 schema_version: "2.0"
 name: read_actor_context
-version: "1.0.1"
+version: "1.0.2"
 owner: ai-runtime
 tenant_scope: actor_membership
 roles: [ADMIN, MANAGER, EMPLOYEE]
@@ -14,6 +14,6 @@ idempotency: NOT_APPLICABLE
 audit: SAFE_METADATA
 trace_metadata: [tool_id, duration_ms, result_status]
 description: >-
-  Read identity context about the authenticated actor when the request depends on who is asking
-  or their organization. Provide the requested sections. Returns scoped identity facts, coverage,
-  and gaps for unsupported sections. Use authorized Project discovery for Project context.
+  Read the signed-in user's display name and organization name when either is needed and
+  missing. This reads the current actor only; it does not look up another person or return
+  roles, permissions or workload. Unsupported sections return NOT_SUPPORTED.

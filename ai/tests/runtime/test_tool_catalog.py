@@ -109,7 +109,7 @@ def test_tool_catalog_rejects_same_major_replacement_after_agent_registration():
     prior = f.tools.resolve("load_skill@1").manifest
     replacement = ToolRegistry(
         [
-            prior.model_copy(update={"version": "1.0.2"}),
+            prior.model_copy(update={"version": "1.0.3"}),
             f.tools.resolve("read_actor_context@1").manifest,
         ]
     )

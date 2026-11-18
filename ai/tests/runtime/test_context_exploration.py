@@ -105,7 +105,7 @@ def observation(
         objective_ref=objective,
         invocation_id=uuid4(),
         tool_reference="explore_projects@1",
-        tool_version="1.0.1",
+        tool_version="1.0.2",
         observed_at=NOW,
         outcome="OK",
         context_refs=refs,
@@ -131,7 +131,7 @@ def observation(
 
 def test_projector_rejects_observation_from_unpinned_tool_version() -> None:
     scope, objective, sources, projector = fixture()
-    stale = observation(scope, objective).model_copy(update={"tool_version": "1.0.0"})
+    stale = observation(scope, objective).model_copy(update={"tool_version": "1.0.1"})
     sources.values[stale.invocation_id] = stale
     with pytest.raises(ToolPolicyError, match="CONTEXT_TOOL_VERSION_CONFLICT") as error:
         projector.apply(projector.empty(), stale)

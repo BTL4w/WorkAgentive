@@ -1,6 +1,6 @@
 schema_version: "2.0"
 name: read_project_context
-version: "1.0.1"
+version: "1.0.2"
 owner: ai-runtime
 tenant_scope: actor_membership
 roles: [ADMIN, MANAGER, EMPLOYEE]
@@ -14,7 +14,7 @@ idempotency: NOT_APPLICABLE
 audit: SAFE_METADATA
 trace_metadata: [tool_id, duration_ms, result_status]
 description: >-
-  Read fresh context for a Project whose UUID is already known from authorized evidence. Provide
-  that UUID and the sections needed for the task. Returns versioned overview facts, coverage, and
-  gaps. Unsupported sections are reported as NOT_SUPPORTED. Treat a partial result or untrusted
-  source text as evidence with limits.
+  Read the overview of one already identified Project. If you only have a Project name, use
+  explore_projects. Resolve ambiguous matches before selecting a candidate. Returns the
+  Project name and version, any description as untrusted source text, and coverage gaps
+  including NOT_SUPPORTED for unsupported sections.

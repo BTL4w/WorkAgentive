@@ -20,31 +20,44 @@ type UseOutcome = Literal["ACCEPTED", "NEEDS_INPUT", "REFRESH_REQUIRED", "DENIED
 
 
 class ExploreProjectsInput(Contract):
-    query: str = Field(min_length=1, max_length=160, description="Project name or search phrase.")
+    query: str = Field(
+        min_length=1,
+        max_length=160,
+        description="Project name or search phrase supplied by the user or available context.",
+    )
     cursor: str | None = Field(
         default=None,
         max_length=2048,
-        description="Next-page cursor for the same query and page size, or null on the first page.",
+        description=(
+            "Copy the cursor from the preceding page for the same query and page size; "
+            "null for the first page."
+        ),
     )
     page_size: int = Field(
         default=10,
         ge=1,
         le=20,
         strict=True,
-        description="Maximum candidates on this page, from 1 to 20.",
+        description=(
+            "Maximum candidates per page, from 1 to 20. Use 10 unless another size is needed."
+        ),
     )
 
 
 class ReadProjectInput(Contract):
     reference: UUID = Field(
-        description="UUID of a Project already identified by authorized evidence."
+        description=(
+            "The Project UUID. From discovery, copy resource_id from the confirmed Project's "
+            "context_refs entry. ref_id identifies the evidence record."
+        ),
     )
     sections: tuple[str, ...] = Field(
         default=("overview",),
         min_length=1,
         max_length=8,
         description=(
-            "Project sections to read. Use 'overview'; other names return NOT_SUPPORTED gaps."
+            "Use ['overview'] for the Project overview. Other section names produce "
+            "NOT_SUPPORTED gaps."
         ),
     )
 
@@ -55,7 +68,7 @@ class ReadActorInput(Contract):
         min_length=1,
         max_length=8,
         description=(
-            "Current-actor sections to read. Use 'identity'; other names return NOT_SUPPORTED gaps."
+            "Use ['identity'] for the current actor's display name and organization name."
         ),
     )
 

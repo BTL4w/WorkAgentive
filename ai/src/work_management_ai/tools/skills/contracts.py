@@ -15,12 +15,18 @@ class LoadSkillInput(_Contract):
     skill_ref: str = Field(
         pattern=r"^[a-z][a-z0-9_.-]*@[1-9][0-9]*$",
         max_length=100,
-        description="Exact name@major reference shown in the current Skill catalog.",
+        description=(
+            "Copy the exact name@major from the catalog's reference field, including underscores "
+            "and version."
+        ),
     )
     resource_id: str | None = Field(
         default=None,
         pattern=r"^[a-z][a-z0-9_-]{0,63}$",
-        description="Null for instructions, or a declared companion ID from the loaded Skill.",
+        description=(
+            "Use null for instructions. For a companion, copy its ID from the already-loaded "
+            "Skill's resource list."
+        ),
     )
 
 
