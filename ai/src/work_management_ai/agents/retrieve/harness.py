@@ -32,7 +32,7 @@ from work_management_ai.agents.retrieve.evidence import (
     source_is_valid,
     synthesis_sources,
 )
-from work_management_ai.agents.retrieve.prompts.system_v1 import PROMPT_VERSION, SYSTEM_V1
+from work_management_ai.agents.retrieve.prompts.system_v1 import SYNTHESIS_INVOCATION_KEY, SYSTEM_V1
 from work_management_ai.agents.retrieve.workflows.graph import RetrieveGraph, RetrieveState
 from work_management_ai.model_gateway.contracts import (
     ModelGateway,
@@ -559,7 +559,7 @@ class _RetrieveRun:
                 async with asyncio.timeout(timeout):
                     response = await self.harness.gateway.generate_structured(
                         StructuredModelRequest(
-                            invocation_key=PROMPT_VERSION,
+                            invocation_key=SYNTHESIS_INVOCATION_KEY,
                             messages=messages,
                             output_schema=GroundedSummary,
                             timeout_seconds=timeout,

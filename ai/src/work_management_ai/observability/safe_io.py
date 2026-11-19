@@ -73,7 +73,7 @@ _CONTAINERS = frozenset(
 _ENUMS: dict[str, frozenset[str]] = {
     # Fixed protocol identities, never provider/source-supplied free-form strings.
     "workflow_version": frozenset({"retrieve.web.v1"}),
-    "prompt_version": frozenset({"retrieve.synthesis.v1"}),
+    "prompt_version": frozenset({"retrieve.synthesis.v1", "retrieve.synthesis.v2"}),
     "verifier_version": frozenset({"retrieve_grounding@1"}),
     "locale": frozenset({"vi", "en"}),
     "agent_id": frozenset(

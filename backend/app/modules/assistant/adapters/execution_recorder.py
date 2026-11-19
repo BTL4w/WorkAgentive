@@ -13,6 +13,9 @@ from app.modules.assistant.domain.models import (
 from app.modules.assistant.domain.models import AgentRunStatus as DomainAgentRunStatus
 from app.modules.identity.domain.auth import AuthenticatedActor
 from work_management_ai.agents.orchestrator.contracts import OrchestratorOutput
+from work_management_ai.agents.retrieve.prompts.system_v1 import (
+    PROMPT_VERSION as RETRIEVE_PROMPT_VERSION,
+)
 from work_management_ai.runtime.activation import ActivationContext
 from work_management_ai.runtime.agent_registry import AgentRegistry
 from work_management_ai.runtime.contracts import (
@@ -340,7 +343,7 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                                 "versions": {
                                     "workflow": "retrieve.web.v1",
                                     "skill": "web_search_and_summarize@1",
-                                    "prompt": "retrieve.synthesis.v1",
+                                    "prompt": RETRIEVE_PROMPT_VERSION,
                                     "verifier": "retrieve_grounding@1",
                                 }
                             }

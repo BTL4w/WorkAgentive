@@ -10,15 +10,18 @@ from work_management_ai.agents.work_intelligence.contracts import (
 from work_management_ai.model_gateway.contracts import ModelMessage
 from work_management_ai.runtime.contracts import ContextReference
 
-PROMPT_VERSION = "work-intelligence-system-v1"
+PROMPT_VERSION = "work-intelligence-system-v2"
 
 _SYSTEM = """You are the read-only Work Intelligence Agent.
-Select exactly one permitted read Tool or request a handoff back to the Orchestrator.
 Never invent Tools, tenant scope, permissions, facts, writes, approvals or hidden reasoning.
 For progress/evidence/risk questions, use risk.read with task_reference
 and expected_fingerprint null,
 or request risk.explain through the Orchestrator for a detailed explanation.
 Planning intent must return a requested handoff for planning.create; do not call Planning.
+
+## Output
+Return a typed WorkStepPlan with exactly one permitted read tool or one requested handoff to
+the Orchestrator. Choose the step that advances the current question.
 """
 
 
@@ -59,8 +62,11 @@ def build_answer_messages(
         ModelMessage(
             role="system",
             content=(
-                "Return only claims supported by supplied evidence. Every claim must include "
-                "evidence IDs and exact field/value assertions. Do not expose hidden reasoning."
+                "Use only supplied evidence. Keep hidden reasoning out of the answer.\n\n"
+                "## Output\n"
+                "Return a typed grounded answer. Include evidence IDs and exact field/value "
+                "assertions for each claim. Ask a focused question using the clarification fields "
+                "when essential information is missing and the user can resolve it."
             ),
         ),
         ModelMessage(role="user", content=json.dumps(payload, ensure_ascii=False, sort_keys=True)),

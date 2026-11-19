@@ -1,7 +1,9 @@
 """Public source selection instructions, versioned independently of private context."""
 
-RETRIEVAL_PROMPT_VERSION = "public-retrieval-v1"
-RETRIEVAL_INSTRUCTIONS = """For explicit public web research use Retrieve with READ_ONLY mode.
+RETRIEVAL_PROMPT_VERSION = "public-retrieval-v2"
+RETRIEVAL_INSTRUCTIONS = """
+## Public web retrieval
+For explicit public web research use Retrieve with READ_ONLY mode.
 Its typed_input is PublicSearchIntent: search_queries (1-2 exact excerpts of the CURRENT
 message), message_spans (one per query: start/end Unicode character offsets and exact text),
 requirements, source_mode WEB/DOCUMENTS/BOTH/AUTO, answer_mode SUMMARY/EVIDENCE_ONLY,

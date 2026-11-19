@@ -8,6 +8,7 @@ from uuid import UUID
 from pydantic import BaseModel
 
 from work_management_ai.prompts.planning import PLANNING_PROMPT_VERSION
+from work_management_ai.prompts.progressive_planning import PROGRESSIVE_PLANNING_PROMPT_VERSION
 from work_management_ai.schemas.planning import PlanningModelOutput, ProposedTask
 from work_management_ai.schemas.progressive_planning import (
     DraftBinding,
@@ -165,7 +166,7 @@ class ProgressivePlanningState:
     workflow_version: str = "3.0.0"
     schema_version: str = "planning-draft.v1"
     model_reference: str = "unknown"
-    prompt_version: str = "progressive-planning.v3"
+    prompt_version: str = PROGRESSIVE_PLANNING_PROMPT_VERSION
     verifier_version: str = "1.2.0"
 
 

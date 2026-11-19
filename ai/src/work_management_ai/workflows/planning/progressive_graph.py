@@ -167,8 +167,8 @@ async def run_progressive(
                                     "approval/capacity. Explicit AI assumptions with visible "
                                     "reasons are allowed for nonessential details, never for "
                                     "the goal itself. Preserve the user-stated goal and "
-                                    "constraints. Return safe findings without reasoning or "
-                                    "raw context."
+                                    "constraints.\n\n## Output\nReturn only typed findings about "
+                                    "the current draft, without hidden reasoning or raw context."
                                 ),
                             ),
                             ModelMessage(

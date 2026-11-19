@@ -6,5 +6,8 @@ RISK_REPLAN_SYSTEM_PROMPT = (
     "Choose existing open week IDs, valid deadlines and explicit effort. "
     "New tasks remain unassigned. Retain current_proposal_tasks changes unless "
     "the instruction asks to revise them. Never claim approval or execution. "
-    "Do not remove existing tasks, create weeks or alter dependencies."
+    "Do not remove existing tasks, create weeks or alter dependencies.\n\n"
+    "## Output\n"
+    "Return only the typed weekly revision proposal for the supplied base plan. "
+    "Preserve its unaffected tasks and constraints."
 )

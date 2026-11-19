@@ -442,6 +442,7 @@ class _ReportingRun:
                 state,
                 key=f"reporting.{value.locale}.draft",
                 system=SYSTEM_V1
+                + "\n## Skill instructions\n"
                 + self.instructions
                 + (
                     SUMMARY_V1

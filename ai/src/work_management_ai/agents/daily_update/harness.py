@@ -176,13 +176,12 @@ class DailyUpdateHarness:
             verify_context(value, snapshot)
         elif node == "extract_report":
             state["model_attempts"] += 1
+            system = SYSTEM_V1 + "\n\n## Skill instructions\n" + state["instructions"]
             response = await self.gateway.generate_structured(
                 StructuredModelRequest(
                     invocation_key=f"daily_update.{value.locale}.extract",
                     messages=(
-                        ModelMessage(
-                            role="system", content=SYSTEM_V1 + "\n" + state["instructions"]
-                        ),
+                        ModelMessage(role="system", content=system),
                         ModelMessage(
                             role="user",
                             content=json.dumps(

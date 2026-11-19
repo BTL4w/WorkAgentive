@@ -29,6 +29,7 @@ from work_management_ai.agents.orchestrator.harness import OrchestratorHarness
 from work_management_ai.agents.retrieve.budget import ModelReservation, RetrievalCheckpoint
 from work_management_ai.agents.retrieve.contracts import PublicURL, RetrieveOutput, WebEvidence
 from work_management_ai.agents.retrieve.harness import RetrieveHarness
+from work_management_ai.agents.retrieve.prompts.system_v1 import PROMPT_VERSION
 from work_management_ai.model_gateway.contracts import ModelGateway, ModelUsage
 from work_management_ai.model_gateway.errors import ModelTimeoutError
 from work_management_ai.model_gateway.mock import MockModelGateway
@@ -134,7 +135,7 @@ class RetrieveEvaluationReport(BaseModel):
         default_factory=lambda: {
             "workflow": "retrieve.web.v1",
             "verifier": "retrieve_grounding@1",
-            "prompt": "retrieve.synthesis.v1",
+            "prompt": PROMPT_VERSION,
             "fixture": "retrieve-regression.v1",
         }
     )

@@ -184,10 +184,11 @@ class _RiskRun:
                     },
                     ensure_ascii=False,
                 )
+                system = SYSTEM_V1 + "\n\n## Skill instructions\n" + self.instructions
                 # UTF-8 bytes bound conservatively bounds token count for text.
                 input_bound = (
                     len(content.encode())
-                    + len((SYSTEM_V1 + self.instructions).encode())
+                    + len(system.encode())
                     + len(json.dumps(RiskExplanation.model_json_schema()).encode())
                     + 1024
                 )
@@ -198,9 +199,7 @@ class _RiskRun:
                     StructuredModelRequest(
                         invocation_key=f"risk.{self.value.locale}.explain",
                         messages=(
-                            ModelMessage(
-                                role="system", content=SYSTEM_V1 + "\n" + self.instructions
-                            ),
+                            ModelMessage(role="system", content=system),
                             ModelMessage(role="user", content=content),
                         ),
                         output_schema=RiskExplanation,

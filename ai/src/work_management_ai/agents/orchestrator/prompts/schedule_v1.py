@@ -2,7 +2,7 @@
 
 from work_management_ai.model_gateway.contracts import ModelMessage
 
-PROMPT_VERSION = "orchestrator-schedule-v1.1"
+PROMPT_VERSION = "orchestrator-schedule-v1.2"
 _SYSTEM = """Extract only the explicit daily-summary schedule request.
 No tenant, role, approval or business write.
 Return exact Project/person references from the message; use SELF for the requester.
@@ -12,6 +12,10 @@ Set NONE only for an explicit disable request; otherwise null. Drafts always nee
 Leave narrative_locale null; the application supplies the conversation language when enabling.
 CONFIGURE creates only a preview. PAUSE/RESUME also require human confirmation.
 Weekdays are Monday=1 through Sunday=7. Use IANA timezone.
+
+## Output
+Return only the typed ScheduleIntent. Leave unspecified fields null so the runtime can decide
+whether the request needs clarification or can proceed to preview.
 """
 
 
