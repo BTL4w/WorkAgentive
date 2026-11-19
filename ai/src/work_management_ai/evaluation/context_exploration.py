@@ -19,6 +19,7 @@ from work_management_ai.evaluation.context_exploration_cases import (
     AssertionName,
     Fixture,
 )
+from work_management_ai.evaluation.context_exploration_skill_cases import SKILL, SkillToolFixture
 from work_management_ai.runtime.manifests import SkillManifestV2
 from work_management_ai.runtime.skill_bundle import read_skill_instructions
 from work_management_ai.runtime.skill_registry import SkillRegistry
@@ -32,13 +33,15 @@ DEFAULT_CORPUS = _AI_ROOT / "evaluations/context_exploration.jsonl"
 DEFAULT_OUTPUT = _REPOSITORY / "docs/superpowers/verification/orchestrator-runs/task-8.4"
 EVALUATOR = "context_exploration@1"
 REVISION = re.compile(r"[a-f0-9]{40}")
-SKILL = "explore_work_context@1"
-TOOL_RESOURCES = tuple(
-    ("work_management_ai.tools.context", f"{resource}.yaml")
-    for resource in ("projects", "project", "actor")
+TOOL_RESOURCES = (
+    ("work_management_ai.tools.skills", "load.yaml"),
+    *(
+        ("work_management_ai.tools.context", f"{resource}.yaml")
+        for resource in ("projects", "project", "actor")
+    ),
 )
 # Required coverage is independent of the fixture file and of runner availability.
-REQUIRED_SCENARIOS = (
+BASELINE_SCENARIOS = (
     "hello",
     "mixed",
     "unique",
@@ -51,6 +54,17 @@ REQUIRED_SCENARIOS = (
     "overflow",
     "cross_scope",
     "actor",
+)
+REQUIRED_SCENARIOS = (
+    *BASELINE_SCENARIOS,
+    "cursor_resume",
+    "project_exact",
+    "project_unavailable",
+    "actor_mixed_sections",
+    "actor_roles_only",
+    "skill_load",
+    "skill_missing_resource",
+    "skill_revoked",
 )
 type Locale = Literal["vi", "en"]
 _LOCALES: tuple[Locale, ...] = ("vi", "en")
@@ -122,7 +136,7 @@ class CaseResult(Contract):
 class ContextExplorationEvaluationReport(Contract):
     schema_version: Literal["1.0"] = "1.0"
     evaluator: Literal["context_exploration@1"] = EVALUATOR
-    evaluator_version: Literal["1.0.0"] = "1.0.0"
+    evaluator_version: Literal["1.0.0", "1.1.0"] = "1.1.0"
     run_id: UUID
     started_at: AwareDatetime
     revision: str = Field(pattern=r"^(?:[a-f0-9]{40}|unknown)$")
@@ -141,7 +155,11 @@ class ContextExplorationEvaluationReport(Contract):
     @model_validator(mode="after")
     def verify_report(self) -> Self:
         ids = {case.case_id for case in self.cases}
-        if ids != EXPECTED_CASES.keys() or len(ids) != len(self.cases):
+        scenarios = BASELINE_SCENARIOS if self.evaluator_version == "1.0.0" else REQUIRED_SCENARIOS
+        expected_ids = {
+            f"context_{scenario}_{locale}@1" for scenario in scenarios for locale in _LOCALES
+        }
+        if ids != expected_ids or len(ids) != len(self.cases):
             raise ValueError("CASE_INVENTORY_MISMATCH")
         if self.counts != _counts(self.cases) or self.passed != _passed(
             self.cases, self.corpus_violations
@@ -160,11 +178,7 @@ def _counts(results: Sequence[CaseResult]) -> dict[Status, int]:
 
 
 def _passed(results: Sequence[CaseResult], violations: Sequence[CorpusViolation]) -> bool:
-    return (
-        not violations
-        and len(results) == len(EXPECTED_CASES)
-        and all(case.status == "PASS" for case in results)
-    )
+    return not violations and bool(results) and all(case.status == "PASS" for case in results)
 
 
 def _revision() -> tuple[str, bool | None]:
@@ -252,7 +266,7 @@ async def _execute_case(
     scenario: str,
     locale: Locale,
     case: Case | None,
-    tool_pins: tuple[VersionPin, ...],
+    skill_tools: SkillToolFixture,
     instructions: str,
 ) -> CaseResult:
     mode = _mode(scenario)
@@ -266,7 +280,9 @@ async def _execute_case(
             violations=("CASE_MISSING" if case is None else "CASE_UNEXECUTED",),
         )
     try:
-        checks = await runner(Fixture(case_id, case.request, tool_pins))
+        checks = await runner(
+            Fixture(case_id, case.request, skill_tools.agent.tool_pins, skill_tools)
+        )
         assertions = tuple(Assertion(name=name, passed=value) for name, value in checks.items())
     except Exception:
         return CaseResult(
@@ -316,14 +332,14 @@ async def evaluate_context_exploration(
     ):
         violations.add("MANIFEST_CASE_MISMATCH")
     tools = ToolRegistry.from_resources(TOOL_RESOURCES)
-    tool_pins = tuple(
-        entry.pin for entry in tools.candidate_definitions(skill.manifest.allowed_tools)
+    skill_tools = SkillToolFixture(
+        registry, tools, CONTEXT_EXPLORATION_EVALUATORS, skill.manifest.allowed_tools
     )
     results = tuple(
         await asyncio.gather(
             *(
                 _execute_case(
-                    case_id, scenario, locale, cases.get(case_id), tool_pins, instructions
+                    case_id, scenario, locale, cases.get(case_id), skill_tools, instructions
                 )
                 for case_id, (scenario, locale) in EXPECTED_CASES.items()
             )
@@ -339,7 +355,7 @@ async def evaluate_context_exploration(
         skill_pin=VersionPin(
             reference=SKILL, version=skill.manifest.version, fingerprint=skill.fingerprint
         ),
-        tool_pins=tool_pins,
+        tool_pins=skill_tools.agent.tool_pins,
         cases=results,
         counts=_counts(results),
         corpus_violations=tuple(sorted(violations)),

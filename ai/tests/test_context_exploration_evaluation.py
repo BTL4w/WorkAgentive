@@ -14,8 +14,35 @@ async def test_default_cases_run_bilingually_and_preserve_unmeasured_model_quali
     assert {case.execution_mode for case in report.cases} == {"STATIC", "DETERMINISTIC"}
     assert all(case.status == "PASS" and case.assertions for case in report.cases)
     assert report.model_selection == report.hosted_quality == "NOT_RUN"
-    assert report.corpus_sha256 and report.skill_pin.version == "1.0.2"
-    assert len(report.tool_pins) == 3
+    assert report.corpus_sha256 and report.skill_pin.version == "1.0.3"
+    assert report.counts == {"PASS": 40, "FAIL": 0, "NOT_RUN": 0}
+    assert {pin.reference for pin in report.tool_pins} == {
+        "explore_projects@1",
+        "read_project_context@1",
+        "read_actor_context@1",
+        "load_skill@1",
+    }
+    for scenario in ("skill_load", "skill_missing_resource", "skill_revoked"):
+        assert sum(case.case_id.startswith(f"context_{scenario}_") for case in report.cases) == 2
+
+
+@pytest.mark.asyncio
+async def test_reports_from_before_the_corpus_expansion_still_validate() -> None:
+    report = await evaluation.evaluate_context_exploration()
+    payload = report.model_dump(mode="json")
+    payload["evaluator_version"] = "1.0.0"
+    baseline_ids = {
+        f"context_{scenario}_{locale}@1"
+        for scenario in evaluation.BASELINE_SCENARIOS
+        for locale in ("vi", "en")
+    }
+    payload["cases"] = [case for case in payload["cases"] if case["case_id"] in baseline_ids]
+    payload["tool_pins"] = [
+        pin for pin in payload["tool_pins"] if pin["reference"] != "load_skill@1"
+    ]
+    payload["counts"] = {"PASS": 24, "FAIL": 0, "NOT_RUN": 0}
+    baseline = evaluation.ContextExplorationEvaluationReport.model_validate(payload)
+    assert baseline.passed and len(baseline.cases) == 24
 
 
 def test_cli_saves_distinct_reports_for_same_revision(

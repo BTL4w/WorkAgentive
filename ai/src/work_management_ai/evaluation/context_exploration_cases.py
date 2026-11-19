@@ -7,11 +7,13 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import ValidationError
 
+from work_management_ai.evaluation.context_exploration_skill_cases import SKILL, SkillToolFixture
 from work_management_ai.runtime.context_exploration import (
     ContextAccessDecision,
     ContextUseValidator,
     ExplorationProjector,
 )
+from work_management_ai.runtime.skill_loading import SkillLoadingError
 from work_management_ai.runtime.tool_loop_contracts import RunScope, VersionPin
 from work_management_ai.skills.explore_work_context.contracts import ExploreWorkContextInput
 from work_management_ai.tools.context.contracts import (
@@ -30,15 +32,19 @@ from work_management_ai.tools.context.contracts import (
     SourceContent,
     UseOutcome,
 )
+from work_management_ai.tools.skills.contracts import LoadedSkill, LoadSkillInput
 
 type ToolReference = Literal["explore_projects@1", "read_project_context@1", "read_actor_context@1"]
 type AssertionName = Literal[
     "absence_keeps_permission_ambiguity",
     "actor_is_current_membership",
+    "actor_known_sections_stay_partial",
+    "actor_unsupported_only_is_empty",
     "ambiguous_use_needs_input",
     "canonical_provenance",
     "cross_scope_observation_rejected",
     "cross_scope_use_denied",
+    "cursor_page_keeps_discovery_unresolved",
     "forged_observation_rejected",
     "missing_not_complete",
     "no_context_requested",
@@ -47,9 +53,14 @@ type AssertionName = Literal[
     "partial_page_not_unique",
     "partial_use_needs_input",
     "playbook_applicability",
+    "project_exact_uuid_preserves_version",
+    "project_unavailable_never_invents_facts",
     "search_contract",
     "selected_reference_allowed",
     "source_content_stays_untrusted",
+    "skill_pinned_instructions_loaded",
+    "skill_undeclared_resource_denied",
+    "skill_cached_result_revoked",
     "stale_reference_requires_refresh",
     "unique_selection",
     "unresolved_after_reread",
@@ -61,7 +72,9 @@ DIGEST = "f" * 64
 
 
 class Fixture:
-    def __init__(self, case: str, request: str, pins: tuple[VersionPin, ...]):
+    def __init__(
+        self, case: str, request: str, pins: tuple[VersionPin, ...], skill_tools: SkillToolFixture
+    ):
         self.namespace = uuid5(NAMESPACE_URL, f"workcrew/explore-eval/{case}")
         self.scope = RunScope(
             organization_id=self.id("organization"),
@@ -74,6 +87,7 @@ class Fixture:
             objective_ref=self.id("objective"), objective=request
         ).objective_ref
         self.pins = {pin.reference: pin.version for pin in pins}
+        self.skill_tools = skill_tools
         self.observations: dict[UUID, ContextReadObservation] = {}
         self.live_versions: dict[UUID, int | None] = {}
         self.projector = ExplorationProjector(
@@ -121,6 +135,8 @@ class Fixture:
         gaps: tuple[ContextGap, ...] = (),
         description: str | None = None,
         cursor: str | None = None,
+        project_name: str = "Atlas",
+        version: int = 1,
     ) -> ContextReadObservation:
         invocation = self.id(label)
         refs = tuple(
@@ -129,7 +145,7 @@ class Fixture:
                 scope=self.scope,
                 resource_type="project",
                 resource_id=self.id(project),
-                version=1,
+                version=version,
                 fingerprint=DIGEST,
                 observed_at=NOW,
                 invocation_id=invocation,
@@ -157,7 +173,8 @@ class Fixture:
                 ),
             ),
             facts=tuple(
-                ContextFact(ref_id=ref.ref_id, field="project.name", value="Atlas") for ref in refs
+                ContextFact(ref_id=ref.ref_id, field="project.name", value=project_name)
+                for ref in refs
             ),
             source_content_refs=()
             if description is None
@@ -372,15 +389,8 @@ async def cross_scope(fixture: Fixture) -> Checks:
     }
 
 
-async def actor(fixture: Fixture) -> Checks:
-    arguments = ReadActorInput(sections=("identity",))
-    extra_rejected = False
-    try:
-        ReadActorInput.model_validate(
-            {"sections": ("identity",), "membership_id": fixture.id("other")}
-        )
-    except ValidationError:
-        extra_rejected = True
+def _actor_read(fixture: Fixture, sections: tuple[str, ...]) -> ExplorationReport:
+    arguments = ReadActorInput(sections=sections)
     invocation = fixture.id("read-actor")
     ref = ContextRef(
         ref_id=fixture.id("actor"),
@@ -392,7 +402,19 @@ async def actor(fixture: Fixture) -> Checks:
         invocation_id=invocation,
         source="current_actor_service",
     )
-    report = fixture.apply(
+    returned = ("identity",) if "identity" in sections else ()
+    gaps = tuple(
+        ContextGap(code="NOT_SUPPORTED", section=section)
+        for section in sections
+        if section != "identity"
+    )
+    facts = (
+        ContextFact(ref_id=ref.ref_id, field="actor.display_name", value="Fixture Actor"),
+        ContextFact(
+            ref_id=ref.ref_id, field="actor.organization_name", value="Fixture Organization"
+        ),
+    )
+    return fixture.apply(
         ContextReadObservation(
             scope=fixture.scope,
             objective_ref=fixture.objective,
@@ -400,22 +422,187 @@ async def actor(fixture: Fixture) -> Checks:
             tool_reference="read_actor_context@1",
             tool_version=fixture.pins["read_actor_context@1"],
             observed_at=NOW,
-            outcome="OK",
-            context_refs=(ref,),
-            facts=(
-                ContextFact(ref_id=ref.ref_id, field="actor.display_name", value="Fixture Actor"),
-            ),
+            outcome="PARTIAL" if gaps else "OK",
+            context_refs=(ref,) if returned else (),
+            facts=facts if returned else (),
             coverage=(
                 ReadCoverage(
                     requested=arguments.sections,
-                    returned=arguments.sections,
-                    status="COMPLETE",
+                    returned=returned,
+                    status="PARTIAL" if gaps else "COMPLETE",
                     query_fingerprint=DIGEST,
                 ),
             ),
+            gaps=gaps,
         )
     )
-    return {"actor_is_current_membership": report.context_refs == (ref,) and extra_rejected}
+
+
+async def actor(fixture: Fixture) -> Checks:
+    extra_rejected = False
+    try:
+        ReadActorInput.model_validate(
+            {"sections": ("identity",), "membership_id": fixture.id("other")}
+        )
+    except ValidationError:
+        extra_rejected = True
+    report = _actor_read(fixture, ("identity",))
+    return {
+        "actor_is_current_membership": len(report.context_refs) == 1
+        and report.context_refs[0].resource_id == fixture.scope.membership_id
+        and extra_rejected,
+    }
+
+
+async def actor_mixed_sections(fixture: Fixture) -> Checks:
+    report = _actor_read(fixture, ("identity", "roles"))
+    return {
+        "actor_known_sections_stay_partial": report.status == "PARTIAL"
+        and report.coverage[0].returned == ("identity",)
+        and {fact.field for fact in report.facts}
+        == {"actor.display_name", "actor.organization_name"}
+        and report.gaps == (ContextGap(code="NOT_SUPPORTED", section="roles"),),
+    }
+
+
+async def actor_roles_only(fixture: Fixture) -> Checks:
+    report = _actor_read(fixture, ("roles",))
+    return {
+        "actor_unsupported_only_is_empty": report.status == "PARTIAL"
+        and not report.context_refs
+        and not report.facts
+        and not report.coverage[0].returned
+        and report.gaps == (ContextGap(code="NOT_SUPPORTED", section="roles"),),
+    }
+
+
+async def cursor_resume(fixture: Fixture) -> Checks:
+    pages: dict[tuple[str, int, str | None], ContextReadObservation] = {
+        ("HS-26", 1, None): fixture.observation(
+            "first",
+            projects=("hom-so-a",),
+            resolution="AMBIGUOUS",
+            outcome="PARTIAL",
+            cursor="fixture-next-page",
+            project_name="HS-26",
+        ),
+        ("HS-26", 1, "fixture-next-page"): fixture.observation(
+            "second",
+            projects=("hom-so-b",),
+            resolution="AMBIGUOUS",
+            project_name="HS-26",
+        ),
+    }
+    query = ExploreProjectsInput(query="HS-26", page_size=1)
+    first = fixture.apply(pages[query.query, query.page_size, query.cursor])
+    resumed = ExploreProjectsInput(
+        query=query.query,
+        page_size=query.page_size,
+        cursor=first.coverage[0].cursor,
+    )
+    second = fixture.apply(pages[resumed.query, resumed.page_size, resumed.cursor])
+    return {
+        "cursor_page_keeps_discovery_unresolved": resumed.cursor == "fixture-next-page"
+        and len(second.source_invocation_ids) == 2
+        and tuple(ref.resource_id for ref in second.context_refs)
+        == (fixture.id("hom-so-a"), fixture.id("hom-so-b"))
+        and all(entity.resolution == "AMBIGUOUS" for entity in second.entities)
+        and second.status == "PARTIAL"
+        and not second.selected_context_refs
+        and await fixture.use((second.context_refs[-1],)) == "NEEDS_INPUT",
+    }
+
+
+async def project_exact(fixture: Fixture) -> Checks:
+    request = ReadProjectInput(reference=fixture.id("sao-mai"))
+    item = fixture.observation(
+        "project-read",
+        tool="read_project_context@1",
+        projects=("sao-mai",),
+        sections=request.sections,
+        project_name="Sao Mai",
+        version=7,
+        description="Synthetic project overview.",
+    )
+    report = fixture.apply(item)
+    return {
+        "project_exact_uuid_preserves_version": len(report.context_refs) == 1
+        and report.context_refs[0].resource_id == request.reference
+        and report.context_refs[0].version == 7
+        and report.context_refs[0].invocation_id == item.invocation_id
+        and report.facts[0].value == "Sao Mai"
+        and report.source_content_refs[0].trust == "UNTRUSTED_SOURCE_CONTENT",
+    }
+
+
+async def project_unavailable(fixture: Fixture) -> Checks:
+    request = ReadProjectInput(reference=fixture.id("sao-mai"))
+    report = fixture.apply(
+        fixture.observation(
+            "project-read",
+            tool="read_project_context@1",
+            projects=(),
+            sections=request.sections,
+            returned=(),
+            outcome="NEEDS_INPUT",
+            resolution="NOT_FOUND_OR_NOT_ACCESSIBLE",
+        )
+    )
+    return {
+        "project_unavailable_never_invents_facts": report.status == "PARTIAL"
+        and report.entities[0].resolution == "NOT_FOUND_OR_NOT_ACCESSIBLE"
+        and not report.coverage[0].returned
+        and not report.context_refs
+        and not report.facts
+        and not report.source_content_refs,
+    }
+
+
+async def skill_load(fixture: Fixture) -> Checks:
+    _, backend = fixture.skill_tools.bind(fixture.scope)
+    args = LoadSkillInput(skill_ref=SKILL)
+    context = fixture.skill_tools.invocation(fixture.scope, args)
+    result = await backend.execute(context, args)
+    await backend.revalidate_result(context, result)
+    output = result.output
+    skill = fixture.skill_tools.skills.resolve(SKILL)
+    return {
+        "skill_pinned_instructions_loaded": isinstance(output, LoadedSkill)
+        and output.reference == SKILL
+        and output.version == skill.manifest.version
+        and output.resource_id is None
+        and result.loaded_skill == output.pin
+        and bool(output.content)
+        and not output.content.startswith("---")
+        and set(output.effective_tools) == set(skill.manifest.allowed_tools),
+    }
+
+
+async def skill_missing_resource(fixture: Fixture) -> Checks:
+    _, backend = fixture.skill_tools.bind(fixture.scope)
+    instructions = LoadSkillInput(skill_ref=SKILL)
+    await backend.execute(fixture.skill_tools.invocation(fixture.scope, instructions), instructions)
+    args = LoadSkillInput(skill_ref=SKILL, resource_id="overview-example")
+    try:
+        await backend.execute(fixture.skill_tools.invocation(fixture.scope, args), args)
+    except SkillLoadingError as exc:
+        return {"skill_undeclared_resource_denied": exc.code == "SKILL_RESOURCE_NOT_DECLARED"}
+    return {"skill_undeclared_resource_denied": False}
+
+
+async def skill_revoked(fixture: Fixture) -> Checks:
+    access, backend = fixture.skill_tools.bind(fixture.scope)
+    args = LoadSkillInput(skill_ref=SKILL)
+    context = fixture.skill_tools.invocation(fixture.scope, args)
+    result = await backend.execute(context, args)
+    access.revoked = True
+    try:
+        await backend.revalidate_result(context, result)
+    except SkillLoadingError as exc:
+        return {
+            "skill_cached_result_revoked": exc.code == "SKILL_NOT_AVAILABLE" and exc.stop_segment,
+        }
+    return {"skill_cached_result_revoked": False}
 
 
 SCENARIO_RUNNERS: dict[str, Callable[[Fixture], Awaitable[Checks]]] = {
@@ -431,4 +618,12 @@ SCENARIO_RUNNERS: dict[str, Callable[[Fixture], Awaitable[Checks]]] = {
     "overflow": overflow,
     "cross_scope": cross_scope,
     "actor": actor,
+    "actor_mixed_sections": actor_mixed_sections,
+    "actor_roles_only": actor_roles_only,
+    "cursor_resume": cursor_resume,
+    "project_exact": project_exact,
+    "project_unavailable": project_unavailable,
+    "skill_load": skill_load,
+    "skill_missing_resource": skill_missing_resource,
+    "skill_revoked": skill_revoked,
 }

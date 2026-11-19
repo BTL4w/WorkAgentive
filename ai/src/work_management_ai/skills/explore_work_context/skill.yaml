@@ -1,6 +1,6 @@
 schema_version: "2.0"
 name: explore_work_context
-version: "1.0.2"
+version: "1.0.3"
 owner: ai-runtime
 # Compatibility mirror of explore-work-context/SKILL.md frontmatter.
 description: "Discover permission-scoped Projects or current-actor facts when that context is needed to continue a request."
@@ -35,6 +35,22 @@ evaluation_cases:
   - context_cross_scope_en@1
   - context_actor_vi@1
   - context_actor_en@1
+  - context_cursor_resume_vi@1
+  - context_cursor_resume_en@1
+  - context_project_exact_vi@1
+  - context_project_exact_en@1
+  - context_project_unavailable_vi@1
+  - context_project_unavailable_en@1
+  - context_actor_mixed_sections_vi@1
+  - context_actor_mixed_sections_en@1
+  - context_actor_roles_only_vi@1
+  - context_actor_roles_only_en@1
+  - context_skill_load_vi@1
+  - context_skill_load_en@1
+  - context_skill_missing_resource_vi@1
+  - context_skill_missing_resource_en@1
+  - context_skill_revoked_vi@1
+  - context_skill_revoked_en@1
 triggers: ["vi:thiếu context Project hoặc current actor", "en:missing Project or current-actor context"]
 required_context: [authenticated_actor, activated_tool_catalog, current_objective, remaining_budget]
 approval: NONE

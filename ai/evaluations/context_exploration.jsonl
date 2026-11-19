@@ -22,3 +22,19 @@
 {"case_id": "context_cross_scope_en@1", "locale": "en", "scenario": "cross_scope", "request": "Which Atlas project may I access?"}
 {"case_id": "context_actor_vi@1", "locale": "vi", "scenario": "actor", "request": "Tôi xuất hiện với tên gì trong hệ thống?"}
 {"case_id": "context_actor_en@1", "locale": "en", "scenario": "actor", "request": "What name am I signed in as?"}
+{"case_id": "context_cursor_resume_vi@1", "locale": "vi", "scenario": "cursor_resume", "request": "Trang đầu mới thấy một dự án mã HS-26. Lật trang tiếp xem còn cái nào trùng mã không nhé."}
+{"case_id": "context_cursor_resume_en@1", "locale": "en", "scenario": "cursor_resume", "request": "The first page only showed one HS-26 result. Check the next page for another match."}
+{"case_id": "context_project_exact_vi@1", "locale": "vi", "scenario": "project_exact", "request": "Mình đang mở thẻ Sao Mai rồi, đọc giúp phần giới thiệu trên thẻ này."}
+{"case_id": "context_project_exact_en@1", "locale": "en", "scenario": "project_exact", "request": "Could you give me the blurb for the Morning Star project I already have open?"}
+{"case_id": "context_project_unavailable_vi@1", "locale": "vi", "scenario": "project_unavailable", "request": "Link dự án Sao Mai hôm qua còn mở được. Giờ có lấy lại phần tổng quan được không?"}
+{"case_id": "context_project_unavailable_en@1", "locale": "en", "scenario": "project_unavailable", "request": "The Sao Mai card loaded yesterday. Can you still retrieve its overview?"}
+{"case_id": "context_actor_mixed_sections_vi@1", "locale": "vi", "scenario": "actor_mixed_sections", "request": "Nhắc mình tài khoản này hiển thị tên gì, ở công ty nào, với có role gì luôn nha."}
+{"case_id": "context_actor_mixed_sections_en@1", "locale": "en", "scenario": "actor_mixed_sections", "request": "Quick check: what name and company does this account show, and what are my roles?"}
+{"case_id": "context_actor_roles_only_vi@1", "locale": "vi", "scenario": "actor_roles_only", "request": "Mình có quyền quản trị gì ở đây không? Chỉ cần biết role thôi."}
+{"case_id": "context_actor_roles_only_en@1", "locale": "en", "scenario": "actor_roles_only", "request": "Just tell me which roles this account has. Skip the profile details."}
+{"case_id": "context_skill_load_vi@1", "locale": "vi", "scenario": "skill_load", "request": "Mình có vài dự án tên Atlas. Dùng playbook Explore để xác định đúng dự án trước khi đọc tổng quan."}
+{"case_id": "context_skill_load_en@1", "locale": "en", "scenario": "skill_load", "request": "There are several projects called Atlas. Use the Explore playbook to identify the right one before reading its overview."}
+{"case_id": "context_skill_missing_resource_vi@1", "locale": "vi", "scenario": "skill_missing_resource", "request": "Playbook mở rồi. Có tệp ví dụ tổng quan nào gửi kèm không?"}
+{"case_id": "context_skill_missing_resource_en@1", "locale": "en", "scenario": "skill_missing_resource", "request": "I have the playbook open. Can you pull up its overview example attachment?"}
+{"case_id": "context_skill_revoked_vi@1", "locale": "vi", "scenario": "skill_revoked", "request": "Phiên vừa đổi quyền. Phần hướng dẫn Explore lúc trước còn dùng tiếp được không?"}
+{"case_id": "context_skill_revoked_en@1", "locale": "en", "scenario": "skill_revoked", "request": "My access just changed. Is the Explore playbook we opened earlier still available?"}
