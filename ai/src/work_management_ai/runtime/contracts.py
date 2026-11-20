@@ -78,6 +78,12 @@ class ContextReference(_StrictFrozenModel):
     freshness_required: bool = True
 
 
+class DelegationBrief(_StrictFrozenModel):
+    objective: str = Field(min_length=1, max_length=4000)
+    constraints: tuple[str, ...] = Field(default=(), max_length=16)
+    expected_result: str = Field(min_length=1, max_length=500)
+
+
 class AgentHandoff(_StrictFrozenModel):
     schema_version: Literal["1.0"] = "1.0"
     orchestration_run_id: UUID

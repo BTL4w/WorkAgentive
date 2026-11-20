@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.execution_fence import assert_execution_fence
 from app.modules.audit.adapters.database_models import AuditEventModel
 from app.modules.audit.domain.events import AuditOutcome
 from app.modules.identity.domain.auth import AuthenticatedActor
@@ -643,3 +644,4 @@ class SqlAlchemyDailyUpdateTransactions:
                 {"org": str(actor.organization_id), "member": str(actor.membership_id)},
             )
             yield SqlAlchemyDailyUpdateRepository(session, actor)
+            await assert_execution_fence(session)

@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.execution_fence import assert_execution_fence
 from app.modules.identity.domain.auth import AuthenticatedActor
 from app.modules.planning_runs.adapters.database_models import OutboxEventModel
 from app.modules.progress.adapters.assessment_models import (
@@ -288,3 +289,4 @@ class SqlAlchemyAssessmentTransactions:
                 {"org": str(actor.organization_id), "member": str(actor.membership_id)},
             )
             yield SqlAlchemyAssessmentRepository(session, actor)
+            await assert_execution_fence(session)

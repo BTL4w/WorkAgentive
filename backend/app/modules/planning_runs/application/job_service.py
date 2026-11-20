@@ -105,6 +105,8 @@ class JobService:
                 await txn.repository.fail_job(
                     job_id=job.id,
                     worker_id=worker_id,
+                    attempt_count=job.attempt_count,
+                    lease_until=job.lease_until,
                     error_message=error_code,
                     next_available_at=now
                     + timedelta(seconds=compute_backoff_seconds(job.attempt_count)),
@@ -127,13 +129,20 @@ class JobService:
                 await txn.repository.fail_job(
                     job_id=job.id,
                     worker_id=worker_id,
+                    attempt_count=job.attempt_count,
+                    lease_until=job.lease_until,
                     error_message=error_code,
                     next_available_at=now + timedelta(seconds=backoff),
                 )
                 await txn.commit()
         else:
             async with self._transaction_factory(organization_id) as txn:
-                await txn.repository.complete_job(job_id=job.id, worker_id=worker_id)
+                await txn.repository.complete_job(
+                    job_id=job.id,
+                    worker_id=worker_id,
+                    attempt_count=job.attempt_count,
+                    lease_until=job.lease_until,
+                )
                 await txn.commit()
 
         return True

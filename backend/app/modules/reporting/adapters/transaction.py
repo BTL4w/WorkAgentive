@@ -8,6 +8,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import get_settings
+from app.core.execution_fence import assert_execution_fence
 from app.modules.identity.domain.auth import AuthenticatedActor
 
 from ..application.ports import ReportRepository
@@ -38,6 +39,7 @@ class ReportTransactions:
                 )
                 await session.execute(text("SET LOCAL statement_timeout='15s'"))
                 yield SQLReportRepository(session, actor, self.default_timezone)
+                await assert_execution_fence(session)
         except DBAPIError as exc:
             code = getattr(exc.orig, "sqlstate", None)
             diagnostic = getattr(exc.orig, "diag", None)

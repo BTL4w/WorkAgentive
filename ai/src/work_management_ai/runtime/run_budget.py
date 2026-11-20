@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from work_management_ai.model_gateway.contracts import (
     ModelGateway,
+    ModelMessage,
     ModelUsage,
     StructuredModelRequest,
     StructuredModelResponse,
@@ -28,6 +29,12 @@ from work_management_ai.model_gateway.tool_contracts import (
     NativeToolGateway,
     ToolModelRequest,
     ToolModelResponse,
+)
+from work_management_ai.runtime.contracts import (
+    DelegationBrief,
+    ToolExecutionRequest,
+    ToolExecutionResult,
+    ToolExecutorPort,
 )
 from work_management_ai.runtime.tool_loop_contracts import RunLease, RunScope, ToolLoopUsage
 
@@ -122,6 +129,8 @@ class CandidateBudget:
     operation_id: UUID | None = None
     retry_of: UUID | None = None
     repair_of: UUID | None = None
+    model_output_cap: int | None = None
+    delegation_brief: DelegationBrief | None = None
 
 
 _CANDIDATE: ContextVar[CandidateBudget | None] = ContextVar(
@@ -143,6 +152,38 @@ def candidate_budget(binding: CandidateBudget) -> Generator[None]:
 def current_candidate_budget() -> CandidateBudget | None:
     """Runtime binding only; never populated from model or client content."""
     return _CANDIDATE.get()
+
+
+class BudgetedSpecialistTools:
+    """Charge each legacy Specialist tool call against the candidate child allocation."""
+
+    def __init__(self, executor: ToolExecutorPort) -> None:
+        self._executor = executor
+
+    async def execute(self, request: ToolExecutionRequest) -> ToolExecutionResult:
+        binding = current_candidate_budget()
+        if binding is None:
+            return await self._executor.execute(request)
+        if (
+            binding.allocation_id is None
+            or request.actor.organization_id != binding.scope.organization_id
+            or request.actor.membership_id != binding.scope.membership_id
+        ):
+            raise BudgetError("BUDGET_SCOPE_MISMATCH")
+        receipt = await binding.store.reserve(
+            binding.scope,
+            UsageReservation(
+                kind="TOOL",
+                allocation_id=binding.allocation_id,
+                interval_id=binding.interval_id,
+            ),
+            lease=binding.lease,
+        )
+        try:
+            async with asyncio.timeout(receipt.seconds_remaining):
+                return await self._executor.execute(request)
+        finally:
+            await binding.store.settle(binding.scope, receipt, None)
 
 
 def _bytes(value: object) -> int:
@@ -198,6 +239,15 @@ class BudgetedToolLoopGateway:
         context = _CANDIDATE.get()
         if context is None:
             return await self.gateway.generate_structured(request)
+        if context.delegation_brief is not None:
+            message = ModelMessage(
+                role="user",
+                content=json.dumps(
+                    {"delegated_objective": context.delegation_brief.model_dump(mode="json")},
+                    ensure_ascii=False,
+                ),
+            )
+            request = replace(request, messages=(*request.messages, message))
         cap = validate_request(request)
         images = sum(len(m.images) for m in request.messages)
         if images and (self.image_token_bound is None or self.image_token_bound <= 0):
@@ -208,6 +258,10 @@ class BudgetedToolLoopGateway:
         )
         inputs += images * (self.image_token_bound or 0)
         outputs = cap or 4000
+        if context.model_output_cap is not None:
+            if context.model_output_cap < 1:
+                raise BudgetError("BUDGET_EXHAUSTED")
+            outputs = min(outputs, context.model_output_cap)
         receipt = await self._reserve(context, inputs, outputs)
         seconds = min(request.timeout_seconds, receipt.seconds_remaining, 60)
         bounded = replace(request, timeout_seconds=seconds, max_output_tokens=outputs)

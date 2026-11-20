@@ -7,6 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, AsyncSessionTransaction, async_sessionmaker
 
 from app.core.config import get_settings
+from app.core.execution_fence import assert_execution_fence
 from app.modules.identity.domain.auth import AuthenticatedActor
 from app.modules.optimization.adapters.event_hints import EventHints
 from app.modules.optimization.application.wakeup import WakeupPort
@@ -50,6 +51,7 @@ class PostgreSQLPlanningRunTransaction(PlanningRunTransaction):
     async def commit(self) -> None:
         if self._transaction is None:
             raise RuntimeError("Planning run transaction is not active.")
+        await assert_execution_fence(self._session)
         await self._transaction.commit()
         await self._hints.committed()
 
@@ -90,6 +92,13 @@ class PostgreSQLPlanningRunTransaction(PlanningRunTransaction):
         if transaction is None:
             raise RuntimeError("Planning run transaction was not entered.")
         try:
+            if exc_type is None and transaction.is_active:
+                try:
+                    await assert_execution_fence(self._session)
+                except BaseException:
+                    await transaction.rollback()
+                    self._hints.discard()
+                    raise
             await transaction.__aexit__(exc_type, exc_val, exc_tb)
             if exc_type is None:
                 await self._hints.committed()

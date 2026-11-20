@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import Date, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.execution_fence import assert_execution_fence
 from app.modules.audit.adapters.database_models import AuditEventModel
 from app.modules.audit.domain.events import AuditOutcome
 from app.modules.identity.adapters.database_models import UserModel
@@ -425,3 +426,4 @@ class ScheduleTransactions:
                 {"org": str(actor.organization_id), "member": str(actor.membership_id)},
             )
             yield ScheduleRepository(session, actor)
+            await assert_execution_fence(session)

@@ -17,6 +17,7 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.execution_fence import assert_execution_fence
 from app.modules.audit.adapters.database_models import AuditEventModel
 from app.modules.audit.domain.events import AuditOutcome
 from app.modules.identity.adapters.database_models import UserModel
@@ -1496,6 +1497,7 @@ class SqlAlchemyTeamRequirementTransactionFactory:
     async def __call__(self) -> AsyncGenerator[SqlAlchemyTeamRequirementRepository]:
         async with self._session_factory.begin() as session:
             yield SqlAlchemyTeamRequirementRepository(session)
+            await assert_execution_fence(session)
 
 
 class SqlAlchemyExplicitAssignmentTransactionFactory:
@@ -1506,3 +1508,4 @@ class SqlAlchemyExplicitAssignmentTransactionFactory:
     async def __call__(self) -> AsyncGenerator[SqlAlchemyExplicitAssignmentRepository]:
         async with self._session_factory.begin() as session:
             yield SqlAlchemyExplicitAssignmentRepository(session)
+            await assert_execution_fence(session)

@@ -111,6 +111,13 @@ class ToolResultAccessPort(Protocol):
         ...
 
 
+@runtime_checkable
+class ToolWaitAccessPort(Protocol):
+    async def revalidate_wait(self, context: ToolInvocationContext, wait: WaitReference) -> None:
+        """Verify exact resource access for replay of an already settled wait."""
+        ...
+
+
 # Authority is supplied by the runtime and application, never as model arguments.
 _RESERVED = frozenset(
     {
@@ -545,6 +552,8 @@ class ToolPipeline:
         if value.wait_ref is not None:
             result = self._validate(context, tool, BackendToolResult(wait_ref=value.wait_ref))
             await self.policy.guard(context, tool, result.evidence)
+            if isinstance(backend, ToolWaitAccessPort):
+                await backend.revalidate_wait(context, value.wait_ref)
             return DeferredToolResult(
                 invocation_id=context.invocation_id,
                 call_id=context.call_id,

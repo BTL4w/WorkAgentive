@@ -3129,12 +3129,18 @@ class PostgreSQLPlanningRunRepository(PlanningRunRepository):
         *,
         job_id: UUID,
         worker_id: str,
+        attempt_count: int,
+        lease_until: datetime | None,
     ) -> None:
         stmt = (
             update(WorkflowJobModel)
             .where(
                 WorkflowJobModel.id == job_id,
                 WorkflowJobModel.locked_by_worker_id == worker_id,
+                WorkflowJobModel.attempt_count == attempt_count,
+                WorkflowJobModel.status == WorkflowJobStatus.RUNNING.value,
+                WorkflowJobModel.lease_until == lease_until,
+                WorkflowJobModel.lease_until > func.clock_timestamp(),
             )
             .values(
                 status=WorkflowJobStatus.COMPLETED.value,
@@ -3150,6 +3156,8 @@ class PostgreSQLPlanningRunRepository(PlanningRunRepository):
         *,
         job_id: UUID,
         worker_id: str,
+        attempt_count: int,
+        lease_until: datetime | None,
         error_message: str,
         next_available_at: datetime,
     ) -> None:
@@ -3158,6 +3166,10 @@ class PostgreSQLPlanningRunRepository(PlanningRunRepository):
             .where(
                 WorkflowJobModel.id == job_id,
                 WorkflowJobModel.locked_by_worker_id == worker_id,
+                WorkflowJobModel.attempt_count == attempt_count,
+                WorkflowJobModel.status == WorkflowJobStatus.RUNNING.value,
+                WorkflowJobModel.lease_until == lease_until,
+                WorkflowJobModel.lease_until > func.clock_timestamp(),
             )
             .with_for_update()
         )

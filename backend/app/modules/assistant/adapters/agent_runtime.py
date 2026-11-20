@@ -92,6 +92,7 @@ from work_management_ai.runtime.execution_engine import (
 )
 from work_management_ai.runtime.manifests import ToolManifest, load_yaml_resource
 from work_management_ai.runtime.policy_guard import PolicyGuard
+from work_management_ai.runtime.run_budget import BudgetedSpecialistTools, BudgetedToolLoopGateway
 from work_management_ai.runtime.skill_registry import SkillRegistry
 from work_management_ai.runtime.tool_registry import ToolRegistry
 from work_management_ai.tracing import SpanSink, trace_session, trace_span
@@ -647,21 +648,23 @@ def build_execution_engine_factory(
     harnesses: Mapping[AgentId, AgentHarness] = {
         AgentId.WORK_INTELLIGENCE: _ScopedAgentHarness(
             WorkIntelligenceHarness(
-                model_gateway=recording_gateway,
-                tool_executor=ScopedReadTools(),
+                model_gateway=BudgetedToolLoopGateway(recording_gateway),
+                tool_executor=BudgetedSpecialistTools(ScopedReadTools()),
             )
         ),
         AgentId.PLANNING: _ScopedAgentHarness(
             PlanningAgentHarness(
-                model_gateway=recording_gateway,
+                model_gateway=BudgetedToolLoopGateway(recording_gateway),
                 tool_executor=planning_tool_executor or InactivePlanningToolExecutor(),
                 actor_resolver=agent_actor_resolver,
             )
         ),
         AgentId.ASSIGNMENT: _ScopedAgentHarness(
             AssignmentAgentHarness(
-                model_gateway=recording_gateway,
-                tool_executor=assignment_tool_executor or InactiveAssignmentToolExecutor(),
+                model_gateway=BudgetedToolLoopGateway(recording_gateway),
+                tool_executor=BudgetedSpecialistTools(
+                    assignment_tool_executor or InactiveAssignmentToolExecutor()
+                ),
                 actor_resolver=agent_actor_resolver,
             )
         ),
@@ -672,10 +675,12 @@ def build_execution_engine_factory(
             **harnesses,
             AgentId.RISK: _ScopedAgentHarness(
                 RiskHarness(
-                    model_gateway=BudgetedDailyGateway(recording_gateway, daily_usage_store)
-                    if daily_usage_store is not None
-                    else recording_gateway,
-                    tool_executor=risk_tool_executor,
+                    model_gateway=BudgetedToolLoopGateway(
+                        BudgetedDailyGateway(recording_gateway, daily_usage_store)
+                        if daily_usage_store is not None
+                        else recording_gateway
+                    ),
+                    tool_executor=BudgetedSpecialistTools(risk_tool_executor),
                     actor_resolver=agent_actor_resolver,
                 ),
                 usage_store=daily_usage_store,
@@ -687,12 +692,14 @@ def build_execution_engine_factory(
             **harnesses,
             AgentId.DAILY_UPDATE: _ScopedAgentHarness(
                 DailyUpdateHarness(
-                    model_gateway=BudgetedDailyGateway(
-                        recording_gateway,
-                        daily_usage_store,
-                        image_token_bound=daily_image_token_bound,
+                    model_gateway=BudgetedToolLoopGateway(
+                        BudgetedDailyGateway(
+                            recording_gateway,
+                            daily_usage_store,
+                            image_token_bound=daily_image_token_bound,
+                        )
                     ),
-                    tool_executor=daily_update_tool_executor,
+                    tool_executor=BudgetedSpecialistTools(daily_update_tool_executor),
                     actor_resolver=agent_actor_resolver,
                 ),
                 usage_store=daily_usage_store,

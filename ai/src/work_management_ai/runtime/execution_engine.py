@@ -47,6 +47,10 @@ class RecordedAgentRun(BaseModel):
     id: UUID
     status: AgentRunStatus
     replayed_result: AgentResult | None = None
+    target_agent_id: AgentId | None = None
+    target_agent_version: str | None = None
+    capability: str | None = None
+    manifest_fingerprint: str | None = None
 
 
 class ExecutionRecorderPort(Protocol):
@@ -99,6 +103,14 @@ class DurableSpecialistRunner:
         result = await harness.run(handoff)
         await self._recorder.finish_agent_run(recorded.id, result)
         return result
+
+    async def lookup_agent_run(self, idempotency_key: str) -> RecordedAgentRun | None:
+        """Read-only seam for commit-before-parent-result receipt reconciliation."""
+        lookup = getattr(self._recorder, "lookup_agent_run", None)
+        if lookup is None:
+            return None
+        found: RecordedAgentRun | None = await lookup(idempotency_key)
+        return found
 
 
 class AgentExecutionEngine:

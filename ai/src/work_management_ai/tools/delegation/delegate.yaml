@@ -1,0 +1,27 @@
+schema_version: "2.0"
+name: delegate_agent
+version: "1.0.0"
+owner: ai-runtime
+description: >-
+  Delegate one bounded objective to an activated Specialist agent using its registered
+  capability and typed business input. Supply authorized context_ref_ids from prior
+  exploration when the Specialist needs resolved Project or actor facts, plus any task
+  constraints and expected_result. Returns either a normalized Specialist observation
+  (including drafts or verified facts) or a durable wait reference when user input,
+  Manager approval or an asynchronous workflow result is required. Delegation never
+  grants permissions, bypasses human approval gates or authorizes direct writes;
+  child model and tool usage count toward the run's conserved budget and idempotent
+  receipts prevent duplicate proposals or workflows on replay.
+tenant_scope: actor_membership
+roles: [ADMIN, MANAGER, EMPLOYEE]
+risk_level: PROPOSAL_ONLY
+input_contract: work_management_ai.tools.delegation.contracts.DelegateAgentInput
+output_contract: work_management_ai.tools.delegation.contracts.DelegateAgentOutput
+timeout_seconds: 120
+max_attempts: 1
+retry_policy: NONE
+idempotency: REQUIRED
+audit: REQUIRED
+evidence_output: true
+freshness_output: true
+trace_metadata: [tool_id, duration_ms, result_status, evidence_count]

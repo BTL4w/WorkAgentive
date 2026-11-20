@@ -154,6 +154,8 @@ class FakeJobRepository:
         *,
         job_id: UUID,
         worker_id: str,
+        attempt_count: int,
+        lease_until: datetime | None,
     ) -> None:
         self.completed_jobs.add(job_id)
 
@@ -162,6 +164,8 @@ class FakeJobRepository:
         *,
         job_id: UUID,
         worker_id: str,
+        attempt_count: int,
+        lease_until: datetime | None,
         error_message: str,
         next_available_at: datetime,
     ) -> None:

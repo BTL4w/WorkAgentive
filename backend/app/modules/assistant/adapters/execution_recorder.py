@@ -199,6 +199,35 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
             return None
         return ExecutionCheckpoint.model_validate(value)
 
+    async def lookup_agent_run(self, idempotency_key: str) -> RecordedAgentRun | None:
+        """Read-only lookup of a recorded child AgentRun for receipt reconciliation."""
+        run_id = uuid5(NAMESPACE_URL, f"agent-run:{idempotency_key}")
+        async with self._transactions(self._context) as transaction:
+            existing = await transaction.repository.get_agent_run(
+                organization_id=self._scope.organization_id, run_id=run_id
+            )
+            await transaction.commit()
+        if existing is None or existing.orchestration_run_id != self._scope.orchestration_run_id:
+            return None
+        replayed = (
+            AgentResult.model_validate(existing.typed_output)
+            if existing.typed_output is not None
+            else None
+        )
+        if replayed is not None and existing.agent_id == AgentId.RETRIEVE.value:
+            replayed = await self._revalidate_retrieval(existing.id, replayed)
+        return RecordedAgentRun(
+            id=existing.id,
+            status=replayed.status
+            if replayed is not None
+            else AgentRunStatus(existing.status.value),
+            replayed_result=replayed,
+            target_agent_id=AgentId(existing.agent_id),
+            target_agent_version=existing.agent_version,
+            capability=existing.capability,
+            manifest_fingerprint=existing.manifest_fingerprint,
+        )
+
     async def start_agent_run(self, handoff: AgentHandoff) -> RecordedAgentRun:
         if handoff.target_agent_id is AgentId.RETRIEVE:
             self._retrieval_active = True

@@ -15,6 +15,7 @@ from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 
+from app.core.execution_fence import assert_execution_fence
 from app.modules.audit.adapters.database_models import AuditEventModel
 from app.modules.audit.domain.events import AuditOutcome
 from app.modules.identity.adapters.database_models import UserModel
@@ -772,6 +773,7 @@ class SqlAlchemyRecommendationTransactionFactory:
                 await session.connection(execution_options={"isolation_level": "SERIALIZABLE"})
             try:
                 yield SqlAlchemyRecommendationRepository(session)
+                await assert_execution_fence(session)
                 await session.commit()
             except BaseException:
                 await session.rollback()

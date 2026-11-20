@@ -244,6 +244,19 @@ class AgentRegistry:
             raise AgentRegistryError("AGENT_PHASE_INACTIVE")
         return result
 
+    def specialist_pins(self) -> tuple[VersionPin, ...]:
+        """Snapshot the configured versions before opening a candidate run."""
+        pins: dict[AgentId, VersionPin] = {}
+        for (agent_id, version), entry in self._entries.items():
+            if agent_id is AgentId.ORCHESTRATOR:
+                continue
+            if agent_id in pins:
+                raise AgentRegistryError("SPECIALIST_VERSION_SELECTION_REQUIRED")
+            pins[agent_id] = VersionPin(
+                reference=agent_id.value, version=version, fingerprint=entry.fingerprint
+            )
+        return tuple(pins[agent_id] for agent_id in sorted(pins))
+
     def planning_catalog(
         self,
         *,
