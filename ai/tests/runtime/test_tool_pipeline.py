@@ -433,6 +433,36 @@ async def test_strict_inputs_and_reserved_authority(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("nested", [False, True])
+async def test_source_turn_ref_is_rejected_and_audited_before_dispatch(
+    binding: tuple[CandidateBudget, Budget],
+    nested: bool,
+):
+    ctx, _ = binding
+    f = Fixture()
+    forged: dict[str, JsonValue] = {"source_turn_ref": str(uuid4())}
+    args: dict[str, JsonValue] = (
+        {"query": "status", "metadata": [forged]}
+        if nested
+        else {
+            "query": "status",
+            **forged,
+        }
+    )
+    with candidate_budget(ctx):
+        result = await f.pipeline.execute(
+            ctx.scope,
+            f.call.model_copy(update={"arguments": args}),
+            admitted=f.catalog,
+            lease=ctx.lease,
+        )
+    assert result.kind == "REJECTED" and result.stop_segment
+    assert result.safe_code == "TOOL_AUTHORITY_FIELDS"
+    assert f.policy.audit == ["TOOL_AUTHORITY_FIELDS"]
+    assert f.backend.effects == 0
+
+
+@pytest.mark.asyncio
 async def test_missing_budget_closed_catalog_and_exhaustion(
     binding: tuple[CandidateBudget, Budget],
 ):

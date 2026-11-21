@@ -388,7 +388,9 @@ async def test_signed_cursor_tamper_and_unavailable_source_never_mean_absence():
         ("explore_projects", "P0", 20, False, False),
         ("explore_projects", "P", 20, True, False),
         ("explore_projects", "P", 1, True, False),
+        ("explore_projects", "P-long", 20, True, False),
         ("read_project_context", "", 20, False, True),
+        ("read_project_context", "P-long", 20, False, True),
         ("read_actor_context", "", 20, False, False),
     ],
 )
@@ -421,6 +423,8 @@ async def test_real_read_contracts_complete_common_pipeline_and_revoke_cached_ou
             return PreparedTool(arguments=arguments, policy_version="test-read")
 
     a, actors, ps, s = fixture()
+    if query == "P-long":
+        ps.values[0] = replace(ps.values[0], name=query, description="đ" * 1025)
     scope = RunScope(
         organization_id=a.organization_id,
         membership_id=a.membership_id,
@@ -474,6 +478,16 @@ async def test_real_read_contracts_complete_common_pipeline_and_revoke_cached_ou
         output = ContextReadObservation.model_validate(payload["output"])
         assert bool(output.source_content_refs) is expected_content
         assert all(item.trust == "UNTRUSTED_SOURCE_CONTENT" for item in output.source_content_refs)
+        if query == "P-long":
+            assert output.outcome == "PARTIAL"
+            assert output.coverage[0].truncated
+            assert any(gap.code == "TRUNCATED" and gap.section == "overview" for gap in output.gaps)
+            if tool == "explore_projects":
+                assert output.entities[0].resolution == "UNIQUE"
+                assert "overview" not in output.coverage[0].returned
+            else:
+                assert output.source_content_refs[0].truncated
+                assert len(output.source_content_refs[0].text.encode()) == 2048
         assert await pipeline.execute(scope, call, admitted=catalog, lease=lease) == result
         actors.actor = None
         revoked = await pipeline.execute(scope, call, admitted=catalog, lease=lease)

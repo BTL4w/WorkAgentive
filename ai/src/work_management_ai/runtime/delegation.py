@@ -71,6 +71,7 @@ from work_management_ai.tools.delegation.contracts import (
 )
 
 _DELEGATE_TOOL_RESOURCE = (("work_management_ai.tools.delegation", "delegate.yaml"),)
+_DELEGATE_V2_TOOL_RESOURCE = (("work_management_ai.tools.delegation", "delegate.v2.yaml"),)
 
 _CAPABILITY_MODELS: dict[str, type[BaseModel]] = {
     "work.answer_question": WorkQuestionDelegationInput,
@@ -648,6 +649,17 @@ async def _settle_replayed_child(context: ToolInvocationContext) -> None:
     await binding.store.close_child(context.scope, allocation_id, lease=context.lease)
 
 
+def _check_tool_pin(context: ToolInvocationContext, tools: ToolRegistry, reference: str) -> None:
+    if context.tool_reference != reference:
+        raise DelegationError("DELEGATION_TOOL_MISMATCH", stop_segment=True)
+    try:
+        pinned = tools.resolve(reference).manifest.version
+    except ToolRegistryError:
+        raise DelegationError("DELEGATION_TOOL_MISMATCH", stop_segment=True) from None
+    if context.tool_version != pinned:
+        raise DelegationError("DELEGATION_VERSION_CONFLICT", stop_segment=True)
+
+
 class DelegationAdapter:
     """Guarded Specialist-as-tool adapter reusing registry, context validation and budgets."""
 
@@ -689,16 +701,6 @@ class DelegationAdapter:
         return key in _CANDIDATE_CAPABILITIES or (
             key == _DAILY_UPDATE_CAPABILITY and self._daily_update_receipts is not None
         )
-
-    def _check_tool_pin(self, context: ToolInvocationContext) -> None:
-        if context.tool_reference != "delegate_agent@1":
-            raise DelegationError("DELEGATION_TOOL_MISMATCH", stop_segment=True)
-        try:
-            pinned = self._tools.resolve(context.tool_reference).manifest.version
-        except ToolRegistryError:
-            raise DelegationError("DELEGATION_TOOL_MISMATCH", stop_segment=True) from None
-        if context.tool_version != pinned:
-            raise DelegationError("DELEGATION_VERSION_CONFLICT", stop_segment=True)
 
     def _resolve_target(self, args: DelegateAgentInput) -> tuple[str, AgentBudget]:
         if args.agent_id is AgentId.ORCHESTRATOR:
@@ -857,7 +859,7 @@ class DelegationAdapter:
         """Execute delegation and return BackendToolResult for ToolPipeline settlement."""
 
         args = DelegateAgentInput.model_validate(value.model_dump())
-        self._check_tool_pin(context)
+        _check_tool_pin(context, self._tools, "delegate_agent@1")
         target_version, child_budget = self._resolve_target(args)
         if not self._supported(args):
             raise DelegationError("DELEGATION_COMPATIBILITY_UNAVAILABLE", stop_segment=False)
@@ -941,7 +943,7 @@ class DelegationAdapter:
         """Recover an already-committed child AgentRun/workflow receipt without re-running."""
 
         args = DelegateAgentInput.model_validate(value.model_dump())
-        self._check_tool_pin(context)
+        _check_tool_pin(context, self._tools, "delegate_agent@1")
         target_version, _ = self._resolve_target(args)
         await self._validate_context_refs(context, args)
         recorded = await self._runner.lookup_agent_run(self._idempotency_key(context))
@@ -1065,6 +1067,7 @@ class DelegationAdapterV2:
         agent_registry: AgentRegistry,
         specialist_pins: tuple[VersionPin, ...],
         runners: Mapping[AgentId, GoalSpecialistRunnerPort],
+        tool_registry: ToolRegistry | None = None,
         activation: ActivationContext | None = None,
         references: DelegationReferencesPort | None = None,
         workflow_verifier: WorkflowWaitVerifierPort | None = None,
@@ -1076,6 +1079,11 @@ class DelegationAdapterV2:
         self._locale: Literal["vi", "en"] = locale
         self._timezone = timezone
         self._registry = agent_registry
+        self._tools = (
+            ToolRegistry.from_resources(_DELEGATE_V2_TOOL_RESOURCE)
+            if tool_registry is None
+            else tool_registry
+        )
         self._pins = {pin.reference: pin for pin in specialist_pins}
         if len(self._pins) != len(specialist_pins):
             raise DelegationError("DELEGATION_TARGET_PIN_DUPLICATE", stop_segment=True)
@@ -1122,8 +1130,7 @@ class DelegationAdapterV2:
     ) -> tuple[AgentHandoffV2, GoalDirectedAgentManifest, GoalSpecialistRunnerPort]:
         if context.scope != self._scope or context.lease.scope != self._scope:
             raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=True)
-        if (context.tool_reference, context.tool_version) != ("delegate_agent@2", "2.0.0"):
-            raise DelegationError("DELEGATION_TOOL_MISMATCH", stop_segment=True)
+        _check_tool_pin(context, self._tools, "delegate_agent@2")
         args = DelegateAgentInputV2.model_validate(arguments.model_dump())
         if args != DelegateAgentInputV2.model_validate(context.canonical_arguments.model_dump()):
             raise DelegationError("TOOL_ARGUMENTS_CHANGED", stop_segment=True)
@@ -1189,11 +1196,20 @@ class DelegationAdapterV2:
     async def reconcile(
         self, context: ToolInvocationContext, arguments: BaseModel
     ) -> BackendToolResult | None:
+        recovered = await self._recover(context, arguments)
+        if recovered is not None and (
+            recovered.wait_ref is None or recovered.wait_ref.kind != "WORKFLOW_RESULT"
+        ):
+            await _settle_replayed_child(context)
+        return recovered
+
+    async def _recover(
+        self, context: ToolInvocationContext, arguments: BaseModel
+    ) -> BackendToolResult | None:
         handoff, manifest, runner = await self._prepare(context, arguments)
         record = await runner.reconcile(handoff)
         if record is None:
             return None
-        await _settle_replayed_child(context)
         return await self._normalize(context, manifest, record)
 
     async def revalidate_result(
@@ -1215,7 +1231,7 @@ class DelegationAdapterV2:
             await self._references.revalidate(context.scope, refs)
 
     async def revalidate_wait(self, context: ToolInvocationContext, wait: WaitReference) -> None:
-        current = await self.reconcile(context, context.canonical_arguments)
+        current = await self._recover(context, context.canonical_arguments)
         if current is None or current.wait_ref != wait:
             raise DelegationError("DELEGATION_WAIT_STALE", stop_segment=True)
 

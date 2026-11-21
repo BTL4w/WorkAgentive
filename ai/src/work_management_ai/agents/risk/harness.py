@@ -178,6 +178,7 @@ class _RiskRun:
             manifest=self.harness.goal_manifest,
             resolved_action="risk.explain",
             action_risk=RiskLevel.READ_ONLY,
+            requested_skill_ids=self.harness.goal_manifest.allowed_skills,
             requested_tool_ids=("risk.read@1",),
         )
         if any(ref.organization_id != actor.organization_id for ref in handoff.context_references):

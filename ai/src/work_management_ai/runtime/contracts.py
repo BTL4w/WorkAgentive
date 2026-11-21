@@ -4,8 +4,9 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal, Protocol
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from work_management_ai.agents.retrieve.contracts import PublicURL
 
@@ -117,6 +118,15 @@ class AgentHandoffV2(_StrictFrozenModel):
     budget: AgentBudget
     step_id: str = Field(min_length=1, max_length=128)
     idempotency_key: str = Field(min_length=1, max_length=255)
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_timezone(cls, name: str) -> str:
+        try:
+            ZoneInfo(name)
+        except (ValueError, ZoneInfoNotFoundError) as error:
+            raise ValueError("TIMEZONE_INVALID") from error
+        return name
 
 
 class RequestedHandoff(_StrictFrozenModel):

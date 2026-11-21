@@ -2,7 +2,7 @@
 
 import json
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import ValidationError
@@ -22,10 +22,12 @@ from work_management_ai.runtime.contracts import (
     RiskLevel,
 )
 from work_management_ai.runtime.delegation import (
+    CanonicalWorkflowState,
     DelegationAdapterV2,
     VerifiedDelegationReferences,
     filtered_delegate_v2_tool_schema,
 )
+from work_management_ai.runtime.manifests import load_tool_manifest_resource
 from work_management_ai.runtime.policy_guard import AgentPolicyError, PolicyGuard
 from work_management_ai.runtime.run_budget import CandidateBudget, candidate_budget
 from work_management_ai.runtime.tool_loop_contracts import RunScope
@@ -154,10 +156,24 @@ def test_goal_handoff_policy_checks_selected_operation_and_risk_before_tool():
         authorize("assignment.assign_task_explicitly", RiskLevel.READ_ONLY)
     with pytest.raises(AgentPolicyError, match="ACTION_RISK_EXCEEDED"):
         authorize("work.answer_question", RiskLevel.PROPOSAL_ONLY)
+    with pytest.raises(AgentPolicyError, match="SKILL_NOT_ALLOWED"):
+        PolicyGuard().authorize_goal_action(
+            current_actor=actor,
+            handoff=handoff,
+            manifest=manifest,
+            resolved_action="work.answer_question",
+            action_risk=RiskLevel.READ_ONLY,
+            requested_skill_ids=("unregistered@1",),
+        )
+    valid = handoff.model_dump()
+    assert AgentHandoffV2.model_validate({**valid, "timezone": "Asia/Ho_Chi_Minh"})
+    with pytest.raises(ValidationError, match="TIMEZONE_INVALID"):
+        AgentHandoffV2.model_validate({**valid, "timezone": "Asia/Unknown_City"})
 
 
 @pytest.mark.asyncio
-async def test_v2_handoff_is_server_bound_and_only_ready_specialists_dispatch():
+@pytest.mark.parametrize("tool_version", ["2.0.0", "2.0.1"])
+async def test_v2_handoff_is_server_bound_and_only_ready_specialists_dispatch(tool_version: str):
     registry = _agent_registry()
     registry.register_resource("work_management_ai.agents.work_intelligence", "agent.v2.yaml")
     registry.register_resource("work_management_ai.agents.risk", "agent.v2.yaml")
@@ -182,6 +198,9 @@ async def test_v2_handoff_is_server_bound_and_only_ready_specialists_dispatch():
 
     scope = _scope()
     parent_id = uuid4()
+    tool_manifest = load_tool_manifest_resource(
+        "work_management_ai.tools.delegation", "delegate.v2.yaml"
+    ).model_copy(update={"version": tool_version})
     adapter = DelegationAdapterV2(
         scope=scope,
         parent_agent_run_id=parent_id,
@@ -192,12 +211,13 @@ async def test_v2_handoff_is_server_bound_and_only_ready_specialists_dispatch():
         agent_registry=registry,
         specialist_pins=registry.specialist_pins(goal_directed=True),
         runners={AgentId.WORK_INTELLIGENCE: Runner()},
+        tool_registry=ToolRegistry([tool_manifest]),
     )
     args = DelegateAgentInputV2(
         agent_id=AgentId.WORK_INTELLIGENCE, objective="Read tasks", expected_result="Status"
     )
     context = _context(scope, args).model_copy(
-        update={"tool_reference": "delegate_agent@2", "tool_version": "2.0.0"}
+        update={"tool_reference": "delegate_agent@2", "tool_version": tool_version}
     )
     budget = _FakeBudget()
     binding = CandidateBudget(scope=scope, lease=context.lease, store=budget, interval_id=uuid4())
@@ -205,6 +225,8 @@ async def test_v2_handoff_is_server_bound_and_only_ready_specialists_dispatch():
         result = await adapter.execute(context, args)
         assert result.output is not None
         assert result.output.model_dump()["child_agent_run_id"] == child_run_id
+        with pytest.raises(ToolPolicyError, match="DELEGATION_VERSION_CONFLICT"):
+            await adapter.execute(context.model_copy(update={"tool_version": "2.0.9"}), args)
         unavailable = args.model_copy(update={"agent_id": AgentId.RISK})
         with pytest.raises(ToolPolicyError, match="DELEGATION_TARGET_UNAVAILABLE"):
             await adapter.execute(
@@ -214,6 +236,65 @@ async def test_v2_handoff_is_server_bound_and_only_ready_specialists_dispatch():
     assert seen[0].source_turn_ref == scope.turn_id
     assert seen[0].parent_agent_run_id == parent_id
     assert seen[0].target_agent_version == "1.1.0"
+
+
+@pytest.mark.asyncio
+async def test_workflow_result_reconcile_does_not_close_async_child_allocation():
+    scope = _scope()
+    registry = _agent_registry()
+    registry.register_resource("work_management_ai.agents.planning", "agent.v2.yaml")
+    workflow_id = uuid4()
+    child_id = uuid4()
+
+    class Runner:
+        async def run(self, handoff: AgentHandoffV2):
+            raise AssertionError("recovery must reuse the committed child")
+
+        async def reconcile(self, handoff: AgentHandoffV2):
+            return child_id, GoalDirectedAgentResult(
+                agent_id=handoff.target_agent_id,
+                agent_version=handoff.target_agent_version,
+                status=AgentRunStatus.AWAITING_HUMAN,
+                typed_output={"workflow_run_id": str(workflow_id)},
+                resolved_action="planning.create",
+                stop_reason="WORKFLOW_QUEUED",
+            )
+
+    class Workflows:
+        async def verify_workflow(self, scope: RunScope, workflow_run_id: UUID):
+            return CanonicalWorkflowState(workflow_run_id=workflow_run_id, status="RUNNING")
+
+        async def find_committed_planning_create(
+            self, scope: RunScope, *, child_run_id: UUID, receipt_id: UUID, call_id: str
+        ):
+            return None
+
+    adapter = DelegationAdapterV2(
+        scope=scope,
+        parent_agent_run_id=uuid4(),
+        actor_role="MANAGER",
+        active_phase=5,
+        locale="en",
+        timezone="UTC",
+        agent_registry=registry,
+        specialist_pins=registry.specialist_pins(goal_directed=True),
+        runners={AgentId.PLANNING: Runner()},
+        workflow_verifier=Workflows(),
+    )
+    args = DelegateAgentInputV2(
+        agent_id=AgentId.PLANNING, objective="Draft a plan", expected_result="Proposal"
+    )
+    context = _context(scope, args).model_copy(
+        update={"tool_reference": "delegate_agent@2", "tool_version": "2.0.0"}
+    )
+    budget = _FakeBudget()
+    binding = CandidateBudget(scope=scope, lease=context.lease, store=budget, interval_id=uuid4())
+    with candidate_budget(binding):
+        recovered = await adapter.reconcile(context, args)
+        assert recovered is not None and recovered.wait_ref is not None
+        assert recovered.wait_ref.kind == "WORKFLOW_RESULT"
+        await adapter.revalidate_wait(context, recovered.wait_ref)
+    assert not budget.closed_allocations
 
 
 @pytest.mark.asyncio
@@ -252,3 +333,36 @@ async def test_verified_reference_lookup_rechecks_every_source_and_scope():
     with pytest.raises(ToolPolicyError, match="DELEGATION_CONTEXT_DENIED"):
         await lookup.resolve(_scope(), supplied)
     assert checked == [refs, refs]
+
+
+def test_reference_overlap_requires_same_provenance():
+    scope = _scope()
+    ref = ContextReference(
+        reference_id=uuid4(),
+        organization_id=scope.organization_id,
+        resource_type="task",
+        resource_id=uuid4(),
+        version=1,
+        observed_at=datetime.now(UTC),
+        fingerprint="a" * 64,
+    )
+
+    async def recheck(current: RunScope, refs: tuple[ContextReference, ...]) -> None:
+        del current, refs
+
+    VerifiedDelegationReferences(
+        scope=scope,
+        exploration=(ref,),
+        active_context=(ref,),
+        completed_specialists=(ref,),
+        recheck=recheck,
+    )
+    for mismatch in ({"freshness_required": False}, {"fingerprint": "b" * 64}):
+        with pytest.raises(ToolPolicyError, match="DELEGATION_CONTEXT_DENIED"):
+            VerifiedDelegationReferences(
+                scope=scope,
+                exploration=(ref,),
+                active_context=(),
+                completed_specialists=(ref.model_copy(update=mismatch),),
+                recheck=recheck,
+            )

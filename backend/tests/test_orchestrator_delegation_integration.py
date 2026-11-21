@@ -364,6 +364,7 @@ async def test_pipeline_replays_work_harness_after_child_result_commit(
             timezone="UTC",
             agent_registry=registry,
             specialist_pins=pins,
+            tool_registry=tools,
             runners={
                 AgentId.WORK_INTELLIGENCE: PostgreSQLGoalSpecialistRunner(
                     recorder=recorder, harness=harness, pin=pins[0]

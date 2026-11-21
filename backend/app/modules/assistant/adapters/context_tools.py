@@ -165,6 +165,7 @@ class ContextToolBackend:
             description = snap.projects[0].description
             if description:
                 text, overview_truncated = _bounded_text(description)
+                # Discovery includes only complete overviews. Direct reads can return an excerpt.
                 if not (discovery_overview and overview_truncated):
                     content = (
                         SourceContent(

@@ -226,6 +226,7 @@ class _RetrieveRun:
                 activation=self.harness.activation,
                 resolved_action="retrieval.summarize_web",
                 action_risk=RiskLevel.READ_ONLY,
+                requested_skill_ids=("web_search_and_summarize@1",),
                 requested_tool_ids=("web.search@1", "web.read_pages@1", "web.revalidate@1"),
             )
             return

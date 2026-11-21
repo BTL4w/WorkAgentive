@@ -104,6 +104,7 @@ class PolicyGuard:
         manifest: AnyAgentManifest,
         resolved_action: str,
         action_risk: RiskLevel,
+        requested_skill_ids: tuple[str, ...] = (),
         requested_tool_ids: tuple[str, ...] = (),
         activation: ActivationContext | None = None,
     ) -> None:
@@ -115,7 +116,7 @@ class PolicyGuard:
             handoff=handoff,
             manifest=manifest,
             capability=resolved_action,
-            requested_skill_ids=(),
+            requested_skill_ids=requested_skill_ids,
             requested_tool_ids=requested_tool_ids,
             activation=activation,
         )

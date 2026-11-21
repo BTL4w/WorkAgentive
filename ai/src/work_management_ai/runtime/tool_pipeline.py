@@ -137,6 +137,7 @@ _RESERVED = frozenset(
         "fencing_token",
         "receipt_id",
         "budget_allocation_id",
+        "source_turn_ref",
         "system_prompt",
         "chain_of_thought",
         "hidden_reasoning",

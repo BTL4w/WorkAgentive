@@ -177,6 +177,7 @@ class WorkIntelligenceHarness:
             handoff=handoff,
             manifest=self._goal_manifest,
             resolved_action=self._goal_action(plan),
+            requested_skill_ids=(plan.skill_reference,),
             requested_tool_ids=(tool_reference,),
             action_risk=RiskLevel.READ_ONLY,
         )
