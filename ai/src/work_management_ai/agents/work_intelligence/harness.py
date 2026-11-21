@@ -6,6 +6,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import BaseModel, ValidationError
 
+from work_management_ai.agents.orchestrator.contracts import ActorContextResolverPort
 from work_management_ai.agents.work_intelligence.contracts import (
     EvidenceItem,
     GroundedAnswerDraft,
@@ -32,21 +33,28 @@ from work_management_ai.model_gateway.contracts import ModelGateway, StructuredM
 from work_management_ai.model_gateway.errors import ModelGatewayError
 from work_management_ai.runtime.contracts import (
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
     ContextReference,
+    GoalActionAccessPort,
+    GoalDirectedAgentResult,
+    InteractionOutcome,
     JsonValue,
+    RiskLevel,
     ToolExecutionRequest,
     ToolExecutorPort,
     VerifierResult,
 )
 from work_management_ai.runtime.manifests import (
     AgentManifest,
+    GoalDirectedAgentManifest,
     ToolManifest,
     load_yaml_resource,
     resolve_contract,
 )
+from work_management_ai.runtime.policy_guard import PolicyGuard
 
 _AGENT_PACKAGE = "work_management_ai.agents.work_intelligence"
 _TOOL_PACKAGES = {
@@ -57,14 +65,26 @@ _TOOL_PACKAGES = {
 
 
 class WorkIntelligenceHarness:
-    def __init__(self, *, model_gateway: ModelGateway, tool_executor: ToolExecutorPort) -> None:
+    def __init__(
+        self,
+        *,
+        model_gateway: ModelGateway,
+        tool_executor: ToolExecutorPort,
+        actor_resolver: ActorContextResolverPort | None = None,
+        goal_access: GoalActionAccessPort | None = None,
+    ) -> None:
         self._model_gateway = model_gateway
         self._tool_executor = tool_executor
         self._manifest = load_yaml_resource(_AGENT_PACKAGE, "agent.yaml", AgentManifest)
+        self._goal_manifest = load_yaml_resource(
+            _AGENT_PACKAGE, "agent.v2.yaml", GoalDirectedAgentManifest
+        )
+        self._actor_resolver = actor_resolver
+        self._goal_access = goal_access
         self._skill_loader = AnswerWorkQuestionSkillLoader()
         self._graph = WorkIntelligenceGraph(self)
 
-    async def run(self, handoff: AgentHandoff) -> AgentResult:
+    async def run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
         return await self._graph.run(
             WorkIntelligenceState(
                 handoff=handoff,
@@ -90,11 +110,16 @@ class WorkIntelligenceHarness:
 
     async def validate_contract(self, state: WorkIntelligenceState) -> dict[str, object]:
         handoff = state["handoff"]
-        runtime = self._manifest.runtime
+        goal = isinstance(handoff, AgentHandoffV2)
+        manifest = self._goal_manifest if goal else self._manifest
+        runtime = manifest.runtime
         if (
             handoff.target_agent_id is not AgentId.WORK_INTELLIGENCE
-            or handoff.target_agent_version != self._manifest.agent.version
-            or handoff.capability not in self._manifest.capabilities
+            or handoff.target_agent_version != manifest.agent.version
+            or (
+                isinstance(handoff, AgentHandoff)
+                and handoff.capability not in manifest.capabilities
+            )
         ):
             return self._failure("WORK_HANDOFF_INVALID")
         if (
@@ -106,10 +131,59 @@ class WorkIntelligenceHarness:
         ):
             return self._failure("WORK_BUDGET_INVALID")
         try:
-            value = WorkIntelligenceInput.model_validate(handoff.typed_input)
+            value = (
+                self._intake_goal(handoff)
+                if isinstance(handoff, AgentHandoffV2)
+                else WorkIntelligenceInput.model_validate(handoff.typed_input)
+            )
         except ValidationError:
             return self._failure("WORK_INPUT_INVALID")
         return {"value": value, "route": "execute"}
+
+    @staticmethod
+    def _intake_goal(handoff: AgentHandoffV2) -> WorkIntelligenceInput:
+        entities = tuple(
+            ref
+            for ref in handoff.context_references
+            if ref.resource_type.casefold() in {"project", "task"}
+        )
+        return WorkIntelligenceInput(
+            question=handoff.brief.objective,
+            locale=handoff.locale,
+            requested_kind=None,
+            entity_reference=str(entities[0].resource_id) if len(entities) == 1 else None,
+        )
+
+    @staticmethod
+    def _goal_action(plan: WorkStepPlan | None) -> str:
+        if plan is not None:
+            if plan.tool_id == "work.read_my_tasks":
+                return "work.read_my_tasks"
+            if plan.tool_id == "work.read_resource":
+                if plan.tool_input.get("resource_type") == "PROJECT":
+                    return "work.read_project"
+                if plan.tool_input.get("resource_type") == "TASK":
+                    return "work.read_task"
+        return "work.answer_question"
+
+    async def _authorize_goal(
+        self, handoff: AgentHandoffV2, plan: WorkStepPlan, tool_reference: str
+    ) -> None:
+        if self._actor_resolver is None:
+            raise ValueError("WORK_ACTOR_CONTEXT_UNAVAILABLE")
+        actor = await self._actor_resolver.resolve(handoff.actor)
+        PolicyGuard().authorize_goal_action(
+            current_actor=actor,
+            handoff=handoff,
+            manifest=self._goal_manifest,
+            resolved_action=self._goal_action(plan),
+            requested_tool_ids=(tool_reference,),
+            action_risk=RiskLevel.READ_ONLY,
+        )
+        if handoff.context_references:
+            if self._goal_access is None:
+                raise ValueError("WORK_CONTEXT_UNAVAILABLE")
+            await self._goal_access.verify(handoff)
 
     async def build_specialist_context(self, state: WorkIntelligenceState) -> dict[str, object]:
         if any(
@@ -187,6 +261,21 @@ class WorkIntelligenceHarness:
             validated_input = input_contract.model_validate(plan.tool_input).model_dump(mode="json")
         except (AttributeError, TypeError, ValidationError, ValueError):
             return self._failure("WORK_TOOL_INPUT_INVALID")
+        handoff = state["handoff"]
+        if isinstance(handoff, AgentHandoffV2):
+            try:
+                await self._authorize_goal(handoff, plan, tool_reference)
+            except ValueError:
+                return self._failure("WORK_CONTEXT_CHANGED")
+            resource_type = validated_input.get("resource_type")
+            if isinstance(resource_type, str):
+                selected = {
+                    str(ref.resource_id)
+                    for ref in handoff.context_references
+                    if ref.resource_type.casefold() == resource_type.casefold()
+                }
+                if selected and validated_input.get("reference") not in selected:
+                    return self._failure("WORK_CONTEXT_CHANGED")
         request = ToolExecutionRequest(
             agent_run_id=uuid5(NAMESPACE_URL, f"agent-run:{state['handoff'].idempotency_key}"),
             tool_id=plan.tool_id,
@@ -234,6 +323,18 @@ class WorkIntelligenceHarness:
         except ValidationError:
             return self._failure("WORK_TOOL_OUTPUT_INVALID")
         evidence = envelope.evidence
+        if isinstance(handoff, AgentHandoffV2):
+            expected_versions = {
+                ref.resource_id: ref.version
+                for ref in handoff.context_references
+                if ref.version is not None
+            }
+            if any(
+                item.resource_id in expected_versions
+                and item.resource_version != expected_versions[item.resource_id]
+                for item in evidence
+            ):
+                return self._failure("WORK_CONTEXT_CHANGED")
         if plan.question_kind is WorkQuestionKind.NEXT_TASK and envelope.next_task_id is not None:
             evidence = tuple(item for item in evidence if item.resource_id == envelope.next_task_id)
         updates: dict[str, object] = {
@@ -304,6 +405,12 @@ class WorkIntelligenceHarness:
             verify_grounded_answer(output)
         except GroundingError:
             return self._failure("WORK_GROUNDING_FAILED")
+        handoff = state["handoff"]
+        if isinstance(handoff, AgentHandoffV2) and plan.tool_id is not None:
+            try:
+                await self._authorize_goal(handoff, plan, f"{plan.tool_id}@1")
+            except ValueError:
+                return self._failure("WORK_CONTEXT_CHANGED")
         if plan.tool_id == "risk.read":
             if state["tool_calls_used"] >= state["handoff"].budget.max_tool_calls:
                 return self._failure("WORK_TOOL_BUDGET_EXHAUSTED")
@@ -384,21 +491,35 @@ class WorkIntelligenceHarness:
                 ),
             ),
         )
-        return {
-            "result": AgentResult(
-                agent_id=AgentId.WORK_INTELLIGENCE,
-                agent_version=self._manifest.agent.version,
-                status=status,
-                typed_output=output.model_dump(mode="json"),
-                evidence=evidence,
-                verifier_results=verifier_results,
-                requested_handoff=requested,
-                iterations_used=state["iterations_used"],
-                tool_calls_used=state["tool_calls_used"],
-                stop_reason=state["stop_reason"],
-                safe_error_code=state["safe_error_code"],
-            )
-        }
+        goal = isinstance(state["handoff"], AgentHandoffV2)
+        result = AgentResult(
+            agent_id=AgentId.WORK_INTELLIGENCE,
+            agent_version=self._goal_manifest.agent.version
+            if goal
+            else self._manifest.agent.version,
+            status=status,
+            typed_output=output.model_dump(mode="json"),
+            evidence=evidence,
+            verifier_results=verifier_results,
+            requested_handoff=requested,
+            iterations_used=state["iterations_used"],
+            tool_calls_used=state["tool_calls_used"],
+            stop_reason=state["stop_reason"],
+            safe_error_code=state["safe_error_code"],
+        )
+        if goal:
+            return {
+                "result": GoalDirectedAgentResult.model_validate(
+                    {
+                        **result.model_dump(),
+                        "resolved_action": self._goal_action(plan),
+                        "interaction_outcome": InteractionOutcome.NEEDS_INPUT
+                        if status is AgentRunStatus.AWAITING_INPUT
+                        else None,
+                    }
+                )
+            }
+        return {"result": result}
 
     def _clarification_output(
         self,
@@ -438,7 +559,7 @@ class WorkIntelligenceHarness:
         }
 
 
-def _context_reference(item: object, handoff: AgentHandoff) -> ContextReference:
+def _context_reference(item: object, handoff: AgentHandoff | AgentHandoffV2) -> ContextReference:
     from work_management_ai.agents.work_intelligence.contracts import EvidenceItem
 
     evidence = EvidenceItem.model_validate(item)

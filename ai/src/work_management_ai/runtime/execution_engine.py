@@ -51,6 +51,7 @@ class RecordedAgentRun(BaseModel):
     target_agent_version: str | None = None
     capability: str | None = None
     manifest_fingerprint: str | None = None
+    existing: bool = False
 
 
 class ExecutionRecorderPort(Protocol):

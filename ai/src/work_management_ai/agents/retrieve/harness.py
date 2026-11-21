@@ -8,7 +8,12 @@ from datetime import UTC, datetime
 from typing import Literal, cast
 from uuid import NAMESPACE_URL, uuid5
 
-from work_management_ai.agents.orchestrator.contracts import ActorContextResolverPort
+from work_management_ai.agents.orchestrator.contracts import (
+    ActorContextResolverPort,
+    MessageSpan,
+    PublicQueryValidatorPort,
+    PublicSearchIntent,
+)
 from work_management_ai.agents.retrieve.budget import (
     RetrievalBudget,
     RetrievalBudgetError,
@@ -20,6 +25,7 @@ from work_management_ai.agents.retrieve.contracts import (
     RetrieveInput,
     RetrieveOutcome,
     RetrieveOutput,
+    RetrieveRequirement,
     RetrieveUsage,
     SourceBinding,
     SourceCoverage,
@@ -48,17 +54,25 @@ from work_management_ai.model_gateway.errors import (
 from work_management_ai.runtime.activation import ActivationContext
 from work_management_ai.runtime.contracts import (
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
+    GoalDirectedAgentResult,
     InteractionOutcome,
     JsonValue,
+    RiskLevel,
+    SourceTurnTextPort,
     ToolExecutionRequest,
     ToolExecutionResult,
     ToolExecutorPort,
 )
 from work_management_ai.runtime.daily_update_budget import MODEL_ATTEMPT_SCOPE
-from work_management_ai.runtime.manifests import load_agent_manifest_resource
+from work_management_ai.runtime.manifests import (
+    GoalDirectedAgentManifest,
+    load_agent_manifest_resource,
+    load_yaml_resource,
+)
 from work_management_ai.runtime.policy_guard import AgentPolicyError, PolicyGuard
 from work_management_ai.tools.web.contracts import (
     WebReadPagesInput,
@@ -74,6 +88,10 @@ def _safe(code: str | None, default: str = "RETRIEVAL_UNAVAILABLE") -> str:
     return code if code and re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", code) else default
 
 
+class _PublicIntentRequired(ValueError):
+    pass
+
+
 class RetrieveHarness:
     def __init__(
         self,
@@ -85,22 +103,72 @@ class RetrieveHarness:
         activation: ActivationContext | None = None,
         is_cancelled: Callable[[], bool] | None = None,
         document_readiness: Literal["ABSENT", "PROCESSING", "FAILED"] | None = None,
+        source_turns: SourceTurnTextPort | None = None,
+        public_query_validator: PublicQueryValidatorPort | None = None,
     ):
         self.gateway = model_gateway
         self.tools = tool_executor
         self.document_readiness = document_readiness
         self.usage, self.actors, self.activation = usage_port, actor_resolver, activation
         self.is_cancelled = is_cancelled or (lambda: False)
+        self.source_turns = source_turns
+        self.public_query_validator = public_query_validator
         self.manifest = load_agent_manifest_resource(
             "work_management_ai.agents.retrieve", "agent.yaml"
         )
+        self.goal_manifest = load_yaml_resource(
+            "work_management_ai.agents.retrieve", "agent.v2.yaml", GoalDirectedAgentManifest
+        )
 
-    async def run(self, handoff: AgentHandoff) -> AgentResult:
+    async def _intake_goal(self, handoff: AgentHandoffV2) -> RetrieveInput:
+        if self.source_turns is None or self.public_query_validator is None:
+            raise _PublicIntentRequired
+        original = await self.source_turns.read(handoff)
+        query = handoff.brief.objective.strip()
+        start = original.find(query)
+        if not 1 <= len(query) <= 500 or start < 0:
+            raise _PublicIntentRequired
+        intent = PublicSearchIntent(
+            search_queries=(query,),
+            message_spans=(MessageSpan(start=start, end=start + len(query), text=query),),
+            requirements=(RetrieveRequirement(requirement_id="topic", description=query),),
+        )
+        try:
+            intent.validate_message(original)
+            await self.public_query_validator.validate_public_intent(
+                intent.model_dump(mode="json"), original, handoff.actor
+            )
+        except ValueError as error:
+            raise _PublicIntentRequired from error
+        return RetrieveInput(
+            query=query,
+            locale=handoff.locale,
+            search_queries=intent.search_queries,
+            requirements=intent.requirements,
+        )
+
+    async def run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
+        result = await self._run(handoff)
+        if isinstance(handoff, AgentHandoffV2):
+            return GoalDirectedAgentResult.model_validate(
+                {
+                    **result.model_dump(),
+                    "agent_version": self.goal_manifest.agent.version,
+                    "resolved_action": "retrieval.summarize_web",
+                }
+            )
+        return result
+
+    async def _run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
         runner = _RetrieveRun(self, handoff)
         try:
             async with asyncio.timeout(min(25, handoff.budget.timeout_seconds)):
                 await runner.guard()
-                runner.value = RetrieveInput.model_validate(handoff.typed_input)
+                runner.value = (
+                    await self._intake_goal(handoff)
+                    if isinstance(handoff, AgentHandoffV2)
+                    else RetrieveInput.model_validate(handoff.typed_input)
+                )
                 runner.budget = await RetrievalBudget.start(
                     handoff=handoff, limits=runner.value.limits, usage_port=self.usage
                 )
@@ -112,6 +180,21 @@ class RetrieveHarness:
             raise
         except TimeoutError:
             return runner.failure("RETRIEVAL_TIMEOUT", outcome=RetrieveOutcome.SOURCE_UNAVAILABLE)
+        except _PublicIntentRequired:
+            assert isinstance(handoff, AgentHandoffV2)
+            return runner.result(
+                RetrieveOutput(
+                    outcome=RetrieveOutcome.NEEDS_INPUT,
+                    strategy_used="NONE",
+                    question=(
+                        "Bạn muốn tra cứu nội dung công khai nào?"
+                        if handoff.locale == "vi"
+                        else "What public information should I look up?"
+                    ),
+                    observed_at=datetime.now(UTC),
+                    safe_error_code="PUBLIC_QUERY_REQUIRED",
+                )
+            )
         except (AgentPolicyError, RetrievalBudgetError) as error:
             return runner.failure(_safe(str(error)))
         except (ValueError, TypeError):
@@ -123,7 +206,7 @@ class RetrieveHarness:
 
 
 class _RetrieveRun:
-    def __init__(self, harness: RetrieveHarness, handoff: AgentHandoff):
+    def __init__(self, harness: RetrieveHarness, handoff: AgentHandoff | AgentHandoffV2):
         self.harness, self.handoff = harness, handoff
         self.value: RetrieveInput
         self.budget: RetrievalBudget
@@ -133,6 +216,19 @@ class _RetrieveRun:
         if self.harness.is_cancelled():
             raise asyncio.CancelledError
         actor = await self.harness.actors.resolve(self.handoff.actor)
+        if isinstance(self.handoff, AgentHandoffV2):
+            if self.handoff.context_references:
+                raise AgentPolicyError("RETRIEVAL_PRIVATE_CONTEXT_FORBIDDEN")
+            PolicyGuard().authorize_goal_action(
+                current_actor=actor,
+                handoff=self.handoff,
+                manifest=self.harness.goal_manifest,
+                activation=self.harness.activation,
+                resolved_action="retrieval.summarize_web",
+                action_risk=RiskLevel.READ_ONLY,
+                requested_tool_ids=("web.search@1", "web.read_pages@1", "web.revalidate@1"),
+            )
+            return
         PolicyGuard().authorize_handoff(
             current_actor=actor,
             parent_agent_id=AgentId.ORCHESTRATOR,

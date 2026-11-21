@@ -23,11 +23,15 @@ from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentBudget,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
     ContextReference,
+    DelegationBrief,
+    GoalDirectedAgentResult,
     JsonValue,
+    ResolvedActorContext,
     ToolExecutionRequest,
     ToolExecutionResult,
 )
@@ -227,6 +231,47 @@ async def test_my_tasks_answer_uses_only_tool_evidence() -> None:
     assert result.status is AgentRunStatus.COMPLETED
     assert output.evidence == (task,)
     assert output.claims[0].evidence_ids == (task.evidence_id,)
+    assert [request.tool_id for request in executor.requests] == ["work.read_my_tasks"]
+
+
+@pytest.mark.asyncio
+async def test_goal_handoff_selects_read_action_in_specialist() -> None:
+    actor = _actor()
+    legacy = _handoff(actor, question="Show my tasks")
+    goal = AgentHandoffV2.model_validate(
+        {
+            **legacy.model_dump(
+                exclude={"schema_version", "typed_input", "objective", "capability"}
+            ),
+            "target_agent_version": "1.1.0",
+            "locale": "en",
+            "timezone": "UTC",
+            "source_turn_ref": uuid4(),
+            "brief": DelegationBrief(objective=legacy.objective, expected_result="Task status"),
+        }
+    )
+    task = _evidence("TASK", fields={"title": "Ship release", "status": "IN_PROGRESS"})
+    executor = RecordingToolExecutor({"work.read_my_tasks": _tool_result(task)})
+
+    class Actors:
+        async def resolve(self, reference: ActorReference) -> ResolvedActorContext:
+            return ResolvedActorContext(**reference.model_dump(), role="EMPLOYEE", is_active=True)
+
+    result = await WorkIntelligenceHarness(
+        model_gateway=MockModelGateway(
+            fixtures={
+                "work_intelligence.en.plan": _fixture("work_intelligence_en.json")["plan"],
+                "work_intelligence.en.synthesize": _draft(
+                    WorkQuestionKind.MY_TASKS, task, field="status", value="IN_PROGRESS"
+                ),
+            }
+        ),
+        tool_executor=executor,
+        actor_resolver=Actors(),
+    ).run(goal)
+    assert isinstance(result, GoalDirectedAgentResult)
+    assert result.status is AgentRunStatus.COMPLETED
+    assert result.resolved_action == "work.read_my_tasks"
     assert [request.tool_id for request in executor.requests] == ["work.read_my_tasks"]
 
 

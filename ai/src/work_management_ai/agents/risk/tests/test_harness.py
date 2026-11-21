@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
@@ -8,8 +9,13 @@ from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentBudget,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentRunStatus,
+    ContextReference,
+    DelegationBrief,
+    GoalDirectedAgentResult,
+    InteractionOutcome,
     JsonValue,
     ResolvedActorContext,
     ToolExecutionRequest,
@@ -75,6 +81,54 @@ def handoff(tools: Tools, locale: str = "vi", **extra: JsonValue) -> AgentHandof
         step_id="risk",
         idempotency_key="risk-test",
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified_task", [True, False])
+async def test_goal_handoff_uses_only_verified_task_or_asks(verified_task: bool):
+    tools = Tools()
+    legacy = handoff(tools)
+    ref = ContextReference(
+        reference_id=uuid4(),
+        organization_id=legacy.actor.organization_id,
+        resource_type="task",
+        resource_id=tools.task,
+        version=2,
+        observed_at=datetime.now(UTC),
+    )
+    goal = AgentHandoffV2.model_validate(
+        {
+            **legacy.model_dump(
+                exclude={"schema_version", "typed_input", "objective", "capability"}
+            ),
+            "target_agent_version": "1.1.0",
+            "locale": "vi",
+            "timezone": "UTC",
+            "source_turn_ref": uuid4(),
+            "context_references": (ref,) if verified_task else (),
+            "brief": DelegationBrief(objective=legacy.objective, expected_result="Verified risk"),
+        }
+    )
+
+    class Access:
+        async def verify(self, handoff: AgentHandoffV2) -> None:
+            assert handoff.context_references == (ref,)
+
+    result = await RiskHarness(
+        model_gateway=MockModelGateway(fixtures={}),
+        tool_executor=tools,
+        actor_resolver=Actors(),
+        goal_access=Access(),
+    ).run(goal)
+    assert isinstance(result, GoalDirectedAgentResult)
+    if verified_task:
+        assert result.status is AgentRunStatus.COMPLETED
+        assert result.resolved_action == "risk.explain"
+        assert all(call.typed_input["task_reference"] == str(tools.task) for call in tools.calls)
+        assert tools.calls
+    else:
+        assert result.interaction_outcome is InteractionOutcome.NEEDS_INPUT
+        assert not tools.calls
 
 
 @pytest.mark.asyncio

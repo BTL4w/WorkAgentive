@@ -628,6 +628,26 @@ async def _inline_child_budget(
         await binding.store.close_child(context.scope, allocation_id, lease=context.lease)
 
 
+async def _settle_replayed_child(context: ToolInvocationContext) -> None:
+    binding = current_candidate_budget()
+    if binding is None:
+        return
+    if binding.scope != context.scope or binding.lease != context.lease:
+        raise DelegationError("DELEGATION_BUDGET_UNAVAILABLE", stop_segment=True)
+    allocation_id = uuid5(context.receipt_id, "child-budget")
+    await binding.store.settle(
+        context.scope,
+        BudgetReceipt(
+            scope=context.scope,
+            lease=context.lease,
+            reservation=_child_interval(allocation_id),
+            replayed=True,
+        ),
+        None,
+    )
+    await binding.store.close_child(context.scope, allocation_id, lease=context.lease)
+
+
 class DelegationAdapter:
     """Guarded Specialist-as-tool adapter reusing registry, context validation and budgets."""
 
@@ -965,24 +985,8 @@ class DelegationAdapter:
                 typed_output={"workflow_run_id": str(workflow_id)},
                 stop_reason="DELEGATION_EFFECT_RECOVERED",
             )
-        binding = current_candidate_budget()
-        if binding is not None and self._supported(args):
-            if binding.scope != context.scope or binding.lease != context.lease:
-                raise DelegationError("DELEGATION_BUDGET_UNAVAILABLE", stop_segment=True)
-            # A terminal child can be committed before its ledger entries close.
-            # Settle under the current lease without running the child again.
-            allocation_id = uuid5(context.receipt_id, "child-budget")
-            await binding.store.settle(
-                context.scope,
-                BudgetReceipt(
-                    scope=context.scope,
-                    lease=context.lease,
-                    reservation=_child_interval(allocation_id),
-                    replayed=True,
-                ),
-                None,
-            )
-            await binding.store.close_child(context.scope, allocation_id, lease=context.lease)
+        if self._supported(args):
+            await _settle_replayed_child(context)
         return await self._to_backend_result(context, args, child_run_id=recorded.id, result=result)
 
 
@@ -1189,6 +1193,7 @@ class DelegationAdapterV2:
         record = await runner.reconcile(handoff)
         if record is None:
             return None
+        await _settle_replayed_child(context)
         return await self._normalize(context, manifest, record)
 
     async def revalidate_result(

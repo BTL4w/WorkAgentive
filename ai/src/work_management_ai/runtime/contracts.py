@@ -173,6 +173,18 @@ class GoalDirectedAgentResult(AgentResult):
     resolved_action: str | None = Field(default=None, min_length=1, max_length=100)
 
 
+class GoalActionAccessPort(Protocol):
+    """Recheck exact authorized references using the current application state."""
+
+    async def verify(self, handoff: AgentHandoffV2) -> None: ...
+
+
+class SourceTurnTextPort(Protocol):
+    """Load the original, authorized user turn referenced by a goal handoff."""
+
+    async def read(self, handoff: AgentHandoffV2) -> str: ...
+
+
 class ToolExecutionRequest(_StrictFrozenModel):
     agent_run_id: UUID
     tool_id: str = Field(min_length=1, max_length=100)

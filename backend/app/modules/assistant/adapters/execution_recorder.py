@@ -21,9 +21,11 @@ from work_management_ai.runtime.agent_registry import AgentRegistry
 from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
+    GoalDirectedAgentResult,
     ResponseBlock,
 )
 from work_management_ai.runtime.execution_engine import (
@@ -32,6 +34,8 @@ from work_management_ai.runtime.execution_engine import (
     RecordedAgentRun,
 )
 from work_management_ai.runtime.triggers import ChatTurnTrigger, ExecutionScope
+
+GOAL_HANDOFF_CAPABILITY = "orchestration.goal"
 
 
 class RetrievalResultRevalidator(Protocol):
@@ -209,10 +213,13 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
             await transaction.commit()
         if existing is None or existing.orchestration_run_id != self._scope.orchestration_run_id:
             return None
+        result_contract = (
+            GoalDirectedAgentResult
+            if existing.capability == GOAL_HANDOFF_CAPABILITY
+            else AgentResult
+        )
         replayed = (
-            AgentResult.model_validate(existing.typed_output)
-            if existing.typed_output is not None
-            else None
+            result_contract.model_validate(existing.typed_output) if existing.typed_output else None
         )
         if replayed is not None and existing.agent_id == AgentId.RETRIEVE.value:
             replayed = await self._revalidate_retrieval(existing.id, replayed)
@@ -228,10 +235,27 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
             manifest_fingerprint=existing.manifest_fingerprint,
         )
 
-    async def start_agent_run(self, handoff: AgentHandoff) -> RecordedAgentRun:
+    async def start_agent_run(self, handoff: AgentHandoff | AgentHandoffV2) -> RecordedAgentRun:
+        goal = isinstance(handoff, AgentHandoffV2)
+        if goal:
+            assert isinstance(handoff, AgentHandoffV2)
+            trigger = self._scope.trigger
+            if (
+                not isinstance(trigger, ChatTurnTrigger)
+                or trigger.turn_id != handoff.source_turn_ref
+            ):
+                raise RuntimeError("AGENT_HANDOFF_SCOPE_MISMATCH")
+            capability = GOAL_HANDOFF_CAPABILITY
+            objective = "Goal-directed Specialist handoff"
+            typed_input: dict[str, object] = {"source_turn_ref": str(handoff.source_turn_ref)}
+        else:
+            assert isinstance(handoff, AgentHandoff)
+            capability = handoff.capability
+            objective = handoff.objective
+            typed_input = cast(dict[str, object], handoff.typed_input)
         if handoff.target_agent_id is AgentId.RETRIEVE:
             self._retrieval_active = True
-        if handoff.capability in {"reporting.prepare_report", "reporting.explain_snapshot"}:
+        if capability in {"reporting.prepare_report", "reporting.explain_snapshot"}:
             self._report_chat_active = True
         if (
             handoff.orchestration_run_id != self._scope.orchestration_run_id
@@ -248,6 +272,27 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                 organization_id=self._scope.organization_id, run_id=run_id
             )
             if existing is not None:
+                if goal:
+                    if (
+                        existing.capability != capability
+                        or existing.orchestration_run_id != handoff.orchestration_run_id
+                        or existing.parent_agent_run_id != handoff.parent_agent_run_id
+                        or (existing.agent_id, existing.agent_version)
+                        != (handoff.target_agent_id.value, handoff.target_agent_version)
+                        or existing.typed_input != typed_input
+                    ):
+                        raise RuntimeError("AGENT_HANDOFF_SCOPE_MISMATCH")
+                    await transaction.commit()
+                    return RecordedAgentRun(
+                        id=existing.id,
+                        status=AgentRunStatus(existing.status.value),
+                        existing=True,
+                        replayed_result=(
+                            GoalDirectedAgentResult.model_validate(existing.typed_output)
+                            if existing.typed_output is not None
+                            else None
+                        ),
+                    )
                 if (
                     existing.agent_id in {"daily_update", "reporting"}
                     and existing.status is DomainAgentRunStatus.AWAITING_HUMAN
@@ -296,9 +341,9 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                     parent_agent_run_id=handoff.parent_agent_run_id,
                     target_agent_id=handoff.target_agent_id.value,
                     target_agent_version=handoff.target_agent_version,
-                    capability=handoff.capability,
-                    objective=handoff.objective,
-                    typed_input=cast(dict[str, object], handoff.typed_input),
+                    capability=capability,
+                    objective=objective,
+                    typed_input=typed_input,
                     context_references=tuple(
                         reference.model_dump(mode="json")
                         for reference in handoff.context_references
@@ -318,8 +363,8 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                 agent_id=handoff.target_agent_id.value,
                 agent_version=handoff.target_agent_version,
                 manifest_fingerprint=registered.fingerprint,
-                capability=handoff.capability,
-                typed_input=cast(dict[str, object], handoff.typed_input),
+                capability=capability,
+                typed_input=typed_input,
                 budget=handoff.budget.model_dump(mode="json"),
             ).mark_running()
             await transaction.repository.append_agent_run(run=run)

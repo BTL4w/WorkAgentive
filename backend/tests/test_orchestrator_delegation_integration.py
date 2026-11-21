@@ -14,6 +14,8 @@ from app.modules.assistant.adapters.daily_update_tools import DailyUpdateToolAda
 from app.modules.assistant.adapters.delegation_tools import (
     BackendDelegationTool,
     PostgreSQLDailyUpdateReceiptReader,
+    PostgreSQLGoalSourceTurnReader,
+    PostgreSQLGoalSpecialistRunner,
     PostgreSQLWorkflowWaitVerifier,
 )
 from app.modules.assistant.adapters.execution_recorder import PostgreSQLExecutionRecorder
@@ -50,15 +52,22 @@ from work_management_ai.model_gateway.mock import MockModelGateway
 from work_management_ai.model_gateway.tool_contracts import ToolCall
 from work_management_ai.runtime.agent_registry import AgentRegistry
 from work_management_ai.runtime.contracts import (
+    ActorReference,
+    AgentBudget,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
+    DelegationBrief,
 )
 from work_management_ai.runtime.delegation import (
     DelegationAdapter,
+    DelegationAdapterV2,
     DelegationError,
+    VerifiedDelegationReferences,
     filtered_delegate_tool_schema,
+    filtered_delegate_v2_tool_schema,
 )
 from work_management_ai.runtime.execution_engine import DurableSpecialistRunner, RecordedAgentRun
 from work_management_ai.runtime.run_budget import (
@@ -83,7 +92,12 @@ from work_management_ai.runtime.tool_loop_contracts import (
 from work_management_ai.runtime.tool_pipeline import ToolPipeline
 from work_management_ai.runtime.tool_registry import ToolRegistry
 from work_management_ai.runtime.triggers import ChatTurnTrigger, ExecutionScope
-from work_management_ai.tools.delegation.contracts import DelegateAgentInput, DelegateAgentOutput
+from work_management_ai.tools.delegation.contracts import (
+    DelegateAgentInput,
+    DelegateAgentInputV2,
+    DelegateAgentOutput,
+    DelegateAgentOutputV2,
+)
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -161,9 +175,11 @@ async def test_fenced_effect_blocks_stale_lease_but_manual_flow_remains_usable(
 
 
 @pytest.mark.parametrize("interrupt_before_settle", [False, True])
+@pytest.mark.parametrize("goal_directed", [False, True])
 async def test_pipeline_replays_work_harness_after_child_result_commit(
     journal: Journal,
     interrupt_before_settle: bool,
+    goal_directed: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine, sessions, actor, journal_recorder, scope, lease, _, _ = journal
@@ -183,6 +199,7 @@ async def test_pipeline_replays_work_harness_after_child_result_commit(
             ("work_management_ai.tools.work.read_resource", "tool.yaml"),
             ("work_management_ai.tools.risk", "tool.yaml"),
             ("work_management_ai.tools.delegation", "delegate.yaml"),
+            ("work_management_ai.tools.delegation", "delegate.v2.yaml"),
         )
     )
     registry = AgentRegistry(
@@ -197,6 +214,8 @@ async def test_pipeline_replays_work_harness_after_child_result_commit(
     )
     registry.register_resource("work_management_ai.agents.orchestrator", "agent.yaml")
     registry.register_resource("work_management_ai.agents.work_intelligence", "agent.yaml")
+    if goal_directed:
+        registry.register_resource("work_management_ai.agents.work_intelligence", "agent.v2.yaml")
 
     exec_scope = ExecutionScope(
         organization_id=scope.organization_id,
@@ -236,13 +255,15 @@ async def test_pipeline_replays_work_harness_after_child_result_commit(
             },
         )
     evidence_id = f"TASK:{task_id}:1"
+    live_actors = CurrentActorService(SqlAlchemyAuthTransactionFactory(sessions))
+    live_tasks = TaskService(SqlAlchemyTaskTransactionFactory(sessions))
     read_tool = RecordingToolExecutor(
         transaction_factory=PostgreSQLAssistantTransactionFactory(sessions),
         tool_registry=tools,
         backend=WorkToolExecutor(
-            actor_resolver=CurrentActorService(SqlAlchemyAuthTransactionFactory(sessions)),
+            actor_resolver=live_actors,
             tool_registry=tools,
-            task_service=TaskService(SqlAlchemyTaskTransactionFactory(sessions)),
+            task_service=live_tasks,
             project_service=ProjectService(SqlAlchemyProjectTransactionFactory(sessions)),
             planning_service=ManualPlanningService(
                 SqlAlchemyManualPlanningTransactionFactory(sessions)
@@ -285,6 +306,7 @@ async def test_pipeline_replays_work_harness_after_child_result_commit(
     harness = WorkIntelligenceHarness(
         model_gateway=BudgetedToolLoopGateway(mock),
         tool_executor=BudgetedSpecialistTools(read_tool),
+        actor_resolver=CurrentAgentActorResolver(live_actors),
     )
     runner = DurableSpecialistRunner(
         recorder=recorder, harnesses={AgentId.WORK_INTELLIGENCE: harness}
@@ -323,13 +345,66 @@ async def test_pipeline_replays_work_harness_after_child_result_commit(
         version="1.0.0",
         fingerprint="test-delegation",
     )
+    if goal_directed:
+        from work_management_ai.runtime.contracts import ContextReference
+
+        async def verify_refs(current: RunScope, refs: tuple[ContextReference, ...]) -> None:
+            assert current == scope
+            for ref in refs:
+                current_task = await live_tasks.get_task(actor=actor, task_id=ref.resource_id)
+                assert current_task.version == ref.version
+
+        pins = registry.specialist_pins(goal_directed=True)
+        goal_backend = DelegationAdapterV2(
+            scope=scope,
+            parent_agent_run_id=parent_run_id,
+            actor_role="MANAGER",
+            active_phase=5,
+            locale="en",
+            timezone="UTC",
+            agent_registry=registry,
+            specialist_pins=pins,
+            runners={
+                AgentId.WORK_INTELLIGENCE: PostgreSQLGoalSpecialistRunner(
+                    recorder=recorder, harness=harness, pin=pins[0]
+                )
+            },
+            references=VerifiedDelegationReferences(
+                scope=scope,
+                exploration=(),
+                active_context=(),
+                completed_specialists=(),
+                recheck=verify_refs,
+            ),
+        )
+        goal_args = DelegateAgentInputV2(
+            agent_id=AgentId.WORK_INTELLIGENCE,
+            objective="What am I working on?",
+            expected_result="Grounded task status",
+        )
+        goal_schema = filtered_delegate_v2_tool_schema(
+            tools.candidate_schemas(("delegate_agent@2",))[0],
+            allowed_specialists=goal_backend.available_specialists(),
+        )
+        assert goal_schema.input_contract is not None
+        admitted_tool = AdmittedTool(
+            schema=goal_schema,
+            input_contract=goal_schema.input_contract,
+            output_contract=DelegateAgentOutputV2,
+            version="2.0.0",
+            fingerprint="test-goal",
+        )
+    else:
+        goal_backend = None
+        goal_args = None
     admitted = PreparedToolSet((admitted_tool,), "test-delegation", lambda _: True)
     policy = Policy()
-    pipeline = ToolPipeline(
-        store=journal_recorder, policy=policy, backends={"delegate_agent@1": backend}
-    )
+    backends = {"delegate_agent@2": goal_backend} if goal_backend else {"delegate_agent@1": backend}
+    pipeline = ToolPipeline(store=journal_recorder, policy=policy, backends=backends)
     call = ToolCall(
-        call_id="d" * 128, name="delegate_agent", arguments=args.model_dump(mode="json")
+        call_id="d" * 128,
+        name="delegate_agent",
+        arguments=(goal_args or args).model_dump(mode="json"),
     )
     with candidate_budget(
         CandidateBudget(scope=scope, lease=lease, store=budget, interval_id=interval_id)
@@ -356,30 +431,65 @@ async def test_pipeline_replays_work_harness_after_child_result_commit(
                 first
             )
             policy.fail_post = False
-        restarted = ToolPipeline(
-            store=journal_recorder, policy=policy, backends={"delegate_agent@1": backend}
-        )
+        restarted = ToolPipeline(store=journal_recorder, policy=policy, backends=backends)
         replayed = await restarted.execute(scope, call, admitted=admitted, lease=lease)
         assert isinstance(replayed, CompletedToolResult), replayed
         assert await restarted.execute(scope, call, admitted=admitted, lease=lease) == replayed
     payload = ToolResultPayload.model_validate(
         await journal_recorder.get_payload(scope, replayed.payload_ref)
     )
-    output = DelegateAgentOutput.model_validate(payload.output)
+    output = (DelegateAgentOutputV2 if goal_directed else DelegateAgentOutput).model_validate(
+        payload.output
+    )
     assert "Ship release is in progress." in str(output.typed_output["claims"])
     assert any(ref.resource_id == task_id and ref.version == 1 for ref in output.evidence)
     receipt_id = replayed.invocation_id
-    expected_child_id = uuid5(NAMESPACE_URL, f"agent-run:delegate:{receipt_id}")
-    found = await recorder.lookup_agent_run(f"delegate:{receipt_id}")
+    child_key = f"{'goal-delegate' if goal_directed else 'delegate'}:{receipt_id}"
+    expected_child_id = uuid5(NAMESPACE_URL, f"agent-run:{child_key}")
+    found = await recorder.lookup_agent_run(child_key)
     assert found is not None
     assert found.id == expected_child_id
     assert found.status is AgentRunStatus.COMPLETED
+    if isinstance(output, DelegateAgentOutputV2):
+        assert output.resolved_action == "work.read_my_tasks"
     usage = (await budget.remaining(scope)).usage
     assert usage.handoffs == 1
     assert usage.total_tool_calls == 2
     assert usage.total_model_requests == 2
     assert (await budget.remaining(scope)).available.total_model_requests == 22
     await budget.settle(scope, interval, None)
+
+
+async def test_goal_source_turn_reads_original_under_exact_actor_and_run(journal: Journal):
+    _, sessions, actor, _, scope, _, _, _ = journal
+    source = PostgreSQLGoalSourceTurnReader(session_factory=sessions, actor=actor, scope=scope)
+    handoff = AgentHandoffV2(
+        orchestration_run_id=scope.orchestration_run_id,
+        parent_agent_run_id=uuid4(),
+        target_agent_id=AgentId.RETRIEVE,
+        target_agent_version="1.1.0",
+        brief=DelegationBrief(objective="Model paraphrase", expected_result="Verified context"),
+        context_references=(),
+        actor=ActorReference(
+            organization_id=scope.organization_id,
+            membership_id=scope.membership_id,
+        ),
+        source_turn_ref=scope.turn_id,
+        locale="en",
+        timezone="UTC",
+        budget=AgentBudget(max_iterations=1, max_tool_calls=0, timeout_seconds=1),
+        step_id="read-original",
+        idempotency_key="read-original",
+    )
+    assert await source.read(handoff) == "Plan a customer event"
+    with pytest.raises(ValueError, match="DELEGATION_CONTEXT_DENIED"):
+        await source.read(handoff.model_copy(update={"source_turn_ref": uuid4()}))
+    with pytest.raises(ValueError, match="DELEGATION_CONTEXT_DENIED"):
+        await source.read(
+            handoff.model_copy(
+                update={"actor": handoff.actor.model_copy(update={"organization_id": uuid4()})}
+            )
+        )
 
 
 async def test_verifier_reads_canonical_workflow_state(journal: Journal) -> None:

@@ -3,13 +3,22 @@
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Literal, cast
+from typing import Literal, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.modules.assistant.adapters.database_models import (
+    AssistantMessageModel,
+    AssistantTurnModel,
+    OrchestrationRunModel,
+)
+from app.modules.assistant.adapters.execution_recorder import (
+    GOAL_HANDOFF_CAPABILITY,
+    PostgreSQLExecutionRecorder,
+)
 from app.modules.assistant.adapters.orchestration_tools import ApplicationToolBackend
 from app.modules.audit.adapters.database_models import AuditEventModel
 from app.modules.audit.domain.events import AuditOutcome
@@ -24,6 +33,11 @@ from app.modules.progress.domain.daily_updates import DailyUpdateDraft, DailyUpd
 from app.modules.progress.domain.evidence_support import AssessmentJobRef
 from app.modules.work.adapters.database_models import IdempotencyRecordModel, IdempotencyState
 from work_management_ai.agents.daily_update.contracts import DailyUpdateResult
+from work_management_ai.runtime.contracts import (
+    AgentHandoffV2,
+    AgentResult,
+    GoalDirectedAgentResult,
+)
 from work_management_ai.runtime.delegation import (
     CanonicalWorkflowState,
     DelegationAdapter,
@@ -33,8 +47,10 @@ from work_management_ai.runtime.tool_loop_contracts import (
     BackendToolResult,
     RunScope,
     ToolInvocationContext,
+    VersionPin,
     WaitReference,
 )
+from work_management_ai.runtime.tool_pipeline import ToolPolicyError
 
 _ALLOWED_WORKFLOW_STATUSES = {
     "QUEUED",
@@ -75,6 +91,109 @@ class _ScopedReceiptReader:
                 {"org": str(self._actor.organization_id), "member": str(self._actor.membership_id)},
             )
             yield session
+
+
+class PostgreSQLGoalSourceTurnReader(_ScopedReceiptReader):
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession],
+        actor: AuthenticatedActor,
+        scope: RunScope,
+    ) -> None:
+        super().__init__(session_factory=session_factory, actor=actor)
+        if not self._matches_actor(scope):
+            raise ValueError("DELEGATION_CONTEXT_DENIED")
+        self._scope = scope
+
+    async def read(self, handoff: AgentHandoffV2) -> str:
+        scope = self._scope
+        if (
+            handoff.actor.organization_id != scope.organization_id
+            or handoff.actor.membership_id != scope.membership_id
+            or handoff.orchestration_run_id != scope.orchestration_run_id
+            or handoff.source_turn_ref != scope.turn_id
+        ):
+            raise ValueError("DELEGATION_CONTEXT_DENIED")
+        async with self._read() as session:
+            content = await session.scalar(
+                select(AssistantMessageModel.content_blocks)
+                .join(
+                    AssistantTurnModel,
+                    (AssistantTurnModel.organization_id == AssistantMessageModel.organization_id)
+                    & (AssistantTurnModel.user_message_id == AssistantMessageModel.id),
+                )
+                .join(
+                    OrchestrationRunModel,
+                    (OrchestrationRunModel.organization_id == AssistantTurnModel.organization_id)
+                    & (OrchestrationRunModel.turn_id == AssistantTurnModel.id),
+                )
+                .where(
+                    AssistantTurnModel.organization_id == scope.organization_id,
+                    AssistantTurnModel.id == scope.turn_id,
+                    AssistantTurnModel.actor_membership_id == scope.membership_id,
+                    AssistantTurnModel.conversation_id == scope.conversation_id,
+                    AssistantMessageModel.conversation_id == scope.conversation_id,
+                    AssistantMessageModel.created_by_membership_id == scope.membership_id,
+                    AssistantMessageModel.role == "USER",
+                    AssistantMessageModel.created_at > func.now() - text("interval '30 days'"),
+                    OrchestrationRunModel.id == scope.orchestration_run_id,
+                )
+            )
+        if content is None or len(content) != 1 or content[0].get("kind") != "text":
+            raise ValueError("DELEGATION_CONTEXT_UNAVAILABLE")
+        original = content[0].get("text")
+        if not isinstance(original, str) or not original:
+            raise ValueError("DELEGATION_CONTEXT_UNAVAILABLE")
+        return original
+
+
+class GoalSpecialistHarness(Protocol):
+    async def run(self, handoff: AgentHandoffV2) -> AgentResult: ...
+
+
+class PostgreSQLGoalSpecialistRunner:
+    def __init__(
+        self,
+        *,
+        recorder: PostgreSQLExecutionRecorder,
+        harness: GoalSpecialistHarness,
+        pin: VersionPin,
+    ) -> None:
+        self._recorder = recorder
+        self._harness = harness
+        self._pin = pin
+
+    async def run(self, handoff: AgentHandoffV2) -> tuple[UUID, GoalDirectedAgentResult]:
+        recorded = await self._recorder.start_agent_run(handoff)
+        if recorded.existing:
+            recovered = await self.reconcile(handoff)
+            if recovered is None:
+                raise ToolPolicyError("DELEGATION_RECEIPT_REQUIRED", stop_segment=True)
+            return recovered
+        result = await self._harness.run(handoff)
+        if not isinstance(result, GoalDirectedAgentResult):
+            raise ToolPolicyError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+        await self._recorder.finish_agent_run(recorded.id, result)
+        return recorded.id, result
+
+    async def reconcile(
+        self, handoff: AgentHandoffV2
+    ) -> tuple[UUID, GoalDirectedAgentResult] | None:
+        recorded = await self._recorder.lookup_agent_run(handoff.idempotency_key)
+        if recorded is None:
+            return None
+        if (
+            recorded.target_agent_id is not handoff.target_agent_id
+            or recorded.target_agent_version != handoff.target_agent_version
+            or recorded.capability != GOAL_HANDOFF_CAPABILITY
+            or recorded.manifest_fingerprint != self._pin.fingerprint
+            or self._pin.reference != handoff.target_agent_id.value
+            or self._pin.version != handoff.target_agent_version
+        ):
+            raise ToolPolicyError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+        result = recorded.replayed_result
+        return (recorded.id, result) if isinstance(result, GoalDirectedAgentResult) else None
 
 
 class PostgreSQLDailyUpdateReceiptReader(_ScopedReceiptReader):

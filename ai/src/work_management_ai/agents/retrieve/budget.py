@@ -18,7 +18,7 @@ from work_management_ai.agents.retrieve.contracts import (
     SourceBinding,
 )
 from work_management_ai.model_gateway.contracts import ModelUsage
-from work_management_ai.runtime.contracts import AgentHandoff, JsonValue
+from work_management_ai.runtime.contracts import AgentHandoff, AgentHandoffV2, JsonValue
 
 
 class RetrievalBudgetError(ValueError):
@@ -111,7 +111,11 @@ class RetrievalBudget:
 
     @classmethod
     async def start(
-        cls, *, handoff: AgentHandoff, limits: RetrieveLimits, usage_port: RetrievalUsagePort
+        cls,
+        *,
+        handoff: AgentHandoff | AgentHandoffV2,
+        limits: RetrieveLimits,
+        usage_port: RetrievalUsagePort,
     ) -> RetrievalBudget:
         limits = RetrieveLimits.model_validate(limits.model_dump())
         changes = {

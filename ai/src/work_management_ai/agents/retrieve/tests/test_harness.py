@@ -16,6 +16,7 @@ from work_management_ai.agents.retrieve.contracts import (
     RetrieveOutput,
     WebEvidence,
 )
+from work_management_ai.agents.retrieve.harness import RetrieveHarness
 from work_management_ai.agents.retrieve.tests.fixtures import (
     Actors,
     Gateway,
@@ -31,13 +32,83 @@ from work_management_ai.model_gateway.contracts import (
     StructuredModelResponse,
 )
 from work_management_ai.model_gateway.errors import ModelRateLimitError, ModelTimeoutError
+from work_management_ai.runtime.activation import ActivationContext
 from work_management_ai.runtime.contracts import (
+    ActorReference,
     AgentHandoff,
+    AgentHandoffV2,
     AgentRunStatus,
+    DelegationBrief,
+    GoalDirectedAgentResult,
     InteractionOutcome,
+    JsonValue,
     ToolExecutionRequest,
     ToolExecutionResult,
 )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "objective", "expect_search"),
+    [
+        (True, "public planning", True),
+        (False, "public planning", False),
+        (True, "private project code", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_goal_retrieve_egress_requires_original_turn_text(
+    enabled: bool, objective: str, expect_search: bool
+) -> None:
+    legacy = handoff()
+    goal = AgentHandoffV2.model_validate(
+        {
+            **legacy.model_dump(
+                exclude={"schema_version", "typed_input", "objective", "capability"}
+            ),
+            "target_agent_version": "1.1.0",
+            "locale": "en",
+            "timezone": "UTC",
+            "source_turn_ref": uuid4(),
+            "brief": DelegationBrief(objective=objective, expected_result="Public sources"),
+        }
+    )
+    original = "Search the public web for public planning"
+
+    class Source:
+        async def read(self, handoff: AgentHandoffV2) -> str:
+            assert handoff.source_turn_ref == goal.source_turn_ref
+            return original
+
+    class Validator:
+        async def validate_public_intent(
+            self, intent: dict[str, JsonValue], message: str, reference: ActorReference
+        ) -> None:
+            assert (message, reference) == (original, goal.actor)
+            assert intent["search_queries"] == ["public planning"]
+
+    sources = (source(),)
+    tools = Tools(legacy, sources)
+    result = await RetrieveHarness(
+        model_gateway=Gateway(sources),
+        tool_executor=tools,
+        usage_port=Usage(),
+        actor_resolver=Actors(goal.actor),
+        activation=ActivationContext(
+            active_phase=5,
+            core_exit_verified=True,
+            active_tracks=frozenset({"I3"}),
+            provider_ready=enabled,
+        ),
+        source_turns=Source(),
+        public_query_validator=Validator(),
+    ).run(goal)
+    assert isinstance(result, GoalDirectedAgentResult)
+    assert any(call.tool_id == "web.search" for call in tools.calls) is expect_search
+    if expect_search:
+        assert result.resolved_action == "retrieval.summarize_web"
+        assert result.status is AgentRunStatus.COMPLETED
+    else:
+        assert not tools.calls
 
 
 @pytest.mark.parametrize("locale", ["vi", "en"])

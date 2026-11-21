@@ -14,7 +14,12 @@ from work_management_ai.agents.work_intelligence.contracts import (
     WorkIntelligenceOutput,
     WorkStepPlan,
 )
-from work_management_ai.runtime.contracts import AgentHandoff, AgentResult, ToolExecutionResult
+from work_management_ai.runtime.contracts import (
+    AgentHandoff,
+    AgentHandoffV2,
+    AgentResult,
+    ToolExecutionResult,
+)
 
 NODES = (
     "receive_handoff",
@@ -39,7 +44,7 @@ type Route = Literal[
 
 
 class WorkIntelligenceState(TypedDict):
-    handoff: AgentHandoff
+    handoff: AgentHandoff | AgentHandoffV2
     value: WorkIntelligenceInput | None
     plan: WorkStepPlan | None
     tool_result: ToolExecutionResult | None

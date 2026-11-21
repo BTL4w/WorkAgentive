@@ -23,21 +23,35 @@ from work_management_ai.model_gateway.contracts import (
 )
 from work_management_ai.runtime.contracts import (
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
+    ContextReference,
+    GoalActionAccessPort,
+    GoalDirectedAgentResult,
+    InteractionOutcome,
     JsonValue,
     RequestedHandoff,
+    RiskLevel,
     ToolExecutionRequest,
     ToolExecutorPort,
     VerifierResult,
 )
-from work_management_ai.runtime.manifests import AgentManifest, load_yaml_resource
+from work_management_ai.runtime.manifests import (
+    AgentManifest,
+    GoalDirectedAgentManifest,
+    load_yaml_resource,
+)
 from work_management_ai.runtime.policy_guard import PolicyGuard
 from work_management_ai.runtime.skill_bundle import (
     load_packaged_skill_manifest,
     read_skill_instructions,
 )
+
+
+class _RiskTaskRequired(ValueError):
+    pass
 
 
 class RiskHarness:
@@ -47,15 +61,32 @@ class RiskHarness:
         model_gateway: ModelGateway,
         tool_executor: ToolExecutorPort,
         actor_resolver: ActorContextResolverPort,
+        goal_access: GoalActionAccessPort | None = None,
     ):
         self.gateway = model_gateway
         self.tools = tool_executor
         self.actors = actor_resolver
+        self.goal_access = goal_access
         self.manifest = load_yaml_resource(
             "work_management_ai.agents.risk", "agent.yaml", AgentManifest
         )
+        self.goal_manifest = load_yaml_resource(
+            "work_management_ai.agents.risk", "agent.v2.yaml", GoalDirectedAgentManifest
+        )
 
-    async def run(self, handoff: AgentHandoff) -> AgentResult:
+    async def run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
+        result = await self._run(handoff)
+        if isinstance(handoff, AgentHandoffV2):
+            return GoalDirectedAgentResult.model_validate(
+                {
+                    **result.model_dump(),
+                    "agent_version": self.goal_manifest.agent.version,
+                    "resolved_action": "risk.explain",
+                }
+            )
+        return result
+
+    async def _run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
         runner = _RiskRun(self, handoff)
         state = RiskState()
         try:
@@ -103,6 +134,21 @@ class RiskHarness:
                     ),
                 ),
             )
+        except _RiskTaskRequired:
+            return AgentResult(
+                agent_id=AgentId.RISK,
+                agent_version=self.goal_manifest.agent.version,
+                status=AgentRunStatus.AWAITING_INPUT,
+                interaction_outcome=InteractionOutcome.NEEDS_INPUT,
+                typed_output={
+                    "question": (
+                        "Bạn muốn xem rủi ro của công việc nào?"
+                        if isinstance(handoff, AgentHandoffV2) and handoff.locale == "vi"
+                        else "Which Task should I assess?"
+                    )
+                },
+                stop_reason="RISK_TASK_REQUIRED",
+            )
         except Exception:
             return AgentResult(
                 agent_id=AgentId.RISK,
@@ -118,14 +164,34 @@ class RiskHarness:
 
 
 class _RiskRun:
-    def __init__(self, harness: RiskHarness, handoff: AgentHandoff):
+    def __init__(self, harness: RiskHarness, handoff: AgentHandoff | AgentHandoffV2):
         self.harness, self.handoff = harness, handoff
         self.value = RiskQuestion(task_reference="unresolved", locale="en", question="unresolved")
         self.instructions = ""
+        self.task: ContextReference | None = None
+
+    async def authorize_goal(self, handoff: AgentHandoffV2) -> None:
+        actor = await self.harness.actors.resolve(handoff.actor)
+        PolicyGuard().authorize_goal_action(
+            current_actor=actor,
+            handoff=handoff,
+            manifest=self.harness.goal_manifest,
+            resolved_action="risk.explain",
+            action_risk=RiskLevel.READ_ONLY,
+            requested_tool_ids=("risk.read@1",),
+        )
+        if any(ref.organization_id != actor.organization_id for ref in handoff.context_references):
+            raise ValueError("RISK_CONTEXT_TENANT")
+        if handoff.context_references:
+            if self.harness.goal_access is None:
+                raise ValueError("RISK_CONTEXT_UNAVAILABLE")
+            await self.harness.goal_access.verify(handoff)
 
     async def read(self, state: RiskState, expected: str | None = None) -> RiskExplanationInput:
         if state.tools >= self.handoff.budget.max_tool_calls:
             raise ValueError("RISK_TOOL_BUDGET")
+        if isinstance(self.handoff, AgentHandoffV2):
+            await self.authorize_goal(self.handoff)
         state.tools += 1
         result = await self.harness.tools.execute(
             ToolExecutionRequest(
@@ -143,24 +209,46 @@ class _RiskRun:
         )
         if result.status != "SUCCEEDED":
             raise ValueError("RISK_READ_DENIED")
-        return RiskExplanationInput.model_validate(result.typed_output)
+        facts = RiskExplanationInput.model_validate(result.typed_output)
+        if self.task is not None and (
+            facts.task_id != self.task.resource_id or facts.task_version != self.task.version
+        ):
+            raise ValueError("RISK_CONTEXT_CHANGED")
+        return facts
 
     async def execute_node(self, node: str, state: RiskState) -> None:
         if node == "authorize":
-            actor = await self.harness.actors.resolve(self.handoff.actor)
-            PolicyGuard().authorize_handoff(
-                current_actor=actor,
-                parent_agent_id=AgentId.ORCHESTRATOR,
-                handoff=self.handoff,
-                manifest=self.harness.manifest,
-                requested_tool_ids=("risk.read@1",),
-                requested_skill_ids=self.harness.manifest.allowed_skills,
-            )
-            if any(
-                r.organization_id != actor.organization_id for r in self.handoff.context_references
-            ):
-                raise ValueError("RISK_CONTEXT_TENANT")
-            self.value = RiskQuestion.model_validate(self.handoff.typed_input)
+            if isinstance(self.handoff, AgentHandoffV2):
+                await self.authorize_goal(self.handoff)
+                tasks = [
+                    ref
+                    for ref in self.handoff.context_references
+                    if ref.resource_type.casefold() == "task"
+                ]
+                if len(tasks) != 1 or tasks[0].version is None:
+                    raise _RiskTaskRequired
+                self.task = tasks[0]
+                self.value = RiskQuestion(
+                    task_reference=str(self.task.resource_id),
+                    locale=self.handoff.locale,
+                    question=self.handoff.brief.objective,
+                )
+            else:
+                actor = await self.harness.actors.resolve(self.handoff.actor)
+                PolicyGuard().authorize_handoff(
+                    current_actor=actor,
+                    parent_agent_id=AgentId.ORCHESTRATOR,
+                    handoff=self.handoff,
+                    manifest=self.harness.manifest,
+                    requested_tool_ids=("risk.read@1",),
+                    requested_skill_ids=self.harness.manifest.allowed_skills,
+                )
+                if any(
+                    r.organization_id != actor.organization_id
+                    for r in self.handoff.context_references
+                ):
+                    raise ValueError("RISK_CONTEXT_TENANT")
+                self.value = RiskQuestion.model_validate(self.handoff.typed_input)
             instructions: list[str] = []
             for ref in self.harness.manifest.allowed_skills:
                 package = f"work_management_ai.skills.{ref.split('@')[0]}"
