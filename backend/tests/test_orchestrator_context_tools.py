@@ -380,8 +380,21 @@ async def test_signed_cursor_tamper_and_unavailable_source_never_mean_absence():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tool", ["explore_projects", "read_project_context", "read_actor_context"])
-async def test_real_read_contracts_complete_common_pipeline_and_revoke_cached_output(tool: str):
+@pytest.mark.parametrize(
+    ("tool", "query", "size", "overview", "expected_content"),
+    [
+        ("explore_projects", "P", 20, False, False),
+        ("explore_projects", "P0", 20, True, True),
+        ("explore_projects", "P0", 20, False, False),
+        ("explore_projects", "P", 20, True, False),
+        ("explore_projects", "P", 1, True, False),
+        ("read_project_context", "", 20, False, True),
+        ("read_actor_context", "", 20, False, False),
+    ],
+)
+async def test_real_read_contracts_complete_common_pipeline_and_revoke_cached_output(
+    tool: str, query: str, size: int, overview: bool, expected_content: bool
+):
     from datetime import timedelta
 
     from pydantic import BaseModel
@@ -396,7 +409,7 @@ async def test_real_read_contracts_complete_common_pipeline_and_revoke_cached_ou
     from work_management_ai.runtime.tool_registry import ToolRegistry
     from work_management_ai.tools.context.contracts import (
         ContextReadObservation,
-        ExploreProjectsInput,
+        ExploreProjectsInputV103,
         ReadActorInput,
         ReadProjectInput,
     )
@@ -427,13 +440,15 @@ async def test_real_read_contracts_complete_common_pipeline_and_revoke_cached_ou
         scope=scope, lease=lease, store=Budget(scope, lease), interval_id=uuid4()
     )
     args: BaseModel = {
-        "explore_projects": ExploreProjectsInput(query="P"),
+        "explore_projects": ExploreProjectsInputV103(
+            query=query or "P", page_size=size, include_overview_if_unique=overview
+        ),
         "read_project_context": ReadProjectInput(reference=ps.values[0].id),
         "read_actor_context": ReadActorInput(),
     }[tool]
     registry = ToolRegistry.from_resources(
         ("work_management_ai.tools.context", resource)
-        for resource in ("projects.yaml", "project.yaml", "actor.yaml")
+        for resource in ("projects.v103.yaml", "project.yaml", "actor.yaml")
     )
     reference = f"{tool}@1"
     (definition,) = registry.candidate_definitions((reference,))
@@ -448,11 +463,17 @@ async def test_real_read_contracts_complete_common_pipeline_and_revoke_cached_ou
     backend = ContextToolBackend(
         actor=a, scope=scope, objective_ref=uuid4(), service=s, tool_registry=registry
     )
-    pipeline = ToolPipeline(store=Log(), policy=ReadPolicy(), backends={f"{tool}@1": backend})
+    log = Log()
+    pipeline = ToolPipeline(store=log, policy=ReadPolicy(), backends={f"{tool}@1": backend})
     call = ToolCall(call_id="read", name=tool, arguments=args.model_dump(mode="json"))
     with candidate_budget(binding):
         result = await pipeline.execute(scope, call, admitted=catalog, lease=lease)
         assert result.kind == "COMPLETED", result
+        payload = await log.get_payload(scope, result.payload_ref)
+        assert isinstance(payload, dict)
+        output = ContextReadObservation.model_validate(payload["output"])
+        assert bool(output.source_content_refs) is expected_content
+        assert all(item.trust == "UNTRUSTED_SOURCE_CONTENT" for item in output.source_content_refs)
         assert await pipeline.execute(scope, call, admitted=catalog, lease=lease) == result
         actors.actor = None
         revoked = await pipeline.execute(scope, call, admitted=catalog, lease=lease)

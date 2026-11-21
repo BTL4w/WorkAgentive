@@ -1,0 +1,34 @@
+schema_version: "4.0"
+delegation_summary: Prepare, revise, and explain Project plans and weekly replanning proposals.
+agent:
+  id: planning
+  name: Planning Agent
+  version: "1.1.0"
+  owner: planning-agent
+  activation_phase: 2
+capabilities: [planning.create, planning.resume, planning.revise, planning.explain]
+contracts:
+  input: work_management_ai.runtime.contracts.AgentHandoffV2
+  output: work_management_ai.runtime.contracts.GoalDirectedAgentResult
+  handoff: work_management_ai.runtime.contracts.AgentHandoffV2
+permissions:
+  roles: [ADMIN, MANAGER]
+  tenant_scope: actor_membership
+  risk_ceiling: PROPOSAL_ONLY
+runtime:
+  workflow: planning-agent.v2
+  max_iterations: 8
+  max_tool_calls: 12
+  max_handoffs: 0
+  max_replans: 1
+  timeout_seconds: 120
+  checkpoint: durable
+  model_policy: structured_proposal_only
+allowed_skills: [create_project_plan@1, revise_project_plan@1]
+allowed_tools: [planning.manage_run@1]
+approval:
+  produced_writes: ALWAYS
+  can_self_approve: false
+fallback:
+  strategy: MANUAL_EDITABLE_DRAFT
+evaluators: [planning_schema@1, planning_invariants@1, planning_grounding@1]

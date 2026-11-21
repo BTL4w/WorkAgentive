@@ -9,7 +9,7 @@ from work_management_ai.runtime.activation import ActivationContext, capability_
 from work_management_ai.runtime.contracts import AgentId, RiskLevel
 from work_management_ai.runtime.manifests import (
     AnyAgentManifest,
-    CapabilityAgentManifest,
+    GoalDirectedAgentManifest,
     SkillManifestV2,
     ToolLoopAgentManifest,
     canonical_manifest_fingerprint,
@@ -146,7 +146,7 @@ class AgentRegistry:
             raise AgentRegistryError("AGENT_VERSION_NOT_REGISTERED")
         if registered.manifest.agent.activation_phase > active_phase:
             raise AgentRegistryError("AGENT_PHASE_INACTIVE")
-        if isinstance(registered.manifest, CapabilityAgentManifest) and not all(
+        if agent_id is AgentId.RETRIEVE and not all(
             capability_enabled(capability, activation)
             for capability in registered.manifest.capabilities
         ):
@@ -244,11 +244,13 @@ class AgentRegistry:
             raise AgentRegistryError("AGENT_PHASE_INACTIVE")
         return result
 
-    def specialist_pins(self) -> tuple[VersionPin, ...]:
+    def specialist_pins(self, *, goal_directed: bool = False) -> tuple[VersionPin, ...]:
         """Snapshot the configured versions before opening a candidate run."""
         pins: dict[AgentId, VersionPin] = {}
         for (agent_id, version), entry in self._entries.items():
-            if agent_id is AgentId.ORCHESTRATOR:
+            if agent_id is AgentId.ORCHESTRATOR or (
+                isinstance(entry.manifest, GoalDirectedAgentManifest) != goal_directed
+            ):
                 continue
             if agent_id in pins:
                 raise AgentRegistryError("SPECIALIST_VERSION_SELECTION_REQUIRED")
@@ -269,12 +271,13 @@ class AgentRegistry:
         for registered in self._entries.values():
             manifest = registered.manifest
             if (
-                manifest.agent.id is AgentId.ORCHESTRATOR
+                isinstance(manifest, GoalDirectedAgentManifest)
+                or manifest.agent.id is AgentId.ORCHESTRATOR
                 or manifest.agent.activation_phase > active_phase
                 or role not in manifest.permissions.roles
             ):
                 continue
-            if isinstance(manifest, CapabilityAgentManifest) and not all(
+            if manifest.agent.id is AgentId.RETRIEVE and not all(
                 capability_enabled(capability, activation) for capability in manifest.capabilities
             ):
                 continue

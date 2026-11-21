@@ -100,6 +100,25 @@ class AgentHandoff(_StrictFrozenModel):
     idempotency_key: str = Field(min_length=1, max_length=255)
 
 
+class AgentHandoffV2(_StrictFrozenModel):
+    """Goal and references bound by the runtime for one Specialist run."""
+
+    schema_version: Literal["2.0"] = "2.0"
+    orchestration_run_id: UUID
+    parent_agent_run_id: UUID
+    target_agent_id: AgentId
+    target_agent_version: str = Field(min_length=1, max_length=64)
+    brief: DelegationBrief
+    context_references: tuple[ContextReference, ...] = Field(max_length=16)
+    actor: ActorReference
+    source_turn_ref: UUID
+    locale: Literal["vi", "en"]
+    timezone: str = Field(min_length=1, max_length=100)
+    budget: AgentBudget
+    step_id: str = Field(min_length=1, max_length=128)
+    idempotency_key: str = Field(min_length=1, max_length=255)
+
+
 class RequestedHandoff(_StrictFrozenModel):
     target_capability: str = Field(min_length=1, max_length=100)
     objective: str = Field(min_length=1, max_length=4_000)
@@ -148,6 +167,10 @@ class AgentResult(_StrictFrozenModel):
 
 class AgentHarness(Protocol):
     async def run(self, handoff: AgentHandoff) -> AgentResult: ...
+
+
+class GoalDirectedAgentResult(AgentResult):
+    resolved_action: str | None = Field(default=None, min_length=1, max_length=100)
 
 
 class ToolExecutionRequest(_StrictFrozenModel):

@@ -7,11 +7,13 @@ from work_management_ai.runtime.activation import ActivationContext, capability_
 from work_management_ai.runtime.contracts import (
     AgentBudget,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     JsonValue,
     ResolvedActorContext,
+    RiskLevel,
 )
-from work_management_ai.runtime.manifests import AnyAgentManifest, CapabilityAgentManifest
+from work_management_ai.runtime.manifests import AnyAgentManifest, GoalDirectedAgentManifest
 
 _RESERVED_AUTHORITY_KEYS = frozenset(
     {
@@ -27,6 +29,7 @@ _RESERVED_AUTHORITY_KEYS = frozenset(
         "provider_ready",
     }
 )
+_RISK_ORDER = {RiskLevel.READ_ONLY: 0, RiskLevel.PROPOSAL_ONLY: 1, RiskLevel.EXPLICIT_WRITE: 2}
 
 
 class AgentPolicyError(ValueError):
@@ -80,6 +83,56 @@ class PolicyGuard:
     ) -> None:
         if parent_agent_id is not AgentId.ORCHESTRATOR:
             raise AgentPolicyError("ORCHESTRATOR_REQUIRED")
+        if isinstance(manifest, GoalDirectedAgentManifest):
+            raise AgentPolicyError("AGENT_HANDOFF_SCHEMA_MISMATCH")
+        self._authorize_action(
+            current_actor=current_actor,
+            handoff=handoff,
+            manifest=manifest,
+            capability=handoff.capability,
+            requested_skill_ids=requested_skill_ids,
+            requested_tool_ids=requested_tool_ids,
+            activation=activation,
+        )
+        self._reject_reserved_keys(handoff.typed_input)
+
+    def authorize_goal_action(
+        self,
+        *,
+        current_actor: ResolvedActorContext,
+        handoff: AgentHandoffV2,
+        manifest: AnyAgentManifest,
+        resolved_action: str,
+        action_risk: RiskLevel,
+        requested_tool_ids: tuple[str, ...] = (),
+        activation: ActivationContext | None = None,
+    ) -> None:
+        """Authorize the operation selected by a Specialist before business tool use."""
+        if not isinstance(manifest, GoalDirectedAgentManifest):
+            raise AgentPolicyError("AGENT_HANDOFF_SCHEMA_MISMATCH")
+        self._authorize_action(
+            current_actor=current_actor,
+            handoff=handoff,
+            manifest=manifest,
+            capability=resolved_action,
+            requested_skill_ids=(),
+            requested_tool_ids=requested_tool_ids,
+            activation=activation,
+        )
+        if _RISK_ORDER[action_risk] > _RISK_ORDER[manifest.permissions.risk_ceiling]:
+            raise AgentPolicyError("ACTION_RISK_EXCEEDED")
+
+    def _authorize_action(
+        self,
+        *,
+        current_actor: ResolvedActorContext,
+        handoff: AgentHandoff | AgentHandoffV2,
+        manifest: AnyAgentManifest,
+        capability: str,
+        requested_skill_ids: tuple[str, ...],
+        requested_tool_ids: tuple[str, ...],
+        activation: ActivationContext | None,
+    ) -> None:
         if not current_actor.is_active:
             raise AgentPolicyError("ACTOR_INACTIVE")
         if (
@@ -93,18 +146,15 @@ class PolicyGuard:
             raise AgentPolicyError("AGENT_ID_MISMATCH")
         if handoff.target_agent_version != manifest.agent.version:
             raise AgentPolicyError("AGENT_VERSION_MISMATCH")
-        if handoff.capability not in manifest.capabilities:
+        if capability not in manifest.capabilities:
             raise AgentPolicyError("CAPABILITY_NOT_ALLOWED")
-        if isinstance(manifest, CapabilityAgentManifest) and not capability_enabled(
-            handoff.capability, activation
-        ):
+        if manifest.agent.id is AgentId.RETRIEVE and not capability_enabled(capability, activation):
             raise AgentPolicyError("AGENT_CAPABILITY_INACTIVE")
         self._validate_budget(handoff.budget, manifest)
         if not set(requested_skill_ids).issubset(manifest.allowed_skills):
             raise AgentPolicyError("SKILL_NOT_ALLOWED")
         if not set(requested_tool_ids).issubset(manifest.allowed_tools):
             raise AgentPolicyError("TOOL_NOT_ALLOWED")
-        self._reject_reserved_keys(handoff.typed_input)
 
     @staticmethod
     def _validate_budget(budget: AgentBudget, manifest: AnyAgentManifest) -> None:

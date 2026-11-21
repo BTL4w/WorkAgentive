@@ -176,30 +176,66 @@ class CapabilityAgentManifest(_AgentManifestFields):
 
     @model_validator(mode="after")
     def validate_web_boundary(self) -> Self:
-        runtime = self.runtime
+        _validate_web_boundary(self)
+        return self
+
+
+def _validate_web_boundary(manifest: _AgentManifestFields) -> None:
+    runtime = manifest.runtime
+    if (
+        manifest.agent.id is not AgentId.RETRIEVE
+        or manifest.agent.activation_phase < 5
+        or frozenset(manifest.capabilities) != WEB_CAPABILITIES
+        or manifest.permissions.risk_ceiling is not RiskLevel.READ_ONLY
+        or manifest.approval.produced_writes != "NEVER"
+        or frozenset(manifest.allowed_tools) != WEB_TOOLS
+        or manifest.allowed_skills != ("web_search_and_summarize@1",)
+        or runtime.max_model_attempts > 2
+        or runtime.max_input_tokens > 12000
+        or runtime.max_output_tokens > 3200
+        or runtime.max_tool_calls > 8
+        or runtime.max_iterations > 12
+        or runtime.timeout_seconds > 25
+        or runtime.max_handoffs != 0
+        or runtime.max_replans != 0
+    ):
+        raise ValueError("invalid read-only web capability boundary")
+
+
+class GoalDirectedAgentManifest(_AgentManifestFields):
+    """Versioned Specialist intake and catalog description for goal handoffs."""
+
+    schema_version: Literal["4.0"]
+    delegation_summary: str = Field(min_length=1, max_length=400)
+    activation: CapabilityActivationManifest | None = None
+    retrieval_limits: WebReadLimitsManifest | None = None
+
+    @model_validator(mode="after")
+    def validate_goal_directed_boundary(self) -> Self:
         if (
-            self.agent.id is not AgentId.RETRIEVE
-            or self.agent.activation_phase < 5
-            or frozenset(self.capabilities) != WEB_CAPABILITIES
-            or self.permissions.risk_ceiling is not RiskLevel.READ_ONLY
-            or self.approval.produced_writes != "NEVER"
-            or frozenset(self.allowed_tools) != WEB_TOOLS
-            or self.allowed_skills != ("web_search_and_summarize@1",)
-            or runtime.max_model_attempts > 2
-            or runtime.max_input_tokens > 12000
-            or runtime.max_output_tokens > 3200
-            or runtime.max_tool_calls > 8
-            or runtime.max_iterations > 12
-            or runtime.timeout_seconds > 25
-            or runtime.max_handoffs != 0
-            or runtime.max_replans != 0
+            self.agent.id is AgentId.ORCHESTRATOR
+            or self.contracts.handoff != "work_management_ai.runtime.contracts.AgentHandoffV2"
+            or not self.delegation_summary.strip()
+            or "\n" in self.delegation_summary
         ):
-            raise ValueError("invalid read-only web capability boundary")
+            raise ValueError("invalid goal-directed Specialist boundary")
+        if self.agent.id is AgentId.RETRIEVE:
+            if self.activation is None or self.retrieval_limits is None:
+                raise ValueError("Retrieve requires capability activation and limits")
+            _validate_web_boundary(self)
+        elif (
+            self.activation is not None
+            or self.retrieval_limits is not None
+            or any(capability.startswith("retrieval.") for capability in self.capabilities)
+            or WEB_TOOLS.intersection(self.allowed_tools)
+        ):
+            raise ValueError("web tools require the Retrieve capability boundary")
         return self
 
 
 type AnyAgentManifest = Annotated[
-    AgentManifest | CapabilityAgentManifest, Field(discriminator="schema_version")
+    AgentManifest | CapabilityAgentManifest | GoalDirectedAgentManifest,
+    Field(discriminator="schema_version"),
 ]
 
 
@@ -338,6 +374,7 @@ class ToolLoopAgentManifest(_ManifestModel):
         root_tools = {
             "load_skill@1",
             "delegate_agent@1",
+            "delegate_agent@2",
             "explore_projects@1",
             "read_project_context@1",
             "read_actor_context@1",

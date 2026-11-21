@@ -24,6 +24,8 @@ from work_management_ai.model_gateway.tool_contracts import (
     ToolModelRequest,
     ToolSchema,
 )
+from work_management_ai.runtime.contracts import AgentId
+from work_management_ai.runtime.delegation import filtered_delegate_v2_tool_schema
 from work_management_ai.runtime.manifests import ToolManifestV2, load_tool_manifest_resource
 from work_management_ai.runtime.tool_registry import ToolRegistry
 from work_management_ai.tools.context import contracts as context_contracts
@@ -166,6 +168,32 @@ async def test_parallel_disabled_and_strict_schema() -> None:
     assert {"type": "null"} in alternatives
     assert "default" not in properties["section"]
     assert req.tools[0] == before
+
+
+@pytest.mark.asyncio
+async def test_goal_delegation_reaches_strict_provider_as_flat_scoped_input() -> None:
+    registry = ToolRegistry.from_resources(
+        (("work_management_ai.tools.delegation", "delegate.v2.yaml"),)
+    )
+    (base,) = registry.candidate_schemas(("delegate_agent@2",))
+    schema = filtered_delegate_v2_tool_schema(
+        base, allowed_specialists=((AgentId.RISK, "Explain verified risks."),)
+    )
+    adapter, stub, _ = gateway(final_message())
+    await adapter.generate_step(request().model_copy(update={"tools": (schema,)}))
+    tools = cast(list[dict[str, object]], stub.binding["tools"])
+    function = cast(dict[str, object], tools[0]["function"])
+    assert "Explain verified risks." in str(function["description"])
+    parameters = cast(dict[str, object], function["parameters"])
+    assert parameters["additionalProperties"] is False
+    assert set(cast(list[str], parameters["required"])) == {
+        "agent_id",
+        "objective",
+        "context_ref_ids",
+        "constraints",
+        "expected_result",
+    }
+    assert "anyOf" not in json.dumps(parameters)
 
 
 @pytest.mark.asyncio

@@ -80,6 +80,7 @@ from work_management_ai.tools.context.contracts import (
 )
 from work_management_ai.tools.delegation.contracts import (
     DelegateAgentInput,
+    DelegateAgentInputV2,
     DelegateAgentOutput,
     PlanningCreateDelegationInput,
     ReportingPrepareDelegationInput,
@@ -111,7 +112,7 @@ def _lease(scope: RunScope) -> RunLease:
 
 def _context(
     scope: RunScope,
-    args: DelegateAgentInput,
+    args: DelegateAgentInput | DelegateAgentInputV2,
     *,
     lease: RunLease | None = None,
     version: str = "1.0.0",

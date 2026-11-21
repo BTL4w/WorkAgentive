@@ -315,7 +315,9 @@ class ToolPipeline:
                 raise ToolPolicyError("INVOCATION_CONFLICT", stop_segment=True)
             reservation = UsageReservation(
                 operation_id=invocation_id,
-                kind="HANDOFF" if tool.reference == "delegate_agent@1" else "TOOL",
+                kind="HANDOFF"
+                if tool.reference in {"delegate_agent@1", "delegate_agent@2"}
+                else "TOOL",
                 interval_id=binding.interval_id,
                 allocation_id=binding.allocation_id,
             )

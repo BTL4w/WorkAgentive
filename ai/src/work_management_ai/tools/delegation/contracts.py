@@ -481,12 +481,54 @@ class DelegateAgentInput(_StrictContract):
         return self
 
 
-class DelegateAgentOutput(_StrictContract):
-    """Normalized observation returned to the Orchestrator after Specialist execution."""
+class DelegateAgentInputV2(_StrictContract):
+    agent_id: AgentId = Field(description="Target Specialist from the offered list.")
+    objective: str = Field(
+        min_length=1,
+        max_length=4000,
+        description="Goal for the Specialist to accomplish within the user's request.",
+    )
+    context_ref_ids: tuple[UUID, ...] = Field(
+        default=(),
+        max_length=16,
+        description="Verified context reference IDs from this run. References never grant rights.",
+    )
+    constraints: tuple[str, ...] = Field(
+        default=(),
+        max_length=16,
+        description="User and task constraints within existing permission and approval gates.",
+    )
+    expected_result: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Short description of the expected result.",
+    )
 
+    @field_validator("objective", "expected_result")
+    @classmethod
+    def non_blank_text(cls, value: str) -> str:
+        return DelegateAgentInput.non_blank_text(value)
+
+    @field_validator("constraints")
+    @classmethod
+    def valid_constraints(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        return DelegateAgentInput.valid_constraints(values)
+
+    @field_validator("context_ref_ids")
+    @classmethod
+    def unique_context_refs(cls, values: tuple[UUID, ...]) -> tuple[UUID, ...]:
+        return DelegateAgentInput.unique_context_refs(values)
+
+    @model_validator(mode="after")
+    def valid_target(self) -> Self:
+        if self.agent_id == AgentId.ORCHESTRATOR:
+            raise ValueError("DELEGATION_SELF_FORBIDDEN")
+        return self
+
+
+class _DelegateAgentOutputFields(_StrictContract):
     agent_id: AgentId
     agent_version: str = Field(min_length=1, max_length=64)
-    capability: str = Field(min_length=1, max_length=100)
     child_agent_run_id: UUID
     status: AgentRunStatus
     interaction_outcome: InteractionOutcome | None = None
@@ -504,3 +546,15 @@ class DelegateAgentOutput(_StrictContract):
     stop_reason: str = Field(min_length=1, max_length=100)
     safe_error_code: str | None = Field(default=None, min_length=1, max_length=100)
     usage: dict[str, int] = Field(default_factory=dict)
+
+
+class DelegateAgentOutput(_DelegateAgentOutputFields):
+    """Normalized observation returned to the Orchestrator after Specialist execution."""
+
+    capability: str = Field(min_length=1, max_length=100)
+
+
+class DelegateAgentOutputV2(_DelegateAgentOutputFields):
+    """Normalized observation from a goal-directed Specialist."""
+
+    resolved_action: str | None = Field(default=None, min_length=1, max_length=100)

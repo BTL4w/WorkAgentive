@@ -5,7 +5,8 @@ never delegate to peers or self. Server-bound identity, tenant scope, authorizat
 context-use validation and conserved budget reservations are enforced in Python.
 """
 
-from collections.abc import Iterable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping
+from contextlib import asynccontextmanager
 from typing import Any, Literal, Protocol, Union
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -20,15 +21,18 @@ from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentBudget,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
     ContextReference,
     DelegationBrief,
+    GoalDirectedAgentResult,
     InteractionOutcome,
     JsonValue,
 )
 from work_management_ai.runtime.execution_engine import RecordedAgentRun
+from work_management_ai.runtime.manifests import GoalDirectedAgentManifest
 from work_management_ai.runtime.run_budget import (
     BudgetError,
     BudgetReceipt,
@@ -58,7 +62,9 @@ from work_management_ai.tools.delegation.contracts import (
     AssignmentAnalyzeWorkloadDelegationInput,
     DailyUpdatePrepareDelegationInput,
     DelegateAgentInput,
+    DelegateAgentInputV2,
     DelegateAgentOutput,
+    DelegateAgentOutputV2,
     RiskExplainDelegationInput,
     WorkQuestionDelegationInput,
     WorkReadProjectDelegationInput,
@@ -231,6 +237,33 @@ def filtered_delegate_tool_schema(
         reference=base_schema.reference,
         description=base_schema.description,
         parameters=filtered_model.model_json_schema(),
+        input_contract=filtered_model,
+    )
+
+
+def filtered_delegate_v2_tool_schema(
+    base_schema: ToolSchema, *, allowed_specialists: Iterable[tuple[AgentId, str]]
+) -> ToolSchema:
+    """Publish the admitted Specialists without exposing their execution contracts."""
+    summaries = dict(allowed_specialists)
+    if base_schema.reference != "delegate_agent@2":
+        raise DelegationError("DELEGATION_TOOL_MISMATCH", stop_segment=True)
+    if not summaries or AgentId.ORCHESTRATOR in summaries:
+        raise DelegationError("DELEGATION_CATALOG_INVALID", stop_segment=True)
+    agents = sorted(summaries, key=lambda agent: agent.value)
+    literal_factory: Any = Literal
+    filtered_model = create_model(
+        "ScopedDelegateAgentInputV2",
+        __base__=DelegateAgentInputV2,
+        agent_id=(
+            literal_factory[tuple(agent.value for agent in agents)],
+            Field(description=DelegateAgentInputV2.model_fields["agent_id"].description),
+        ),
+    )
+    descriptions = "\n".join(f"- {agent.value}: {summaries[agent]}" for agent in agents)
+    return ToolSchema(
+        reference=base_schema.reference,
+        description=f"{base_schema.description}\n\nEligible Specialists:\n{descriptions}",
         input_contract=filtered_model,
     )
 
@@ -527,6 +560,74 @@ def _normalize_typed_input(args: DelegateAgentInput) -> dict[str, JsonValue]:
     raise DelegationError("DELEGATION_COMPATIBILITY_UNAVAILABLE", stop_segment=False)
 
 
+def _child_interval(allocation_id: UUID) -> UsageReservation:
+    return UsageReservation(
+        operation_id=uuid5(allocation_id, "interval"),
+        kind="INTERVAL",
+        allocation_id=allocation_id,
+    )
+
+
+@asynccontextmanager
+async def _inline_child_budget(
+    context: ToolInvocationContext,
+    binding: CandidateBudget,
+    allocation_id: UUID,
+    child_budget: AgentBudget,
+    brief: DelegationBrief,
+) -> AsyncGenerator[None]:
+    try:
+        rem = await binding.store.remaining(context.scope)
+        allowance = ToolLoopUsage(
+            root_model_requests=0,
+            total_model_requests=min(
+                child_budget.max_model_attempts, rem.available.total_model_requests
+            ),
+            total_tool_calls=min(child_budget.max_tool_calls, rem.available.total_tool_calls),
+            handoffs=0,
+            input_tokens=min(child_budget.max_input_tokens, rem.available.input_tokens),
+            output_tokens=min(child_budget.max_output_tokens, rem.available.output_tokens),
+            segments=1,
+            active_seconds=float(context.limits.segment_seconds),
+        )
+        if (
+            (allowance.total_model_requests == 0 and allowance.total_tool_calls == 0)
+            or rem.available.segments < allowance.segments
+            or rem.available.active_seconds < allowance.active_seconds
+        ):
+            raise BudgetError("BUDGET_EXHAUSTED")
+        await binding.store.allocate_child(
+            context.scope,
+            ChildAllocation(allocation_id=allocation_id, allowance=allowance),
+            lease=context.lease,
+        )
+    except BudgetError:
+        raise DelegationError("DELEGATION_BUDGET_EXHAUSTED", stop_segment=True) from None
+
+    try:
+        child_interval = await binding.store.reserve(
+            context.scope,
+            _child_interval(allocation_id),
+            lease=context.lease,
+        )
+        try:
+            child_binding = CandidateBudget(
+                scope=context.scope,
+                lease=context.lease,
+                store=binding.store,
+                interval_id=child_interval.reservation.operation_id,
+                allocation_id=allocation_id,
+                delegation_brief=brief,
+                model_output_cap=allowance.output_tokens // max(1, allowance.total_model_requests),
+            )
+            with candidate_budget(child_binding):
+                yield
+        finally:
+            await binding.store.settle(context.scope, child_interval, None)
+    finally:
+        await binding.store.close_child(context.scope, allocation_id, lease=context.lease)
+
+
 class DelegationAdapter:
     """Guarded Specialist-as-tool adapter reusing registry, context validation and budgets."""
 
@@ -652,14 +753,6 @@ class DelegationAdapter:
     def _idempotency_key(self, context: ToolInvocationContext) -> str:
         return f"delegate:{context.receipt_id}"
 
-    @staticmethod
-    def _child_interval(allocation_id: UUID) -> UsageReservation:
-        return UsageReservation(
-            operation_id=uuid5(allocation_id, "interval"),
-            kind="INTERVAL",
-            allocation_id=allocation_id,
-        )
-
     async def _recover_daily_result(
         self,
         context: ToolInvocationContext,
@@ -780,61 +873,13 @@ class DelegationAdapter:
             idempotency_key=idempotency_key,
         )
 
-        try:
-            rem = await binding.store.remaining(context.scope)
-            allowance = ToolLoopUsage(
-                root_model_requests=0,
-                total_model_requests=min(
-                    child_budget.max_model_attempts, rem.available.total_model_requests
-                ),
-                total_tool_calls=min(child_budget.max_tool_calls, rem.available.total_tool_calls),
-                handoffs=0,
-                input_tokens=min(child_budget.max_input_tokens, rem.available.input_tokens),
-                output_tokens=min(child_budget.max_output_tokens, rem.available.output_tokens),
-                segments=1,
-                active_seconds=float(context.limits.segment_seconds),
-            )
-            if (
-                (allowance.total_model_requests == 0 and allowance.total_tool_calls == 0)
-                or rem.available.segments < allowance.segments
-                or rem.available.active_seconds < allowance.active_seconds
-            ):
-                raise BudgetError("BUDGET_EXHAUSTED")
-            await binding.store.allocate_child(
-                context.scope,
-                ChildAllocation(allocation_id=allocation_id, allowance=allowance),
-                lease=context.lease,
-            )
-        except BudgetError:
-            raise DelegationError("DELEGATION_BUDGET_EXHAUSTED", stop_segment=True) from None
-
-        try:
-            child_interval = await binding.store.reserve(
-                context.scope,
-                self._child_interval(allocation_id),
-                lease=context.lease,
-            )
-            try:
-                child_binding = CandidateBudget(
-                    scope=context.scope,
-                    lease=context.lease,
-                    store=binding.store,
-                    interval_id=child_interval.reservation.operation_id,
-                    allocation_id=allocation_id,
-                    delegation_brief=DelegationBrief(
-                        objective=args.objective,
-                        constraints=args.constraints,
-                        expected_result=args.expected_result,
-                    ),
-                    model_output_cap=allowance.output_tokens
-                    // max(1, allowance.total_model_requests),
-                )
-                with candidate_budget(child_binding):
-                    result = await self._runner.run_specialist(handoff)
-            finally:
-                await binding.store.settle(context.scope, child_interval, None)
-        finally:
-            await binding.store.close_child(context.scope, allocation_id, lease=context.lease)
+        brief = DelegationBrief(
+            objective=args.objective,
+            constraints=args.constraints,
+            expected_result=args.expected_result,
+        )
+        async with _inline_child_budget(context, binding, allocation_id, child_budget, brief):
+            result = await self._runner.run_specialist(handoff)
 
         if (result.agent_id, result.agent_version) != (args.agent_id, target_version):
             raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
@@ -932,13 +977,279 @@ class DelegationAdapter:
                 BudgetReceipt(
                     scope=context.scope,
                     lease=context.lease,
-                    reservation=self._child_interval(allocation_id),
+                    reservation=_child_interval(allocation_id),
                     replayed=True,
                 ),
                 None,
             )
             await binding.store.close_child(context.scope, allocation_id, lease=context.lease)
         return await self._to_backend_result(context, args, child_run_id=recorded.id, result=result)
+
+
+class GoalSpecialistRunnerPort(Protocol):
+    """Persist and recover goal-directed child results under the exact handoff identity."""
+
+    async def run(self, handoff: AgentHandoffV2) -> tuple[UUID, GoalDirectedAgentResult]: ...
+
+    async def reconcile(
+        self, handoff: AgentHandoffV2
+    ) -> tuple[UUID, GoalDirectedAgentResult] | None: ...
+
+
+class DelegationReferencesPort(Protocol):
+    """Resolve and recheck current, server-verified references within the specified run."""
+
+    async def resolve(
+        self, scope: RunScope, reference_ids: tuple[UUID, ...]
+    ) -> tuple[ContextReference, ...]: ...
+
+    async def revalidate(self, scope: RunScope, refs: tuple[ContextReference, ...]) -> None: ...
+
+
+class VerifiedDelegationReferences:
+    """Index provenance already established by the trusted turn and runtime."""
+
+    def __init__(
+        self,
+        *,
+        scope: RunScope,
+        exploration: Iterable[ContextReference],
+        active_context: Iterable[ContextReference],
+        completed_specialists: Iterable[ContextReference],
+        recheck: Callable[[RunScope, tuple[ContextReference, ...]], Awaitable[None]],
+    ) -> None:
+        self._scope = scope
+        self._recheck = recheck
+        self._refs: dict[UUID, ContextReference] = {}
+        for source in (exploration, active_context, completed_specialists):
+            for ref in source:
+                known = self._refs.setdefault(ref.reference_id, ref)
+                if ref.organization_id != scope.organization_id or ref != known:
+                    raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=True)
+
+    async def resolve(
+        self, scope: RunScope, reference_ids: tuple[UUID, ...]
+    ) -> tuple[ContextReference, ...]:
+        try:
+            refs = tuple(self._refs[ref_id] for ref_id in reference_ids)
+        except KeyError:
+            raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=False) from None
+        await self.revalidate(scope, refs)
+        return refs
+
+    async def revalidate(self, scope: RunScope, refs: tuple[ContextReference, ...]) -> None:
+        if scope != self._scope or any(
+            ref.organization_id != scope.organization_id for ref in refs
+        ):
+            raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=True)
+        if refs:
+            await self._recheck(scope, refs)
+
+
+class DelegationAdapterV2:
+    """Bind a goal to a ready Specialist under a pinned, run-scoped configuration."""
+
+    def __init__(
+        self,
+        *,
+        scope: RunScope,
+        parent_agent_run_id: UUID,
+        actor_role: Literal["ADMIN", "MANAGER", "EMPLOYEE"],
+        active_phase: int,
+        locale: Literal["vi", "en"],
+        timezone: str,
+        agent_registry: AgentRegistry,
+        specialist_pins: tuple[VersionPin, ...],
+        runners: Mapping[AgentId, GoalSpecialistRunnerPort],
+        activation: ActivationContext | None = None,
+        references: DelegationReferencesPort | None = None,
+        workflow_verifier: WorkflowWaitVerifierPort | None = None,
+    ) -> None:
+        self._scope = scope
+        self._parent_id = parent_agent_run_id
+        self._role = actor_role
+        self._phase = active_phase
+        self._locale: Literal["vi", "en"] = locale
+        self._timezone = timezone
+        self._registry = agent_registry
+        self._pins = {pin.reference: pin for pin in specialist_pins}
+        if len(self._pins) != len(specialist_pins):
+            raise DelegationError("DELEGATION_TARGET_PIN_DUPLICATE", stop_segment=True)
+        self._runners = dict(runners)
+        self._activation = activation
+        self._references = references
+        self._workflow_verifier = workflow_verifier
+
+    def _target(
+        self, agent_id: AgentId
+    ) -> tuple[GoalDirectedAgentManifest, GoalSpecialistRunnerPort]:
+        pin = self._pins.get(agent_id.value)
+        runner = self._runners.get(agent_id)
+        if agent_id is AgentId.ORCHESTRATOR or pin is None or runner is None:
+            raise DelegationError("DELEGATION_TARGET_UNAVAILABLE", stop_segment=False)
+        try:
+            target = self._registry.resolve(
+                agent_id, pin.version, self._phase, activation=self._activation
+            )
+        except AgentRegistryError:
+            raise DelegationError("DELEGATION_TARGET_UNAVAILABLE", stop_segment=False) from None
+        if target.fingerprint != pin.fingerprint or not isinstance(
+            target.manifest, GoalDirectedAgentManifest
+        ):
+            raise DelegationError("DELEGATION_TARGET_PIN_MISMATCH", stop_segment=True)
+        if self._role not in target.manifest.permissions.roles:
+            raise DelegationError("DELEGATION_ROLE_FORBIDDEN", stop_segment=False)
+        return target.manifest, runner
+
+    def available_specialists(self) -> tuple[tuple[AgentId, str], ...]:
+        available: list[tuple[AgentId, str]] = []
+        for agent_id in sorted(self._runners):
+            try:
+                manifest, _ = self._target(agent_id)
+            except DelegationError as error:
+                if error.stop_segment:
+                    raise
+                continue
+            available.append((agent_id, manifest.delegation_summary))
+        return tuple(available)
+
+    async def _prepare(
+        self, context: ToolInvocationContext, arguments: BaseModel
+    ) -> tuple[AgentHandoffV2, GoalDirectedAgentManifest, GoalSpecialistRunnerPort]:
+        if context.scope != self._scope or context.lease.scope != self._scope:
+            raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=True)
+        if (context.tool_reference, context.tool_version) != ("delegate_agent@2", "2.0.0"):
+            raise DelegationError("DELEGATION_TOOL_MISMATCH", stop_segment=True)
+        args = DelegateAgentInputV2.model_validate(arguments.model_dump())
+        if args != DelegateAgentInputV2.model_validate(context.canonical_arguments.model_dump()):
+            raise DelegationError("TOOL_ARGUMENTS_CHANGED", stop_segment=True)
+        manifest, runner = self._target(args.agent_id)
+        refs: tuple[ContextReference, ...] = ()
+        if args.context_ref_ids:
+            if self._references is None:
+                raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=False)
+            refs = await self._references.resolve(context.scope, args.context_ref_ids)
+            if tuple(ref.reference_id for ref in refs) != args.context_ref_ids or any(
+                ref.organization_id != context.scope.organization_id for ref in refs
+            ):
+                raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=False)
+        rt = manifest.runtime
+        handoff = AgentHandoffV2(
+            orchestration_run_id=context.scope.orchestration_run_id,
+            parent_agent_run_id=self._parent_id,
+            target_agent_id=args.agent_id,
+            target_agent_version=manifest.agent.version,
+            brief=DelegationBrief(
+                objective=args.objective,
+                constraints=args.constraints,
+                expected_result=args.expected_result,
+            ),
+            context_references=refs,
+            actor=ActorReference(
+                organization_id=context.scope.organization_id,
+                membership_id=context.scope.membership_id,
+            ),
+            source_turn_ref=context.scope.turn_id,
+            locale=self._locale,
+            timezone=self._timezone,
+            budget=AgentBudget(
+                max_model_attempts=rt.max_model_attempts,
+                max_input_tokens=rt.max_input_tokens,
+                max_output_tokens=rt.max_output_tokens,
+                max_iterations=rt.max_iterations,
+                max_tool_calls=rt.max_tool_calls,
+                max_replans=rt.max_replans,
+                timeout_seconds=rt.timeout_seconds,
+            ),
+            step_id=f"delegate:{context.receipt_id}",
+            idempotency_key=f"goal-delegate:{context.receipt_id}",
+        )
+        return handoff, manifest, runner
+
+    async def execute(
+        self, context: ToolInvocationContext, arguments: BaseModel
+    ) -> BackendToolResult:
+        handoff, manifest, runner = await self._prepare(context, arguments)
+        binding = current_candidate_budget()
+        if binding is None or binding.scope != context.scope or binding.lease != context.lease:
+            raise DelegationError("DELEGATION_BUDGET_UNAVAILABLE", stop_segment=True)
+        if binding.allocation_id is not None:
+            raise DelegationError("DELEGATION_PEER_FORBIDDEN", stop_segment=True)
+        allocation_id = uuid5(context.receipt_id, "child-budget")
+        async with _inline_child_budget(
+            context, binding, allocation_id, handoff.budget, handoff.brief
+        ):
+            record = await runner.run(handoff)
+        return await self._normalize(context, manifest, record)
+
+    async def reconcile(
+        self, context: ToolInvocationContext, arguments: BaseModel
+    ) -> BackendToolResult | None:
+        handoff, manifest, runner = await self._prepare(context, arguments)
+        record = await runner.reconcile(handoff)
+        if record is None:
+            return None
+        return await self._normalize(context, manifest, record)
+
+    async def revalidate_result(
+        self, context: ToolInvocationContext, result: BackendToolResult
+    ) -> None:
+        _, manifest, _ = await self._prepare(context, context.canonical_arguments)
+        if not isinstance(result.output, DelegateAgentOutputV2):
+            raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+        value = result.output
+        if (value.agent_id, value.agent_version) != (
+            manifest.agent.id,
+            manifest.agent.version,
+        ) or value.resolved_action not in manifest.capabilities:
+            raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+        refs = tuple(dict.fromkeys((*result.evidence, *value.evidence, *value.artifact_refs)))
+        if refs:
+            if self._references is None:
+                raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=True)
+            await self._references.revalidate(context.scope, refs)
+
+    async def revalidate_wait(self, context: ToolInvocationContext, wait: WaitReference) -> None:
+        current = await self.reconcile(context, context.canonical_arguments)
+        if current is None or current.wait_ref != wait:
+            raise DelegationError("DELEGATION_WAIT_STALE", stop_segment=True)
+
+    async def _normalize(
+        self,
+        context: ToolInvocationContext,
+        manifest: GoalDirectedAgentManifest,
+        record: tuple[UUID, GoalDirectedAgentResult],
+    ) -> BackendToolResult:
+        child_id, result = record
+        action = result.resolved_action
+        if (result.agent_id, result.agent_version) != (manifest.agent.id, manifest.agent.version):
+            raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+        if action is not None and action not in manifest.capabilities:
+            raise DelegationError("DELEGATION_CAPABILITY_MISMATCH", stop_segment=True)
+        workflow_id = _uuid_field(result.typed_output, "workflow_run_id")
+        workflow = (
+            await self._workflow_verifier.verify_workflow(context.scope, workflow_id)
+            if self._workflow_verifier is not None and workflow_id is not None
+            else None
+        )
+        output, wait, failure = _normalize_to_parts(
+            context.scope,
+            result,
+            invocation_id=context.invocation_id,
+            capability=action or "unresolved",
+            child_run_id=child_id,
+            workflow_state=workflow,
+        )
+        if failure is not None:
+            raise DelegationError(failure, stop_segment=False)
+        if wait is not None:
+            return BackendToolResult(wait_ref=wait, evidence=result.evidence)
+        if output is None or action is None:
+            raise DelegationError("DELEGATION_UNVERIFIED_RESULT", stop_segment=True)
+        value = DelegateAgentOutputV2.model_validate(
+            {**output.model_dump(exclude={"capability"}), "resolved_action": action}
+        )
+        return BackendToolResult(output=value, evidence=value.evidence)
 
 
 class DelegationToolBackend:

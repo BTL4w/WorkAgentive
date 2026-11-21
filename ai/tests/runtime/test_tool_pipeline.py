@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
@@ -12,7 +13,11 @@ from pydantic import BaseModel, ConfigDict
 
 from work_management_ai.model_gateway.tool_contracts import ToolCall, ToolSchema
 from work_management_ai.runtime.contracts import ContextReference, JsonValue
-from work_management_ai.runtime.run_budget import CandidateBudget, candidate_budget
+from work_management_ai.runtime.run_budget import (
+    CandidateBudget,
+    UsageReservation,
+    candidate_budget,
+)
 from work_management_ai.runtime.session_log import (
     EventDraft,
     InvocationReceipt,
@@ -444,6 +449,40 @@ async def test_missing_budget_closed_catalog_and_exhaustion(
         denied = await f.pipeline.execute(ctx.scope, f.call, admitted=f.catalog, lease=ctx.lease)
         assert denied.kind == "REJECTED" and denied.stop_segment
     assert f.backend.effects == 0
+
+
+@pytest.mark.asyncio
+async def test_delegate_v2_counts_handoffs_and_blocks_seventh_dispatch(
+    binding: tuple[CandidateBudget, Budget],
+):
+    ctx, _ = binding
+
+    class HandoffBudget(Budget):
+        async def reserve(self, scope: RunScope, reservation: UsageReservation, *, lease: RunLease):
+            if reservation.kind == "HANDOFF" and len(self.reservations) >= 6:
+                raise ValueError("BUDGET_EXHAUSTED")
+            return await super().reserve(scope, reservation, lease=lease)
+
+    budget = HandoffBudget(ctx.scope, ctx.lease)
+    ctx = replace(ctx, store=budget)
+    f = Fixture()
+    f.catalog.tool = replace(
+        f.catalog.tool,
+        schema=ToolSchema(
+            reference="delegate_agent@2", description="Delegate", input_contract=Input
+        ),
+        version="2.0.0",
+    )
+    pipeline = ToolPipeline(store=f.log, policy=f.policy, backends={"delegate_agent@2": f.backend})
+    with candidate_budget(ctx):
+        for number in range(7):
+            call = ToolCall(
+                call_id=f"handoff-{number}", name="delegate_agent", arguments={"query": "status"}
+            )
+            result = await pipeline.execute(ctx.scope, call, admitted=f.catalog, lease=ctx.lease)
+            assert result.kind == ("COMPLETED" if number < 6 else "REJECTED")
+    assert [item.kind for item in budget.reservations] == ["HANDOFF"] * 6
+    assert f.backend.effects == 6
 
 
 @pytest.mark.asyncio

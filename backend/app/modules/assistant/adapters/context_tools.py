@@ -28,6 +28,7 @@ from work_management_ai.tools.context.contracts import (
     ContextRef,
     EntityResolution,
     ExploreProjectsInput,
+    ExploreProjectsInputV103,
     ReadActorInput,
     ReadCoverage,
     ReadProjectInput,
@@ -123,7 +124,11 @@ class ContextToolBackend:
         )
 
     def _project(
-        self, context: ToolInvocationContext, snap: ProjectReadSnapshot
+        self,
+        context: ToolInvocationContext,
+        snap: ProjectReadSnapshot,
+        *,
+        include_overview_if_unique: bool = False,
     ) -> ContextReadObservation:
         refs = tuple(
             self._ref(
@@ -144,19 +149,33 @@ class ContextToolBackend:
                 ContextFact(ref_id=r.ref_id, field="project.version", value=p.version),
             )
         )
+        discovery_overview = (
+            include_overview_if_unique
+            and snap.resolution == "UNIQUE"
+            and snap.outcome == "OK"
+            and snap.cursor is None
+            and not snap.gaps
+            and len(refs) == 1
+        )
         content: tuple[SourceContent, ...] = ()
+        overview_truncated = False
         if (
-            context.tool_reference == "read_project_context@1"
-            and snap.projects
-            and snap.projects[0].description
-        ):
-            text, truncated = _bounded_text(snap.projects[0].description)
-            content = (SourceContent(ref_id=refs[0].ref_id, text=text, truncated=truncated),)
-        truncated = bool(snap.cursor) or any(s.truncated for s in content)
+            discovery_overview or context.tool_reference == "read_project_context@1"
+        ) and snap.projects:
+            description = snap.projects[0].description
+            if description:
+                text, overview_truncated = _bounded_text(description)
+                if not (discovery_overview and overview_truncated):
+                    content = (
+                        SourceContent(
+                            ref_id=refs[0].ref_id, text=text, truncated=overview_truncated
+                        ),
+                    )
+        truncated = bool(snap.cursor) or overview_truncated
         gaps = tuple(ContextGap(code="NOT_SUPPORTED", section=g) for g in snap.gaps)
         if snap.cursor:
             gaps = (*gaps, ContextGap(code="PAGINATION"))
-        if any(s.truncated for s in content):
+        if overview_truncated:
             gaps = (*gaps, ContextGap(code="TRUNCATED", section="overview"))
         entities = (
             EntityResolution.model_validate(
@@ -186,8 +205,12 @@ class ContextToolBackend:
                 "gaps": gaps,
                 "coverage": (
                     ReadCoverage(
-                        requested=snap.requested,
-                        returned=snap.returned,
+                        requested=(*snap.requested, "overview")
+                        if discovery_overview
+                        else snap.requested,
+                        returned=(*snap.returned, "overview")
+                        if discovery_overview and not overview_truncated
+                        else snap.returned,
                         status="PARTIAL"
                         if truncated or snap.gaps or not snap.returned
                         else "COMPLETE",
@@ -213,7 +236,12 @@ class ContextToolBackend:
                     cursor=arguments.cursor,
                     page_size=arguments.page_size,
                 )
-                observation = self._project(context, snap)
+                observation = self._project(
+                    context,
+                    snap,
+                    include_overview_if_unique=isinstance(arguments, ExploreProjectsInputV103)
+                    and arguments.include_overview_if_unique,
+                )
             elif context.tool_reference == "read_project_context@1" and isinstance(
                 arguments, ReadProjectInput
             ):

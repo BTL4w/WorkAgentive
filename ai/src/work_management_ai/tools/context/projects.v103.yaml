@@ -1,0 +1,20 @@
+schema_version: "2.0"
+name: explore_projects
+version: "1.0.3"
+owner: ai-runtime
+tenant_scope: actor_membership
+roles: [ADMIN, MANAGER, EMPLOYEE]
+risk_level: READ_ONLY
+input_contract: work_management_ai.tools.context.contracts.ExploreProjectsInputV103
+output_contract: work_management_ai.tools.context.contracts.ContextReadObservation
+timeout_seconds: 5
+max_attempts: 1
+retry_policy: NONE
+idempotency: NOT_APPLICABLE
+audit: SAFE_METADATA
+trace_metadata: [tool_id, duration_ms, result_status]
+description: >-
+  Find Projects visible to the current actor by name or search phrase when the Project has not
+  been uniquely identified. Returns candidates and a resolution status. One candidate on a
+  partial page is still unresolved. Request an overview with discovery when one Project
+  matches on a complete page. For an identified Project, use read_project_context directly.

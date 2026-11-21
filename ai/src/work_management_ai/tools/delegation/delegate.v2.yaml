@@ -1,0 +1,22 @@
+schema_version: "2.0"
+name: delegate_agent
+version: "2.0.0"
+owner: ai-runtime
+description: >-
+  Assign one bounded user objective to an eligible Specialist. Provide verified context
+  references, applicable constraints, and the expected result. The Specialist chooses
+  its permitted method. Returns a verified result or a wait for input, workflow completion,
+  or human review.
+tenant_scope: actor_membership
+roles: [ADMIN, MANAGER, EMPLOYEE]
+risk_level: PROPOSAL_ONLY
+input_contract: work_management_ai.tools.delegation.contracts.DelegateAgentInputV2
+output_contract: work_management_ai.tools.delegation.contracts.DelegateAgentOutputV2
+timeout_seconds: 120
+max_attempts: 1
+retry_policy: NONE
+idempotency: REQUIRED
+audit: REQUIRED
+evidence_output: true
+freshness_output: true
+trace_metadata: [tool_id, duration_ms, result_status, evidence_count]

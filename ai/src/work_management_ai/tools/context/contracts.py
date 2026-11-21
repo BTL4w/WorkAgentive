@@ -44,6 +44,14 @@ class ExploreProjectsInput(Contract):
     )
 
 
+class ExploreProjectsInputV103(ExploreProjectsInput):
+    include_overview_if_unique: bool = Field(
+        default=False,
+        strict=True,
+        description="Return an overview when discovery identifies one Project on a complete page.",
+    )
+
+
 class ReadProjectInput(Contract):
     reference: UUID = Field(
         description=(
