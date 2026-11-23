@@ -10,7 +10,6 @@ from uuid import NAMESPACE_URL, uuid5
 
 from work_management_ai.agents.orchestrator.contracts import (
     ActorContextResolverPort,
-    MessageSpan,
     PublicQueryValidatorPort,
     PublicSearchIntent,
 )
@@ -39,6 +38,7 @@ from work_management_ai.agents.retrieve.evidence import (
     synthesis_sources,
 )
 from work_management_ai.agents.retrieve.prompts.system_v1 import SYNTHESIS_INVOCATION_KEY, SYSTEM_V1
+from work_management_ai.agents.retrieve.public_intent import select_public_topic
 from work_management_ai.agents.retrieve.workflows.graph import RetrieveGraph, RetrieveState
 from work_management_ai.model_gateway.contracts import (
     ModelGateway,
@@ -124,13 +124,13 @@ class RetrieveHarness:
         if self.source_turns is None or self.public_query_validator is None:
             raise _PublicIntentRequired
         original = await self.source_turns.read(handoff)
-        query = handoff.brief.objective.strip()
-        start = original.find(query)
-        if not 1 <= len(query) <= 500 or start < 0:
+        span = select_public_topic(original, handoff.brief.objective)
+        if span is None:
             raise _PublicIntentRequired
+        query = span.text
         intent = PublicSearchIntent(
             search_queries=(query,),
-            message_spans=(MessageSpan(start=start, end=start + len(query), text=query),),
+            message_spans=(span,),
             requirements=(RetrieveRequirement(requirement_id="topic", description=query),),
         )
         try:
@@ -154,7 +154,9 @@ class RetrieveHarness:
                 {
                     **result.model_dump(),
                     "agent_version": self.goal_manifest.agent.version,
-                    "resolved_action": "retrieval.summarize_web",
+                    "resolved_action": "retrieval.summarize_web"
+                    if result.tool_calls_used
+                    else None,
                 }
             )
         return result

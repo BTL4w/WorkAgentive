@@ -48,16 +48,59 @@ from work_management_ai.runtime.contracts import (
 
 
 @pytest.mark.parametrize(
-    ("enabled", "objective", "expect_search"),
+    ("enabled", "objective", "original", "query"),
     [
-        (True, "public planning", True),
-        (False, "public planning", False),
-        (True, "private project code", False),
+        (True, "public planning", "Search the public web for public planning", "public planning"),
+        (
+            True,
+            "public planning",
+            "Search the public web for public planning at https://example.org/guide",
+            "public planning",
+        ),
+        (False, "public planning", "Search the public web for public planning", None),
+        (
+            True,
+            "Find public guidance on planning",
+            "Search the public web for public planning",
+            "public planning",
+        ),
+        (
+            True,
+            "Tra cứu chuẩn ISO 27001 mới nhất từ nguồn web công khai",
+            "Tìm giúp tôi chuẩn ISO 27001 mới nhất trên web công khai",
+            "chuẩn ISO 27001 mới nhất",
+        ),
+        (True, "Find public guidance", "My project code is ABC123", None),
+        (True, "Launch date Q2", "Do not search the web for Launch date Q2", None),
+        (
+            True,
+            "My project code is ABC123",
+            "Search the public web for planning. My project code is ABC123.",
+            None,
+        ),
+        (
+            True,
+            "Find guidance on release calendars",
+            "Search the public web for release calendars, but keep case number 483719 to yourself",
+            None,
+        ),
+        (
+            True,
+            "483719",
+            "Search the public web for release calendars, but keep case number 483719 to yourself",
+            None,
+        ),
+        (
+            True,
+            "483719",
+            "Tìm lịch phát hành nhưng giữ kín mã hồ sơ 483719 trên web công khai",
+            None,
+        ),
     ],
 )
 @pytest.mark.asyncio
 async def test_goal_retrieve_egress_requires_original_turn_text(
-    enabled: bool, objective: str, expect_search: bool
+    enabled: bool, objective: str, original: str, query: str | None
 ) -> None:
     legacy = handoff()
     goal = AgentHandoffV2.model_validate(
@@ -72,19 +115,20 @@ async def test_goal_retrieve_egress_requires_original_turn_text(
             "brief": DelegationBrief(objective=objective, expected_result="Public sources"),
         }
     )
-    original = "Search the public web for public planning"
 
     class Source:
         async def read(self, handoff: AgentHandoffV2) -> str:
             assert handoff.source_turn_ref == goal.source_turn_ref
             return original
 
+    validated_queries: list[JsonValue] = []
+
     class Validator:
         async def validate_public_intent(
             self, intent: dict[str, JsonValue], message: str, reference: ActorReference
         ) -> None:
             assert (message, reference) == (original, goal.actor)
-            assert intent["search_queries"] == ["public planning"]
+            validated_queries.append(intent["search_queries"])
 
     sources = (source(),)
     tools = Tools(legacy, sources)
@@ -103,12 +147,15 @@ async def test_goal_retrieve_egress_requires_original_turn_text(
         public_query_validator=Validator(),
     ).run(goal)
     assert isinstance(result, GoalDirectedAgentResult)
-    assert any(call.tool_id == "web.search" for call in tools.calls) is expect_search
-    if expect_search:
+    assert validated_queries == ([] if query is None else [[query]])
+    searches = [call.typed_input["query"] for call in tools.calls if call.tool_id == "web.search"]
+    if query is not None:
+        assert searches == [query]
         assert result.resolved_action == "retrieval.summarize_web"
         assert result.status is AgentRunStatus.COMPLETED
     else:
         assert not tools.calls
+        assert result.resolved_action is None
 
 
 @pytest.mark.parametrize("locale", ["vi", "en"])

@@ -24,6 +24,7 @@ from work_management_ai.runtime.contracts import (
     ActivityResponseBlock,
     ActorReference,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     ToolExecutionRequest,
@@ -159,7 +160,7 @@ class RetrievalRuntime:
             lease=RetrievalLease(job.id, job.locked_by or "", job.attempt_count),
         )
 
-    async def usage(self, handoff: AgentHandoff) -> RetrievalUsageAdapter:
+    async def usage(self, handoff: AgentHandoff | AgentHandoffV2) -> RetrievalUsageAdapter:
         job = self._job()
         actor = await self.actors.resolve(
             organization_id=handoff.actor.organization_id, membership_id=handoff.actor.membership_id
@@ -180,7 +181,7 @@ class RetrievalRuntime:
             progress=progress,
             budgets=self.budgets,
             actor=actor,
-            run_id=uuid5(NAMESPACE_URL, f"agent-run:{handoff.idempotency_key}"),
+            run_id=run_id,
             lease=RetrievalLease(job.id, job.locked_by or "", job.attempt_count),
         )
 

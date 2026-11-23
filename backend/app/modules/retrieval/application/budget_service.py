@@ -16,6 +16,9 @@ from app.modules.retrieval.application.ports import (
     RetrievalRepository,
     RetrievalTransactions,
 )
+from app.modules.retrieval.application.query_policy import (
+    validate_public_query as validate_intent,
+)
 from app.modules.retrieval.domain.models import (
     PublicPageRequest,
     PublicSearchRequest,
@@ -36,10 +39,25 @@ from app.modules.retrieval.domain.state import (
     charge_for,
     request_hash,
 )
+from work_management_ai.agents.retrieve.public_intent import select_public_topic
 
 
 def _normalized(value: str) -> str:
     return " ".join(value.casefold().split())
+
+
+def _validate_query_spans(
+    scope: RetrievalRunScope, queries: list[str], filters: dict[str, Any]
+) -> None:
+    spans: list[dict[str, str | int]] = []
+    for query in queries:
+        start = scope.user_text.find(query)
+        spans.append(dict(start=start, end=start + len(query), text=query))
+    validate_intent(
+        dict(search_queries=queries, message_spans=spans, filters=filters),
+        scope.user_text,
+        scope.protected_terms,
+    )
 
 
 def _public_scope(scope: RetrievalRunScope) -> dict[str, Any]:
@@ -50,11 +68,17 @@ def _public_scope(scope: RetrievalRunScope) -> dict[str, Any]:
         r"\b(confidential|internal|secret)\b|nội bộ|bí mật", text
     ):
         raise RetrievalPolicyError("PUBLIC_QUERY_PROVENANCE_REQUIRED")
-    raw_values: object = scope.typed_input.get("search_queries") or [scope.typed_input.get("query")]
+    goal = scope.agent_version == "1.1.0"
+    if goal and select_public_topic(scope.user_text) is None:
+        raise RetrievalPolicyError("PUBLIC_QUERY_PROVENANCE_REQUIRED")
+    # Goal runs retain only the source-turn reference. Check each query at reservation and dispatch.
+    raw_values: object = (
+        [] if goal else scope.typed_input.get("search_queries") or [scope.typed_input.get("query")]
+    )
     if not isinstance(raw_values, list):
         raise RetrievalPolicyError("PUBLIC_QUERY_PROVENANCE_REQUIRED")
     values = cast(list[object], raw_values)
-    if not 1 <= len(values) <= 2:
+    if not goal and not 1 <= len(values) <= 2:
         raise RetrievalPolicyError("PUBLIC_QUERY_PROVENANCE_REQUIRED")
     queries: list[str] = []
     for query in values:
@@ -67,27 +91,12 @@ def _public_scope(scope: RetrievalRunScope) -> dict[str, Any]:
         if _normalized(query) not in text:
             raise RetrievalPolicyError("PUBLIC_QUERY_PROVENANCE_REQUIRED")
         queries.append(query)
-    from app.modules.retrieval.application.query_policy import (
-        validate_public_query as validate_intent,
-    )
-
-    spans: list[dict[str, Any]] = []
-    for query in queries:
-        start = scope.user_text.find(query)
-        spans.append(dict(start=start, end=start + len(query), text=query))
-    validate_intent(
-        dict(
-            search_queries=queries,
-            message_spans=spans,
-            filters=scope.typed_input.get("filters", {}),
-        ),
-        scope.user_text,
-        scope.protected_terms,
-    )
     raw_filters: object = scope.typed_input.get("filters", {})
     if not isinstance(raw_filters, dict):
         raise RetrievalPolicyError("PUBLIC_QUERY_PROVENANCE_REQUIRED")
     filters = cast(dict[str, object], raw_filters)
+    if queries:
+        _validate_query_spans(scope, queries, filters)
     for key in ("include_domains", "exclude_domains"):
         domains = filters.get(key, [])
         if not isinstance(domains, list):
@@ -270,9 +279,18 @@ class RetrievalBudgetService:
         lease: RetrievalLease,
         *,
         allow_terminal: bool = False,
+        expected_agent_version: str | None = None,
+        require_budget: bool = True,
     ) -> None:
         async with self._transaction(actor, run_id) as repo:
-            await self._state(repo, run_id, lease, allow_terminal=allow_terminal)
+            if require_budget:
+                scope, _ = await self._state(repo, run_id, lease, allow_terminal=allow_terminal)
+            else:
+                scope = await repo.bind(
+                    run_id, lease, allow_terminal=allow_terminal, allow_no_evidence_outcome=True
+                )
+            if expected_agent_version is not None and scope.agent_version != expected_agent_version:
+                raise RetrievalPolicyError("RETRIEVAL_RESULT_INVALID")
 
     async def _state(
         self,
@@ -286,6 +304,11 @@ class RetrievalBudgetService:
         state = await repo.get_budget(run_id)
         if state is None or state.lease != lease:
             raise RetrievalPolicyError("RETRIEVAL_JOB_CLAIM_LOST")
+        if (
+            scope.agent_version == "1.1.0"
+            and state.scope["message_hash"] != hashlib.sha256(scope.user_text.encode()).hexdigest()
+        ):
+            raise RetrievalPolicyError("PUBLIC_QUERY_PROVENANCE_REQUIRED")
         if scope.now >= min(state.deadline, scope.started_at + timedelta(seconds=25)):
             raise RetrievalPolicyError("RETRIEVAL_DEADLINE_EXCEEDED")
         return scope, state
@@ -293,14 +316,29 @@ class RetrievalBudgetService:
     async def _request_allowed(
         self,
         repo: RetrievalRepository,
+        scope: RetrievalRunScope,
         state: RetrievalBudgetState,
         request: PublicSearchRequest | PublicPageRequest | None,
         kind: str,
     ) -> None:
         if kind == "SEARCH":
-            if (
-                not isinstance(request, PublicSearchRequest)
-                or request_hash(
+            if not isinstance(request, PublicSearchRequest):
+                raise RetrievalPolicyError("PUBLIC_QUERY_PROVENANCE_REQUIRED")
+            if scope.agent_version == "1.1.0":
+                span = select_public_topic(scope.user_text, request.query)
+                if (
+                    span is None
+                    or span.text != request.query
+                    or request.validated_filters != ValidatedSourceFilters()
+                ):
+                    raise RetrievalPolicyError("PUBLIC_QUERY_PROVENANCE_REQUIRED")
+                validate_intent(
+                    {"search_queries": [span.text], "message_spans": [span.model_dump()]},
+                    scope.user_text,
+                    scope.protected_terms,
+                )
+            elif (
+                request_hash(
                     PublicSearchRequest(_normalized(request.query), request.validated_filters, 1)
                 )
                 not in state.scope["search_scope_hashes"]
@@ -329,7 +367,7 @@ class RetrievalBudgetService:
     ) -> RetrievalReservation:
         async with self._transaction(actor, agent_run_id) as repo:
             scope, state = await self._state(repo, agent_run_id, lease)
-            await self._request_allowed(repo, state, request, kind)
+            await self._request_allowed(repo, scope, state, request, kind)
             if (
                 type(attempt_no) is not int
                 or not 1 <= attempt_no <= 2
@@ -409,7 +447,7 @@ class RetrievalBudgetService:
         actor: AuthenticatedActor,
         receipt: RetrievalReservation,
         lease: RetrievalLease,
-    ) -> tuple[RetrievalBudgetState, RetrievalAttempt]:
+    ) -> tuple[RetrievalRunScope, RetrievalBudgetState, RetrievalAttempt]:
         scope, state = await self._state(repo, receipt.agent_run_id, lease)
         if receipt.deadline <= scope.now:
             raise RetrievalPolicyError("RETRIEVAL_DEADLINE_EXCEEDED")
@@ -425,7 +463,7 @@ class RetrievalBudgetService:
             or stored.status != "RESERVED"
         ):
             raise RetrievalPolicyError("RETRIEVAL_RECEIPT_INVALID")
-        return state, stored
+        return scope, state, stored
 
     async def authorize(
         self,
@@ -439,8 +477,8 @@ class RetrievalBudgetService:
             state = await repo.get_budget(reservation.agent_run_id, lock=False)
             if state is None:
                 raise RetrievalPolicyError("RETRIEVAL_RECEIPT_INVALID")
-            state, stored = await self._receipt(repo, actor, reservation, state.lease)
-            await self._request_allowed(repo, state, request, reservation.kind)
+            scope, state, stored = await self._receipt(repo, actor, reservation, state.lease)
+            await self._request_allowed(repo, scope, state, request, reservation.kind)
             if stored.request_hash != request_hash(request):
                 raise RetrievalPolicyError("RETRIEVAL_RECEIPT_INVALID")
             await repo.dispatch(reservation)
@@ -456,7 +494,7 @@ class RetrievalBudgetService:
         invocation_id: UUID | None = None,
     ) -> tuple[RetrievalSnapshot, ...]:
         async with self._transaction(actor, receipt.agent_run_id) as repo:
-            state, stored = await self._receipt(repo, actor, receipt, lease)
+            _, state, stored = await self._receipt(repo, actor, receipt, lease)
             safe = _metadata(metadata)
             overrun = any(
                 safe.get(key) is not None and safe[key] > stored.charged[key]
@@ -576,10 +614,6 @@ class RetrievalBudgetService:
     async def validate_public_intent(
         self, actor: AuthenticatedActor, intent: dict[str, Any], message: str
     ) -> None:
-        from app.modules.retrieval.application.query_policy import (
-            validate_public_query as validate_intent,
-        )
-
         async with self._transaction(actor, None) as repo:
             terms = await repo.protected_terms()
             validate_intent(intent, message, terms)

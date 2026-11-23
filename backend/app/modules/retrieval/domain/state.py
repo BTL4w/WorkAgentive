@@ -100,6 +100,7 @@ class RetrievalRunScope:
     now: datetime
     lease_until: datetime | None
     protected_terms: tuple[str, ...] = ()
+    agent_version: str = "1.0.0"
 
 
 @dataclass(frozen=True, slots=True)

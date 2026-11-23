@@ -42,6 +42,8 @@ from app.modules.work.planning.adapters.manual_repository import (
     SqlAlchemyManualPlanningTransactionFactory,
 )
 from app.modules.work.planning.application.manual_service import ManualPlanningService
+from tests.retrieval_fixtures import RetrievalHarness
+from tests.retrieval_fixtures import retrieval_harness as retrieval_harness
 from tests.test_orchestrator_session_log_integration import Journal
 from tests.test_orchestrator_session_log_integration import journal as journal
 from tests.test_orchestrator_tool_pipeline_integration import Policy
@@ -459,6 +461,206 @@ async def test_pipeline_replays_work_harness_after_child_result_commit(
     assert usage.total_model_requests == 2
     assert (await budget.remaining(scope)).available.total_model_requests == 22
     await budget.settle(scope, interval, None)
+
+
+@pytest.mark.parametrize("case", ["success", "protected", "publication_rejected"])
+async def test_goal_retrieve_runs_and_replays_with_postgresql(
+    retrieval_harness: RetrievalHarness, case: str
+) -> None:
+    from app.core.config import Settings
+    from app.core.database import create_session_factory
+    from app.modules.assistant.adapters.agent_runtime import build_agent_registry
+    from app.modules.assistant.adapters.retrieval_runtime import (
+        RetrievalRuntime,
+        retrieval_job_scope,
+    )
+    from app.modules.identity.adapters.current_actor import CurrentActorResolver
+    from app.modules.planning_runs.adapters.ai_runtime import build_model_gateway
+    from app.modules.retrieval.adapters.mock import MockRetrievalAdapter
+    from app.modules.retrieval.application.service import RetrievalService
+    from app.modules.retrieval.domain.models import (
+        PublicSearchRequest,
+        RetrievalPolicyError,
+        SearchBatch,
+    )
+    from work_management_ai.agents.retrieve.harness import RetrieveHarness
+    from work_management_ai.runtime.activation import ActivationContext
+    from work_management_ai.runtime.contracts import GoalDirectedAgentResult
+
+    h = retrieval_harness
+    activation = ActivationContext(5, True, frozenset({"I3"}), True)
+    registry, tools = build_agent_registry(activation=activation)
+    registry.register_resource("work_management_ai.agents.retrieve", "agent.v2.yaml")
+    sessions = create_session_factory(h.engine)
+    transactions = PostgreSQLAssistantTransactionFactory(sessions)
+    actors = CurrentActorResolver(CurrentActorService(SqlAlchemyAuthTransactionFactory(sessions)))
+    searches: list[str] = []
+
+    class Provider(MockRetrievalAdapter):
+        async def search(
+            self, request: PublicSearchRequest, *, timeout_seconds: float
+        ) -> SearchBatch:
+            searches.append(request.query)
+            return await super().search(request, timeout_seconds=timeout_seconds)
+
+    class DNS:
+        async def resolve(self, hostname: str) -> tuple[str, ...]:
+            return ("93.184.216.34",)
+
+    budgets, provider = h.service(), Provider()
+    runtime = RetrievalRuntime(
+        budgets=budgets,
+        service=RetrievalService(search=provider, pages=provider, access=budgets, dns=DNS()),
+        actors=actors,
+        tools=tools,
+        transactions=transactions,
+    )
+    recorder = PostgreSQLExecutionRecorder(
+        transaction_factory=transactions,
+        registry=registry,
+        job=h.job,
+        actor=h.actor,
+        activation=activation,
+        retrieval_replay_validator=runtime,
+    )
+    scope = RunScope(
+        organization_id=h.actor.organization_id,
+        membership_id=h.actor.membership_id,
+        conversation_id=h.job.conversation_id,
+        turn_id=h.job.turn_id,
+        orchestration_run_id=h.orchestration_id,
+    )
+    if case == "protected":
+        await h.sql(
+            "INSERT INTO projects(id,organization_id,name,created_by_membership_id,"
+            "updated_by_membership_id) VALUES(:id,:org,'public planning',:member,:member)",
+            {"id": uuid4(), "org": scope.organization_id, "member": scope.membership_id},
+        )
+    if case == "success":
+        await h.sql(
+            "UPDATE assistant_messages SET content_blocks="
+            '\'[{"kind":"text","text":"Search the public web for public planning"}]\'::jsonb'
+            " WHERE id=:id",
+            {"id": h.message_id},
+        )
+    handoff = AgentHandoffV2(
+        orchestration_run_id=scope.orchestration_run_id,
+        parent_agent_run_id=await recorder.ensure_orchestrator_run(),
+        target_agent_id=AgentId.RETRIEVE,
+        target_agent_version="1.1.0",
+        context_references=(),
+        actor=ActorReference(
+            organization_id=scope.organization_id, membership_id=scope.membership_id
+        ),
+        brief=DelegationBrief(
+            objective="Find guidance about planning" if case == "success" else "public planning",
+            expected_result="Public sources",
+        ),
+        source_turn_ref=scope.turn_id,
+        locale="en",
+        timezone="UTC",
+        budget=AgentBudget(
+            max_model_attempts=2,
+            max_input_tokens=12000,
+            max_output_tokens=3200,
+            max_iterations=12,
+            max_tool_calls=8,
+            timeout_seconds=25,
+        ),
+        step_id="retrieve-goal",
+        idempotency_key=f"{scope.turn_id}:retrieve-goal",
+    )
+    pin = next(
+        pin for pin in registry.specialist_pins(goal_directed=True) if pin.reference == "retrieve"
+    )
+    rejected_sources: list[UUID] = []
+    with retrieval_job_scope(h.job):
+        specialist = RetrieveHarness(
+            model_gateway=build_model_gateway(Settings(environment="test", ai_provider="mock")),
+            tool_executor=runtime,
+            usage_port=await runtime.usage(handoff),
+            actor_resolver=CurrentAgentActorResolver(actors),
+            activation=activation,
+            source_turns=PostgreSQLGoalSourceTurnReader(
+                session_factory=sessions, actor=h.actor, scope=scope
+            ),
+            public_query_validator=runtime,
+        )
+
+        class Harness:
+            async def run(self, handoff: AgentHandoffV2) -> AgentResult:
+                if case == "success":
+                    run_id = uuid5(NAMESPACE_URL, f"agent-run:{handoff.idempotency_key}")
+                    await budgets.start_run(h.actor, run_id, h.lease())
+                    for query in ("Public planning", "the public web"):
+                        with pytest.raises(
+                            RetrievalPolicyError, match="PUBLIC_QUERY_PROVENANCE_REQUIRED"
+                        ):
+                            await budgets.reserve_attempt(
+                                h.actor,
+                                run_id,
+                                "forged-search",
+                                1,
+                                "SEARCH",
+                                lease=h.lease(),
+                                request=PublicSearchRequest(query),
+                            )
+                result = await specialist.run(handoff)
+                if case == "publication_rejected":
+                    assert result.status is AgentRunStatus.COMPLETED and result.evidence
+                    rejected_sources.extend(ref.resource_id for ref in result.evidence)
+                    h.enabled = False
+                return result
+
+        runner = PostgreSQLGoalSpecialistRunner(recorder=recorder, harness=Harness(), pin=pin)
+        run_id, result = await runner.run(handoff)
+        expected = {
+            "success": AgentRunStatus.COMPLETED,
+            "protected": AgentRunStatus.AWAITING_INPUT,
+            "publication_rejected": AgentRunStatus.FAILED,
+        }[case]
+        assert result.status is expected, result
+        assert isinstance(result, GoalDirectedAgentResult) and result.agent_version == "1.1.0"
+        assert bool(result.evidence) == (case == "success")
+        if case == "success":
+            assert result.typed_output["outcome"] == "ANSWER_READY"
+        if case == "protected":
+            assert result.resolved_action is None
+            assert result.typed_output["outcome"] == "NEEDS_INPUT"
+        if case == "publication_rejected":
+            assert result.safe_error_code == "RETRIEVAL_CAPABILITY_INACTIVE"
+        h.enabled = True
+        assert await runner.reconcile(handoff) == (run_id, result)
+        assert await runner.run(handoff) == (run_id, result)
+        if case == "publication_rejected":
+            with pytest.raises(RetrievalPolicyError, match="RETRIEVAL_RUN_STOPPED"):
+                await budgets.projection_sources(h.actor, run_id, tuple(rejected_sources))
+        if case == "success":
+            foreign = await runtime.revalidate_agent_result(
+                run_id,
+                ActorReference(
+                    organization_id=h.foreign.organization_id, membership_id=h.foreign.membership_id
+                ),
+                result,
+            )
+            assert isinstance(foreign, GoalDirectedAgentResult)
+            assert foreign.status is AgentRunStatus.FAILED and not foreign.evidence
+            h.enabled = False
+            replay = await runner.reconcile(handoff)
+            assert replay is not None
+            assert replay[1].status is AgentRunStatus.FAILED and not replay[1].evidence
+    assert searches == ([] if case == "protected" else ["public planning"])
+    row = (
+        await h.sql("SELECT status, typed_input FROM agent_runs WHERE id=:id", {"id": run_id})
+    ).one()
+    assert row.status == expected.value
+    assert row.typed_input == {"source_turn_ref": str(scope.turn_id)}
+    if case == "protected":
+        assert (
+            await h.sql(
+                "SELECT 1 FROM retrieval_run_budgets WHERE agent_run_id=:id", {"id": run_id}
+            )
+        ).scalar_one_or_none() is None
 
 
 async def test_goal_source_turn_reads_original_under_exact_actor_and_run(journal: Journal):

@@ -90,7 +90,12 @@ class PostgreSQLRetrievalRepository:
         self.session, self.actor = session, actor
 
     async def bind(
-        self, run_id: UUID, lease: RetrievalLease | None, *, allow_terminal: bool = False
+        self,
+        run_id: UUID,
+        lease: RetrievalLease | None,
+        *,
+        allow_terminal: bool = False,
+        allow_no_evidence_outcome: bool = False,
     ) -> RetrievalRunScope:
         active = await self.session.scalar(
             text("SELECT public.lock_active_membership(:org,:member)"),
@@ -185,10 +190,13 @@ class PostgreSQLRetrievalRepository:
             else None
         )
         if (
-            conversation is None
+            turn is None
+            or turn.actor_membership_id != self.actor.membership_id
+            or conversation is None
             or conversation.owner_membership_id != self.actor.membership_id
             or conversation.status != "ACTIVE"
             or message is None
+            or message.conversation_id != conversation.id
             or message.role != "USER"
             or message.created_by_membership_id != self.actor.membership_id
         ):
@@ -202,11 +210,12 @@ class PostgreSQLRetrievalRepository:
             )
         except ValueError:
             raise RetrievalPolicyError("RETRIEVAL_CONTEXT_EXPIRED") from None
-        if (
-            agent.agent_id != "retrieve"
-            or agent.agent_version != "1.0.0"
-            or agent.capability not in {"retrieval.search_web", "retrieval.summarize_web"}
-        ):
+        goal = (agent.agent_version, agent.capability) == ("1.1.0", "orchestration.goal")
+        legacy = agent.agent_version == "1.0.0" and agent.capability in {
+            "retrieval.search_web",
+            "retrieval.summarize_web",
+        }
+        if agent.agent_id != "retrieve" or not (goal or legacy):
             raise RetrievalPolicyError("RETRIEVAL_AGENT_BOUNDARY_INVALID")
         parent_agent = await self.session.scalar(
             select(AgentRunModel).where(
@@ -226,19 +235,47 @@ class PostgreSQLRetrievalRepository:
             load_agent_manifest_resource,
         )
 
-        try:
-            typed_input = RetrieveInput.model_validate(agent.typed_input).model_dump(mode="json")
-        except ValueError:
-            raise RetrievalPolicyError("RETRIEVAL_INPUT_INVALID") from None
         expected = canonical_manifest_fingerprint(
-            load_agent_manifest_resource("work_management_ai.agents.retrieve", "agent.yaml")
+            load_agent_manifest_resource(
+                "work_management_ai.agents.retrieve",
+                "agent.v2.yaml" if goal else "agent.yaml",
+            )
         )
         if agent.manifest_fingerprint != expected:
             raise RetrievalPolicyError("RETRIEVAL_MANIFEST_MISMATCH")
-        if agent.status not in ({"RUNNING", "COMPLETED"} if allow_terminal else {"RUNNING"}) or (
+        allowed_statuses = {"RUNNING"}
+        if allow_terminal:
+            allowed_statuses.add("COMPLETED")
+            if goal and allow_no_evidence_outcome:
+                allowed_statuses.update({"AWAITING_INPUT", "FAILED"})
+        if agent.status not in allowed_statuses or (
             not allow_terminal and parent.status != "RUNNING"
         ):
             raise RetrievalPolicyError("RETRIEVAL_RUN_STOPPED")
+        if goal:
+            if agent.typed_input != {"source_turn_ref": str(turn.id)}:
+                raise RetrievalPolicyError("RETRIEVAL_INPUT_INVALID")
+            if message.created_at <= now - timedelta(days=30):
+                raise RetrievalPolicyError("RETRIEVAL_CONTEXT_EXPIRED")
+            blocks = message.content_blocks
+            if len(blocks) != 1 or blocks[0].get("kind") != "text":
+                raise RetrievalPolicyError("RETRIEVAL_INPUT_INVALID")
+            original = blocks[0].get("text")
+            if not isinstance(original, str) or not original:
+                raise RetrievalPolicyError("RETRIEVAL_INPUT_INVALID")
+            typed_input = {}
+        else:
+            try:
+                typed_input = RetrieveInput.model_validate(agent.typed_input).model_dump(
+                    mode="json"
+                )
+            except ValueError:
+                raise RetrievalPolicyError("RETRIEVAL_INPUT_INVALID") from None
+            original = "\n".join(
+                str(block.get("text", ""))
+                for block in message.content_blocks
+                if block.get("kind") == "text"
+            )
         now = cast(datetime, await self.session.scalar(text("SELECT clock_timestamp()")))
         if lease is not None and (lease_until is None or lease_until <= now):
             raise RetrievalPolicyError("RETRIEVAL_JOB_CLAIM_LOST")
@@ -249,16 +286,13 @@ class PostgreSQLRetrievalRepository:
             parent.budget,
             parent.usage,
             typed_input,
-            "\n".join(
-                str(block.get("text", ""))
-                for block in message.content_blocks
-                if block.get("kind") == "text"
-            ),
+            original,
             agent.started_at or agent.created_at,
             parent.started_at or parent.created_at,
             now,
             lease_until,
             await self.protected_terms(),
+            agent_version=agent.agent_version,
         )
 
     async def get_budget(self, run_id: UUID, *, lock: bool = True) -> RetrievalBudgetState | None:

@@ -33,7 +33,12 @@ class RetrievalAdmissionPort(Protocol):
 
 class RetrievalRepository(Protocol):
     async def bind(
-        self, run_id: UUID, lease: RetrievalLease | None, *, allow_terminal: bool = False
+        self,
+        run_id: UUID,
+        lease: RetrievalLease | None,
+        *,
+        allow_terminal: bool = False,
+        allow_no_evidence_outcome: bool = False,
     ) -> RetrievalRunScope: ...
     async def get_budget(
         self, run_id: UUID, *, lock: bool = True

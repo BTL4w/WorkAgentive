@@ -1,8 +1,10 @@
 """Reusable durable step/checkpoint recording with separate chat and typed sinks."""
 
+from dataclasses import replace
 from typing import Any, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
+from app.modules.assistant.adapters.retrieval_tools import reject_retrieval_result
 from app.modules.assistant.application.ports import AssistantRepository, AssistantTransactionFactory
 from app.modules.assistant.domain.models import (
     AgentCheckpoint,
@@ -119,14 +121,7 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                 ),
                 result,
             )
-        return AgentResult(
-            agent_id=AgentId.RETRIEVE,
-            agent_version="1.0.0",
-            status=AgentRunStatus.FAILED,
-            typed_output={},
-            stop_reason="RETRIEVAL_REPLAY_REJECTED",
-            safe_error_code="RETRIEVAL_REVALIDATION_REQUIRED",
-        )
+        return reject_retrieval_result(result, "RETRIEVAL_REVALIDATION_REQUIRED")
 
     async def ensure_orchestrator_run(self) -> UUID:
         run_id = uuid5(NAMESPACE_URL, f"orchestrator:{self._identity}")
@@ -372,12 +367,21 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
         return RecordedAgentRun(id=run.id, status=AgentRunStatus.RUNNING)
 
     async def finish_agent_run(self, run_id: UUID, result: AgentResult) -> None:
-        rejected_retrieval = False
+        published = await self._finish_agent_run(run_id, result)
+        if published != result:
+            raise ValueError("RETRIEVAL_RESULT_REJECTED")
+
+    async def finish_goal_agent_run(
+        self, run_id: UUID, result: GoalDirectedAgentResult
+    ) -> GoalDirectedAgentResult:
+        published = await self._finish_agent_run(run_id, result)
+        assert isinstance(published, GoalDirectedAgentResult)
+        return published
+
+    async def _finish_agent_run(self, run_id: UUID, result: AgentResult) -> AgentResult:
         if result.agent_id is AgentId.RETRIEVE:
             self._retrieval_active = True
-            original = result
             result = await self._revalidate_retrieval(run_id, result)
-            rejected_retrieval = result != original
         if result.agent_id is AgentId.REPORTING and self._job is not None:
             self._report_chat_active = True
         async with self._transactions(self._context) as transaction:
@@ -390,6 +394,8 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                 or run.orchestration_run_id != self._scope.orchestration_run_id
                 or run.agent_id != result.agent_id.value
                 or run.agent_version != result.agent_version
+                or (run.capability == GOAL_HANDOFF_CAPABILITY)
+                != isinstance(result, GoalDirectedAgentResult)
             ):
                 raise RuntimeError("AGENT_RUN_NOT_FOUND")
             if (
@@ -403,7 +409,7 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                 ):
                     raise RuntimeError("REPORTING_RESULT_REPLAY_MISMATCH")
                 await transaction.commit()
-                return
+                return result
             if result.status is AgentRunStatus.COMPLETED:
                 updated = run.mark_completed(
                     typed_output=result.model_dump(mode="json"),
@@ -442,11 +448,21 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                 )
             else:
                 updated = run.mark_failed(result.safe_error_code or "AGENT_EXECUTION_FAILED")
+                if isinstance(result, GoalDirectedAgentResult):
+                    updated = replace(
+                        updated,
+                        typed_output=result.model_dump(mode="json"),
+                        stop_reason=result.stop_reason,
+                        usage={
+                            "iterations": result.iterations_used,
+                            "tool_calls": result.tool_calls_used,
+                            "model_attempts": result.model_attempts_used,
+                        },
+                    )
             await transaction.repository.finish_agent_run(run=updated)
             await transaction.commit()
 
-        if rejected_retrieval:
-            raise ValueError("RETRIEVAL_RESULT_REJECTED")
+        return result
 
     async def save_checkpoint(self, checkpoint: ExecutionCheckpoint) -> None:
         if checkpoint.orchestration_run_id != self._scope.orchestration_run_id:

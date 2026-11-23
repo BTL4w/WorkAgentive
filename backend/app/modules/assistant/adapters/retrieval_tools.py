@@ -25,6 +25,7 @@ from work_management_ai.runtime.contracts import (
     AgentResult,
     AgentRunStatus,
     ContextReference,
+    GoalDirectedAgentResult,
     JsonValue,
     ToolExecutionRequest,
     ToolExecutionResult,
@@ -38,6 +39,22 @@ from work_management_ai.tools.web.contracts import (
     WebSearchInput,
     WebSearchOutput,
 )
+
+
+def reject_retrieval_result(result: AgentResult, code: str) -> AgentResult:
+    return result.model_copy(
+        update={
+            "status": AgentRunStatus.FAILED,
+            "typed_output": {},
+            "interaction_outcome": None,
+            "evidence": (),
+            "proposed_actions": (),
+            "verifier_results": (),
+            "requested_handoff": None,
+            "stop_reason": "RETRIEVAL_REPLAY_REJECTED",
+            "safe_error_code": code,
+        }
+    )
 
 
 def _web(snapshot: RetrievalSnapshot) -> WebEvidence:
@@ -324,14 +341,28 @@ class RetrievalToolExecutor:
                 or actor.membership_id != reference.membership_id
             ):
                 raise RetrievalPolicyError("RETRIEVAL_ACTOR_UNAVAILABLE")
-            await self._budgets.validate_run(actor, run_id, self._lease, allow_terminal=True)
+            goal = isinstance(result, GoalDirectedAgentResult)
             if (
                 result.agent_id is not AgentId.RETRIEVE
-                or result.agent_version != "1.0.0"
+                or result.agent_version != ("1.1.0" if goal else "1.0.0")
                 or result.proposed_actions
                 or result.requested_handoff is not None
             ):
                 raise RetrievalPolicyError("RETRIEVAL_RESULT_INVALID")
+            no_evidence_goal_outcome = goal and result.status in {
+                AgentRunStatus.AWAITING_INPUT,
+                AgentRunStatus.FAILED,
+            }
+            if no_evidence_goal_outcome and result.evidence:
+                raise RetrievalPolicyError("RETRIEVAL_RESULT_INVALID")
+            await self._budgets.validate_run(
+                actor,
+                run_id,
+                self._lease,
+                allow_terminal=True,
+                expected_agent_version=result.agent_version,
+                require_budget=not no_evidence_goal_outcome,
+            )
             sources: tuple[RetrievalSnapshot, ...] = ()
             if result.evidence:
                 if any(
@@ -363,11 +394,4 @@ class RetrievalToolExecutor:
                 if isinstance(error, RetrievalPolicyError)
                 else "RETRIEVAL_RESULT_INVALID"
             )
-            return AgentResult(
-                agent_id=AgentId.RETRIEVE,
-                agent_version="1.0.0",
-                status=AgentRunStatus.FAILED,
-                typed_output={},
-                stop_reason="RETRIEVAL_REPLAY_REJECTED",
-                safe_error_code=code,
-            )
+            return reject_retrieval_result(result, code)

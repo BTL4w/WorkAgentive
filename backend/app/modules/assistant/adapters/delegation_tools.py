@@ -174,8 +174,7 @@ class PostgreSQLGoalSpecialistRunner:
         result = await self._harness.run(handoff)
         if not isinstance(result, GoalDirectedAgentResult):
             raise ToolPolicyError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
-        await self._recorder.finish_agent_run(recorded.id, result)
-        return recorded.id, result
+        return recorded.id, await self._recorder.finish_goal_agent_run(recorded.id, result)
 
     async def reconcile(
         self, handoff: AgentHandoffV2
