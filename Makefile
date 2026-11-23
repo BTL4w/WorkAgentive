@@ -27,7 +27,7 @@ db-up:
 
 .PHONY: redis-up
 redis-up:
-	docker compose --profile redis up -d --wait --wait-timeout 60 redis
+	docker compose up -d --wait --wait-timeout 60 redis
 
 backend-dev:
 	$(MAKE) --no-print-directory -C backend up
@@ -69,7 +69,7 @@ containers-build:
 	docker compose build backend-api frontend ai-worker
 
 containers-up:
-	docker compose up -d --build --wait --wait-timeout 60 postgres backend-api frontend ai-worker
+	docker compose up -d --build --wait --wait-timeout 60 postgres redis backend-api frontend ai-worker
 
 containers-down:
 	docker compose down
