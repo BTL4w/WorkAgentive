@@ -276,6 +276,96 @@ async def test_goal_handoff_selects_read_action_in_specialist() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resource_type", ["PROJECT", "TASK"])
+@pytest.mark.parametrize("case", ["allowed", "denied", "revoked", "version_changed"])
+async def test_goal_work_checks_access_and_version_of_pinned_resource(
+    resource_type: Literal["PROJECT", "TASK"], case: str
+) -> None:
+    actor = _actor()
+    legacy = _handoff(actor, question="Show the status of this resource")
+    ref = ContextReference(
+        reference_id=uuid4(),
+        organization_id=actor.organization_id,
+        resource_type=resource_type.lower(),
+        resource_id=uuid4(),
+        version=1,
+        observed_at=_NOW,
+    )
+    goal = AgentHandoffV2.model_validate(
+        {
+            **legacy.model_dump(
+                exclude={"schema_version", "typed_input", "objective", "capability"}
+            ),
+            "target_agent_version": "1.1.0",
+            "locale": "en",
+            "timezone": "UTC",
+            "source_turn_ref": uuid4(),
+            "context_references": (ref,),
+            "brief": DelegationBrief(objective=legacy.objective, expected_result="Verified status"),
+        }
+    )
+    fact = _evidence(
+        resource_type,
+        resource_id=ref.resource_id,
+        version=2 if case == "version_changed" else 1,
+        fields={"name": "Checkout"},
+    )
+    executor = RecordingToolExecutor({"work.read_resource": _tool_result(fact)})
+
+    class Actors:
+        async def resolve(self, reference: ActorReference) -> ResolvedActorContext:
+            return ResolvedActorContext(**reference.model_dump(), role="MANAGER", is_active=True)
+
+    class Access:
+        checks = 0
+
+        async def verify(self, handoff: AgentHandoffV2) -> None:
+            assert handoff.context_references == (ref,)
+            self.checks += 1
+            if case == "denied" or (case == "revoked" and self.checks > 1):
+                raise ValueError("WORK_CONTEXT_DENIED")
+
+    access = Access()
+    kind = (
+        WorkQuestionKind.PROJECT_DETAIL
+        if resource_type == "PROJECT"
+        else WorkQuestionKind.TASK_DETAIL
+    )
+    result = await WorkIntelligenceHarness(
+        model_gateway=MockModelGateway(
+            fixtures={
+                "work_intelligence.en.plan": _plan(
+                    kind,
+                    tool_input={"resource_type": resource_type, "reference": str(ref.resource_id)},
+                ),
+                "work_intelligence.en.synthesize": _draft(
+                    kind, fact, field="name", value="Checkout"
+                ),
+            }
+        ),
+        tool_executor=executor,
+        actor_resolver=Actors(),
+        goal_access=access,
+    ).run(goal)
+    assert isinstance(result, GoalDirectedAgentResult)
+    if case == "allowed":
+        assert result.status is AgentRunStatus.COMPLETED
+        assert result.resolved_action == f"work.read_{resource_type.lower()}"
+        assert [(item.resource_id, item.version) for item in result.evidence] == [
+            (ref.resource_id, 1)
+        ]
+    else:
+        assert result.status is AgentRunStatus.FAILED
+        assert result.stop_reason == "WORK_CONTEXT_CHANGED"
+        assert result.safe_error_code == "WORK_MANUAL_READ_FALLBACK"
+        assert not result.evidence
+    assert access.checks == (2 if case in {"allowed", "revoked"} else 1)
+    assert [item.tool_id for item in executor.requests] == (
+        [] if case == "denied" else ["work.read_resource"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_next_task_uses_deterministic_tool_selection() -> None:
     golden = _fixture("work_intelligence_vi.json")
     actor = _actor()

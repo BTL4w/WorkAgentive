@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import re
+from datetime import UTC, datetime
 from typing import cast
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from work_management_ai.agents.orchestrator.contracts import ActorContextResolverPort
 from work_management_ai.agents.risk.contracts import (
@@ -54,6 +56,27 @@ class _RiskTaskRequired(ValueError):
     pass
 
 
+def _named_task(objective: str) -> str:
+    match = re.search(
+        r"\b(?:(?:risk\s+(?:of|for)|rủi ro\s+của)\s+"
+        r"(?:(?:the\s+)?(?:task|công việc|nhiệm vụ)\s+)?"
+        r"|(?:task|công việc|nhiệm vụ)\s+)"
+        r"(?P<title>.+?)(?:\s+(?:là gì|như thế nào))?[?!.]*$",
+        objective.strip(),
+        re.IGNORECASE,
+    )
+    if match is None:
+        raise _RiskTaskRequired
+    title = match["title"].strip().strip("\"'“”\u2018\u2019").strip()
+    if not 1 <= len(title) <= 300:
+        raise _RiskTaskRequired
+    try:
+        UUID(title)
+    except ValueError:
+        return title
+    raise _RiskTaskRequired
+
+
 class RiskHarness:
     def __init__(
         self,
@@ -75,20 +98,21 @@ class RiskHarness:
         )
 
     async def run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
-        result = await self._run(handoff)
+        runner = _RiskRun(self, handoff)
+        state = RiskState()
+        result = await self._run(runner, state)
         if isinstance(handoff, AgentHandoffV2):
             return GoalDirectedAgentResult.model_validate(
                 {
                     **result.model_dump(),
                     "agent_version": self.goal_manifest.agent.version,
-                    "resolved_action": "risk.explain",
+                    "resolved_action": "risk.explain" if state.context is not None else None,
                 }
             )
         return result
 
-    async def _run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
-        runner = _RiskRun(self, handoff)
-        state = RiskState()
+    async def _run(self, runner: "_RiskRun", state: RiskState) -> AgentResult:
+        handoff = runner.handoff
         try:
             async with asyncio.timeout(min(90, handoff.budget.timeout_seconds)):
                 await RiskGraph().run(runner, state, handoff.budget.max_iterations)
@@ -118,11 +142,27 @@ class RiskHarness:
                 "explanation": explanation.model_dump(mode="json"),
                 "fallback": state.fallback,
             }
+            evidence = ()
+            if isinstance(handoff, AgentHandoffV2):
+                evidence = (
+                    ContextReference(
+                        reference_id=uuid5(
+                            NAMESPACE_URL, f"{handoff.idempotency_key}:risk-context"
+                        ),
+                        organization_id=handoff.actor.organization_id,
+                        resource_type="RISK_CONTEXT",
+                        resource_id=context.task_id,
+                        version=context.task_version,
+                        fingerprint=context.fingerprint,
+                        observed_at=datetime.now(UTC),
+                    ),
+                )
             return AgentResult(
                 agent_id=AgentId.RISK,
                 agent_version="1.0.0",
                 status=AgentRunStatus.COMPLETED,
                 typed_output=cast(dict[str, JsonValue], output),
+                evidence=evidence,
                 requested_handoff=requested,
                 iterations_used=state.iterations,
                 tool_calls_used=state.tools,
@@ -147,6 +187,8 @@ class RiskHarness:
                         else "Which Task should I assess?"
                     )
                 },
+                iterations_used=state.iterations,
+                tool_calls_used=state.tools,
                 stop_reason="RISK_TASK_REQUIRED",
             )
         except Exception:
@@ -202,13 +244,22 @@ class _RiskRun:
                 call_id=f"{self.handoff.step_id}:read:{state.tools}",
                 actor=self.handoff.actor,
                 typed_input={
-                    "task_reference": self.value.task_reference,
+                    "task_reference": str(state.context.task_id)
+                    if isinstance(self.handoff, AgentHandoffV2) and state.context is not None
+                    else self.value.task_reference,
                     "expected_fingerprint": expected,
                 },
                 idempotency_key=f"{self.handoff.idempotency_key}:read:{state.tools}",
             )
         )
         if result.status != "SUCCEEDED":
+            if (
+                isinstance(self.handoff, AgentHandoffV2)
+                and self.task is None
+                and state.context is None
+                and result.safe_error_code == "TASK_AMBIGUOUS_OR_NOT_FOUND"
+            ):
+                raise _RiskTaskRequired
             raise ValueError("RISK_READ_DENIED")
         facts = RiskExplanationInput.model_validate(result.typed_output)
         if self.task is not None and (
@@ -226,14 +277,17 @@ class _RiskRun:
                     for ref in self.handoff.context_references
                     if ref.resource_type.casefold() == "task"
                 ]
-                if len(tasks) != 1 or tasks[0].version is None:
+                if len(tasks) > 1 or (tasks and tasks[0].version is None):
                     raise _RiskTaskRequired
-                self.task = tasks[0]
+                self.task = tasks[0] if tasks else None
                 self.value = RiskQuestion(
-                    task_reference=str(self.task.resource_id),
+                    task_reference=str(self.task.resource_id)
+                    if self.task is not None
+                    else _named_task(self.handoff.brief.objective),
                     locale=self.handoff.locale,
                     question=self.handoff.brief.objective,
                 )
+                allowed_skills = self.harness.goal_manifest.allowed_skills
             else:
                 actor = await self.harness.actors.resolve(self.handoff.actor)
                 PolicyGuard().authorize_handoff(
@@ -250,8 +304,9 @@ class _RiskRun:
                 ):
                     raise ValueError("RISK_CONTEXT_TENANT")
                 self.value = RiskQuestion.model_validate(self.handoff.typed_input)
+                allowed_skills = self.harness.manifest.allowed_skills
             instructions: list[str] = []
-            for ref in self.harness.manifest.allowed_skills:
+            for ref in allowed_skills:
                 package = f"work_management_ai.skills.{ref.split('@')[0]}"
                 skill = load_packaged_skill_manifest(package)
                 instructions.append(read_skill_instructions(package, skill))

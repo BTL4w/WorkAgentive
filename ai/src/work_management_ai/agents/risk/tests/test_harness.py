@@ -33,6 +33,7 @@ class Tools:
         self.task = uuid4()
         self.assessment = uuid4()
         self.changed = False
+        self.name_missing = False
         self.calls: list[ToolExecutionRequest] = []
         self.snapshot: dict[str, JsonValue] = dict(
             task_id=str(self.task),
@@ -54,6 +55,10 @@ class Tools:
 
     async def execute(self, request: ToolExecutionRequest) -> ToolExecutionResult:
         self.calls.append(request)
+        if self.name_missing:
+            return ToolExecutionResult(
+                status="REJECTED", typed_output={}, safe_error_code="TASK_AMBIGUOUS_OR_NOT_FOUND"
+            )
         if self.changed and len(self.calls) > 1:
             return ToolExecutionResult(status="REJECTED", typed_output={}, safe_error_code="STALE")
         return ToolExecutionResult(status="SUCCEEDED", typed_output=self.snapshot)
@@ -84,9 +89,10 @@ def handoff(tools: Tools, locale: str = "vi", **extra: JsonValue) -> AgentHandof
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("verified_task", [True, False])
-async def test_goal_handoff_uses_only_verified_task_or_asks(verified_task: bool):
+@pytest.mark.parametrize("case", ["pinned", "named_en", "named_vi", "missing", "unresolved"])
+async def test_goal_handoff_uses_pinned_or_resolved_task(case: str):
     tools = Tools()
+    tools.name_missing = case == "unresolved"
     legacy = handoff(tools)
     ref = ContextReference(
         reference_id=uuid4(),
@@ -105,8 +111,15 @@ async def test_goal_handoff_uses_only_verified_task_or_asks(verified_task: bool)
             "locale": "vi",
             "timezone": "UTC",
             "source_turn_ref": uuid4(),
-            "context_references": (ref,) if verified_task else (),
-            "brief": DelegationBrief(objective=legacy.objective, expected_result="Verified risk"),
+            "context_references": (ref,) if case == "pinned" else (),
+            "brief": DelegationBrief(
+                objective={
+                    "named_en": 'Explain the risk of task "Checkout".',
+                    "named_vi": "Rủi ro của task Checkout là gì?",
+                    "unresolved": "Explain risk for task Checkout",
+                }.get(case, legacy.objective),
+                expected_result="Verified risk",
+            ),
         }
     )
 
@@ -121,14 +134,25 @@ async def test_goal_handoff_uses_only_verified_task_or_asks(verified_task: bool)
         goal_access=Access(),
     ).run(goal)
     assert isinstance(result, GoalDirectedAgentResult)
-    if verified_task:
+    if case in {"pinned", "named_en", "named_vi"}:
         assert result.status is AgentRunStatus.COMPLETED
         assert result.resolved_action == "risk.explain"
-        assert all(call.typed_input["task_reference"] == str(tools.task) for call in tools.calls)
-        assert tools.calls
+        (evidence,) = result.evidence
+        assert evidence.organization_id == goal.actor.organization_id
+        assert evidence.resource_type == "RISK_CONTEXT"
+        assert evidence.resource_id == tools.task
+        assert evidence.version == tools.snapshot["task_version"]
+        assert evidence.fingerprint == tools.snapshot["fingerprint"]
+        assert evidence.freshness_required
+        assert [call.typed_input["task_reference"] for call in tools.calls] == [
+            str(tools.task) if case == "pinned" else "Checkout",
+            str(tools.task),
+        ]
     else:
+        assert not result.evidence
         assert result.interaction_outcome is InteractionOutcome.NEEDS_INPUT
-        assert not tools.calls
+        assert result.resolved_action is None
+        assert result.tool_calls_used == len(tools.calls) == int(case == "unresolved")
 
 
 @pytest.mark.asyncio

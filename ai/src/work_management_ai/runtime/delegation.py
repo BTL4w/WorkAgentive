@@ -1215,7 +1215,7 @@ class DelegationAdapterV2:
     async def revalidate_result(
         self, context: ToolInvocationContext, result: BackendToolResult
     ) -> None:
-        _, manifest, _ = await self._prepare(context, context.canonical_arguments)
+        handoff, manifest, runner = await self._prepare(context, context.canonical_arguments)
         if not isinstance(result.output, DelegateAgentOutputV2):
             raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
         value = result.output
@@ -1224,6 +1224,11 @@ class DelegationAdapterV2:
             manifest.agent.version,
         ) or value.resolved_action not in manifest.capabilities:
             raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+        if value.agent_id is AgentId.RISK:
+            record = await runner.reconcile(handoff)
+            if record is None or await self._normalize(context, manifest, record) != result:
+                raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+            return
         refs = tuple(dict.fromkeys((*result.evidence, *value.evidence, *value.artifact_refs)))
         if refs:
             if self._references is None:

@@ -20,6 +20,7 @@ from app.modules.assistant.adapters.execution_recorder import (
     PostgreSQLExecutionRecorder,
 )
 from app.modules.assistant.adapters.orchestration_tools import ApplicationToolBackend
+from app.modules.assistant.adapters.risk_tools import RiskToolAdapter
 from app.modules.audit.adapters.database_models import AuditEventModel
 from app.modules.audit.domain.events import AuditOutcome
 from app.modules.identity.domain.auth import AuthenticatedActor
@@ -35,7 +36,9 @@ from app.modules.work.adapters.database_models import IdempotencyRecordModel, Id
 from work_management_ai.agents.daily_update.contracts import DailyUpdateResult
 from work_management_ai.runtime.contracts import (
     AgentHandoffV2,
+    AgentId,
     AgentResult,
+    AgentRunStatus,
     GoalDirectedAgentResult,
 )
 from work_management_ai.runtime.delegation import (
@@ -159,10 +162,12 @@ class PostgreSQLGoalSpecialistRunner:
         recorder: PostgreSQLExecutionRecorder,
         harness: GoalSpecialistHarness,
         pin: VersionPin,
+        risk_tools: RiskToolAdapter | None = None,
     ) -> None:
         self._recorder = recorder
         self._harness = harness
         self._pin = pin
+        self._risk_tools = risk_tools
 
     async def run(self, handoff: AgentHandoffV2) -> tuple[UUID, GoalDirectedAgentResult]:
         recorded = await self._recorder.start_agent_run(handoff)
@@ -179,6 +184,8 @@ class PostgreSQLGoalSpecialistRunner:
     async def reconcile(
         self, handoff: AgentHandoffV2
     ) -> tuple[UUID, GoalDirectedAgentResult] | None:
+        if handoff.target_agent_id is AgentId.RISK:
+            self._recorder.check_handoff_scope(handoff)
         recorded = await self._recorder.lookup_agent_run(handoff.idempotency_key)
         if recorded is None:
             return None
@@ -192,7 +199,13 @@ class PostgreSQLGoalSpecialistRunner:
         ):
             raise ToolPolicyError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
         result = recorded.replayed_result
-        return (recorded.id, result) if isinstance(result, GoalDirectedAgentResult) else None
+        if not isinstance(result, GoalDirectedAgentResult):
+            return None
+        if handoff.target_agent_id is AgentId.RISK and result.status is AgentRunStatus.COMPLETED:
+            if self._risk_tools is None:
+                raise ToolPolicyError("RISK_CONTEXT_UNAVAILABLE", stop_segment=True)
+            await self._risk_tools.revalidate_goal_result(handoff.actor, result)
+        return recorded.id, result
 
 
 class PostgreSQLDailyUpdateReceiptReader(_ScopedReceiptReader):

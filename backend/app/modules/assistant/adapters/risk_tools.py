@@ -6,12 +6,15 @@ from uuid import UUID
 from app.modules.identity.domain.auth import AuthenticatedActor
 from app.modules.risk.application.read_service import RiskReadService
 from app.modules.work.application.task_service import TaskService
-from work_management_ai.agents.risk.contracts import RiskExplanationInput
+from work_management_ai.agents.risk.contracts import RiskCardContent, RiskExplanationInput
 from work_management_ai.runtime.contracts import (
+    ActorReference,
+    GoalDirectedAgentResult,
     JsonValue,
     ToolExecutionRequest,
     ToolExecutionResult,
 )
+from work_management_ai.runtime.tool_pipeline import ToolPolicyError
 from work_management_ai.tools.risk.contracts import RiskToolInput
 
 
@@ -25,20 +28,49 @@ class RiskToolAdapter:
     def __init__(self, *, actors: ActorResolver, tasks: TaskService, reads: RiskReadService):
         self.actors, self.tasks, self.reads = actors, tasks, reads
 
+    async def _resolve_actor(self, reference: ActorReference) -> AuthenticatedActor:
+        actor = await self.actors.resolve(
+            organization_id=reference.organization_id, membership_id=reference.membership_id
+        )
+        if (
+            actor is None
+            or actor.organization_id != reference.organization_id
+            or actor.membership_id != reference.membership_id
+        ):
+            raise ValueError("ACTOR_UNAVAILABLE")
+        return actor
+
+    async def revalidate_goal_result(
+        self, reference: ActorReference, result: GoalDirectedAgentResult
+    ) -> None:
+        try:
+            card = RiskCardContent.model_validate(result.typed_output)
+            (pin,) = result.evidence
+            if (
+                result.resolved_action != "risk.explain"
+                or pin.organization_id != reference.organization_id
+                or pin.resource_type != "RISK_CONTEXT"
+                or pin.resource_id != card.task_id
+                or pin.version != card.task_version
+                or pin.fingerprint != card.fingerprint
+                or not pin.freshness_required
+            ):
+                raise ValueError("RISK_CONTEXT_MISMATCH")
+            actor = await self._resolve_actor(reference)
+            current = await self.reads.read(actor, card.task_id, card.fingerprint)
+            saved = RiskExplanationInput.model_validate(
+                card.model_dump(exclude={"explanation", "fallback"})
+            )
+            if saved != RiskExplanationInput.model_validate(current.model_dump()):
+                raise ValueError("RISK_CONTEXT_MISMATCH")
+        except Exception:
+            raise ToolPolicyError("RISK_CONTEXT_UNAVAILABLE", stop_segment=True) from None
+
     async def execute(self, request: ToolExecutionRequest) -> ToolExecutionResult:
         try:
             if request.tool_id != "risk.read":
                 raise ValueError("TOOL_NOT_ALLOWED")
-            actor = await self.actors.resolve(
-                organization_id=request.actor.organization_id,
-                membership_id=request.actor.membership_id,
-            )
-            if (
-                actor is None
-                or actor.organization_id != request.actor.organization_id
-                or actor.membership_id != request.actor.membership_id
-            ):
-                raise ValueError("ACTOR_UNAVAILABLE")
+            actor = await self._resolve_actor(request.actor)
             value = RiskToolInput.model_validate(request.typed_input)
             try:
                 task_id = UUID(value.task_reference)
@@ -46,8 +78,15 @@ class RiskToolAdapter:
                 matches = await self.tasks.find_visible_tasks_by_title(
                     actor=actor, query=value.task_reference, limit=2
                 )
-                if len(matches) != 1:
-                    raise ValueError("TASK_AMBIGUOUS_OR_NOT_FOUND") from None
+                if (
+                    len(matches) != 1
+                    or value.task_reference.casefold() not in matches[0].title.casefold()
+                ):
+                    return ToolExecutionResult(
+                        status="REJECTED",
+                        typed_output={},
+                        safe_error_code="TASK_AMBIGUOUS_OR_NOT_FOUND",
+                    )
                 task_id = matches[0].id
             context = await self.reads.read(actor, task_id, value.expected_fingerprint)
             output = RiskExplanationInput.model_validate(context.model_dump(mode="json"))

@@ -230,16 +230,27 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
             manifest_fingerprint=existing.manifest_fingerprint,
         )
 
-    async def start_agent_run(self, handoff: AgentHandoff | AgentHandoffV2) -> RecordedAgentRun:
-        goal = isinstance(handoff, AgentHandoffV2)
-        if goal:
-            assert isinstance(handoff, AgentHandoffV2)
+    def check_handoff_scope(self, handoff: AgentHandoff | AgentHandoffV2) -> None:
+        if isinstance(handoff, AgentHandoffV2):
             trigger = self._scope.trigger
             if (
                 not isinstance(trigger, ChatTurnTrigger)
                 or trigger.turn_id != handoff.source_turn_ref
             ):
                 raise RuntimeError("AGENT_HANDOFF_SCOPE_MISMATCH")
+        if (
+            handoff.orchestration_run_id != self._scope.orchestration_run_id
+            or handoff.actor.organization_id != self._scope.organization_id
+            or handoff.actor.membership_id != self._scope.actor_membership_id
+            or handoff.parent_agent_run_id != uuid5(NAMESPACE_URL, f"orchestrator:{self._identity}")
+        ):
+            raise RuntimeError("AGENT_HANDOFF_SCOPE_MISMATCH")
+
+    async def start_agent_run(self, handoff: AgentHandoff | AgentHandoffV2) -> RecordedAgentRun:
+        self.check_handoff_scope(handoff)
+        goal = isinstance(handoff, AgentHandoffV2)
+        if goal:
+            assert isinstance(handoff, AgentHandoffV2)
             capability = GOAL_HANDOFF_CAPABILITY
             objective = "Goal-directed Specialist handoff"
             typed_input: dict[str, object] = {"source_turn_ref": str(handoff.source_turn_ref)}
@@ -252,13 +263,6 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
             self._retrieval_active = True
         if capability in {"reporting.prepare_report", "reporting.explain_snapshot"}:
             self._report_chat_active = True
-        if (
-            handoff.orchestration_run_id != self._scope.orchestration_run_id
-            or handoff.actor.organization_id != self._scope.organization_id
-            or handoff.actor.membership_id != self._scope.actor_membership_id
-            or handoff.parent_agent_run_id != uuid5(NAMESPACE_URL, f"orchestrator:{self._identity}")
-        ):
-            raise RuntimeError("AGENT_HANDOFF_SCOPE_MISMATCH")
         handoff_id = uuid5(NAMESPACE_URL, f"handoff:{handoff.idempotency_key}")
         run_id = uuid5(NAMESPACE_URL, f"agent-run:{handoff.idempotency_key}")
         async with self._transactions(self._context) as transaction:
