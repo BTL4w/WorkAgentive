@@ -1,6 +1,7 @@
 """AI budget port to the application ledger; models never authorize allowance."""
 
 import math
+from typing import Literal
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -11,13 +12,15 @@ from app.modules.assistant.adapters.session_usage_repository import (
 from app.modules.assistant.adapters.tool_loop_recorder import session_lease, session_scope
 from app.modules.assistant.application.session_service import fingerprint
 from app.modules.assistant.application.session_usage_service import RunUsageService
-from app.modules.assistant.domain.session import SessionError
-from app.modules.assistant.domain.session_usage import DIMENSIONS
+from app.modules.assistant.domain.session import SessionError, SessionLease
+from app.modules.assistant.domain.session_usage import DIMENSIONS, JobClaim
 from app.modules.identity.domain.auth import AuthenticatedActor
 from work_management_ai.model_gateway.contracts import ModelUsage
 from work_management_ai.runtime.run_budget import (
     BudgetReceipt,
     ChildAllocation,
+    ChildJobClaim,
+    JobBudgetReceipt,
     RemainingBudget,
     UsageReservation,
 )
@@ -40,9 +43,37 @@ def _usage(value: dict[str, int]) -> ToolLoopUsage:
     )
 
 
+def _claim(value: ChildJobClaim) -> JobClaim:
+    return JobClaim(value.kind, value.job_id, value.worker_id, value.attempt, value.lease_until)
+
+
 class PostgreSQLRunBudget:
     def __init__(self, sessions: async_sessionmaker[AsyncSession], actor: AuthenticatedActor):
-        self.service = RunUsageService(PostgreSQLUsageTransactionFactory(sessions), actor)
+        self._transactions = PostgreSQLUsageTransactionFactory(sessions)
+        self._actor = actor
+        self.service = RunUsageService(self._transactions, actor)
+
+    async def job_scope(self, claim: ChildJobClaim) -> tuple[RunScope, UUID] | None:
+        async with self._transactions(self._actor) as transaction:
+            bound = await transaction.repository.bound_job(self._actor, claim.kind, claim.job_id)
+        if bound is None:
+            return None
+        scope, allocation_id = bound
+        return RunScope(
+            organization_id=scope.organization_id,
+            membership_id=scope.membership_id,
+            conversation_id=scope.conversation_id,
+            turn_id=scope.turn_id,
+            orchestration_run_id=scope.orchestration_run_id,
+        ), allocation_id
+
+    async def close_for_job(
+        self,
+        scope: RunScope,
+        allocation_id: UUID,
+        claim: ChildJobClaim,
+    ) -> None:
+        await self.service.close_job(session_scope(scope), allocation_id, _claim(claim))
 
     async def recover_tool(
         self,
@@ -89,9 +120,58 @@ class PostgreSQLRunBudget:
         self, scope: RunScope, reservation: UsageReservation, *, lease: RunLease
     ) -> BudgetReceipt:
         reservation = UsageReservation.model_validate(reservation)
-        replayed, seconds = await self.service.reserve(
+        replayed, seconds = await self._reserve(scope, reservation, session_lease(lease))
+        return BudgetReceipt(
+            scope=scope,
+            lease=lease,
+            reservation=reservation,
+            replayed=replayed,
+            seconds_remaining=seconds,
+        )
+
+    async def bind_job(
+        self,
+        scope: RunScope,
+        allocation_id: UUID,
+        kind: Literal["PLANNING", "REPORTING"],
+        job_id: UUID,
+        *,
+        lease: RunLease,
+    ) -> None:
+        await self.service.bind_job(
+            session_scope(scope), session_lease(lease), allocation_id, kind, job_id
+        )
+
+    async def reserve_for_job(
+        self,
+        scope: RunScope,
+        allocation_id: UUID,
+        *,
+        job_claim_token: ChildJobClaim,
+        reservation: UsageReservation,
+    ) -> JobBudgetReceipt:
+        claim = ChildJobClaim.model_validate(job_claim_token)
+        reservation = UsageReservation.model_validate(reservation)
+        if reservation.allocation_id != allocation_id:
+            raise SessionError("BUDGET_SCOPE_MISMATCH")
+        replayed, seconds = await self._reserve(scope, reservation, _claim(claim))
+        return JobBudgetReceipt(
+            scope=scope,
+            claim=claim,
+            reservation=reservation,
+            replayed=replayed,
+            seconds_remaining=seconds,
+        )
+
+    async def _reserve(
+        self,
+        scope: RunScope,
+        reservation: UsageReservation,
+        authority: SessionLease | JobClaim,
+    ) -> tuple[bool, float]:
+        return await self.service.reserve(
             session_scope(scope),
-            session_lease(lease),
+            authority,
             operation_id=reservation.operation_id,
             kind=reservation.kind,
             allocation_id=reservation.allocation_id,
@@ -100,13 +180,6 @@ class PostgreSQLRunBudget:
             outputs=reservation.output_tokens,
             retry_of=reservation.retry_of,
             repair_of=reservation.repair_of,
-        )
-        return BudgetReceipt(
-            scope=scope,
-            lease=lease,
-            reservation=reservation,
-            replayed=replayed,
-            seconds_remaining=seconds,
         )
 
     async def allocate_child(
@@ -129,7 +202,25 @@ class PostgreSQLRunBudget:
     ) -> None:
         if receipt.scope != scope:
             raise SessionError("BUDGET_SCOPE_MISMATCH")
-        request = receipt.reservation
+        await self._settle(scope, session_lease(receipt.lease), receipt.reservation, usage)
+
+    async def settle_for_job(
+        self,
+        scope: RunScope,
+        receipt: JobBudgetReceipt,
+        usage: ModelUsage | None,
+    ) -> None:
+        if receipt.scope != scope:
+            raise SessionError("BUDGET_SCOPE_MISMATCH")
+        await self._settle(scope, _claim(receipt.claim), receipt.reservation, usage)
+
+    async def _settle(
+        self,
+        scope: RunScope,
+        authority: SessionLease | JobClaim,
+        request: UsageReservation,
+        usage: ModelUsage | None,
+    ) -> None:
         identity = fingerprint(
             dict(
                 kind=request.kind,
@@ -143,10 +234,11 @@ class PostgreSQLRunBudget:
         )
         await self.service.settle(
             session_scope(scope),
-            session_lease(receipt.lease),
+            authority,
             request.operation_id,
             identity,
             (usage.input_tokens, usage.output_tokens) if usage else None,
+            allocation_id=request.allocation_id,
         )
 
     async def remaining(self, scope: RunScope) -> RemainingBudget:

@@ -383,7 +383,8 @@ async def test_child_fence_uses_workflow_lease_and_allocation_while_parent_suspe
     from datetime import UTC, datetime, timedelta
 
     from app.core.execution_fence import WorkflowJobFence
-    from work_management_ai.runtime.run_budget import ChildAllocation
+    from app.modules.assistant.domain.session_usage import JobClaim
+    from work_management_ai.runtime.run_budget import ChildAllocation, ChildJobClaim
     from work_management_ai.runtime.tool_loop_contracts import ToolLoopUsage
 
     engine, sessions, actor, _, scope, lease, _, job_id = journal
@@ -393,20 +394,6 @@ async def test_child_fence_uses_workflow_lease_and_allocation_while_parent_suspe
         allowance=ToolLoopUsage(total_tool_calls=2, segments=1, active_seconds=180),
     )
     await budget.allocate_child(scope, allocation, lease=lease)
-    interval = await budget.reserve(
-        scope,
-        UsageReservation(kind="INTERVAL", allocation_id=allocation.allocation_id),
-        lease=lease,
-    )
-    tool = await budget.reserve(
-        scope,
-        UsageReservation(
-            kind="TOOL",
-            allocation_id=allocation.allocation_id,
-            interval_id=interval.reservation.operation_id,
-        ),
-        lease=lease,
-    )
     workflow_id, child_id = uuid4(), uuid4()
     until = datetime.now(UTC) + timedelta(seconds=50)
     async with engine.begin() as conn:
@@ -429,6 +416,8 @@ async def test_child_fence_uses_workflow_lease_and_allocation_while_parent_suspe
             ),
             {"id": child_id, "org": scope.organization_id, "workflow": workflow_id, "until": until},
         )
+    await budget.bind_job(scope, allocation.allocation_id, "PLANNING", child_id, lease=lease)
+    async with engine.begin() as conn:
         await conn.execute(
             text(
                 "UPDATE orchestration_runtime_states SET "
@@ -437,18 +426,38 @@ async def test_child_fence_uses_workflow_lease_and_allocation_while_parent_suspe
             ),
             {"org": scope.organization_id},
         )
-    child = WorkflowJobFence(
+    claim = ChildJobClaim(
+        kind="PLANNING",
         job_id=child_id,
-        workflow_run_id=workflow_id,
         worker_id="child-worker",
-        attempt_count=1,
+        attempt=1,
         lease_until=until,
+    )
+    interval = await budget.reserve_for_job(
+        scope,
+        allocation.allocation_id,
+        job_claim_token=claim,
+        reservation=UsageReservation(kind="INTERVAL", allocation_id=allocation.allocation_id),
+    )
+    tool = await budget.reserve_for_job(
+        scope,
+        allocation.allocation_id,
+        job_claim_token=claim,
+        reservation=UsageReservation(
+            kind="TOOL",
+            allocation_id=allocation.allocation_id,
+            interval_id=interval.reservation.operation_id,
+        ),
+    )
+    child = WorkflowJobFence(
         allocation_id=allocation.allocation_id,
+        claim=JobClaim("PLANNING", child_id, "child-worker", 1, until),
     )
     context = ExecutionFenceContext(
         actor=actor,
         scope=session_scope(scope),
-        lease=session_lease(lease),
+        lease=None,
+        interval_id=interval.reservation.operation_id,
         operation_id=tool.reservation.operation_id,
         workflow=child,
     )

@@ -11,8 +11,10 @@ from typing import Any, Protocol, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
+from app.modules.assistant.adapters.child_job_runtime import execute_child_job
 from app.modules.assistant.adapters.retrieval_planning import PlanningRetrievalContext
 from app.modules.identity.domain.auth import AuthenticatedActor
 from app.modules.organization.domain.roles import MembershipRole
@@ -43,6 +45,7 @@ from work_management_ai.model_gateway.errors import ModelInvalidOutputError, Mod
 from work_management_ai.model_gateway.mock import MockModelGateway
 from work_management_ai.model_gateway.openai import OpenAIModelGateway
 from work_management_ai.observability.langsmith_adapter import LangSmithTraceAdapter
+from work_management_ai.runtime.run_budget import BudgetedToolLoopGateway, ChildJobClaim
 from work_management_ai.schemas.planning import PlanningModelOutput
 from work_management_ai.tracing import trace_session
 from work_management_ai.workflows.planning.context import (
@@ -1191,7 +1194,7 @@ class PlanningJobHandler:
             )
 
         gateway = WorkflowRecordingModelGateway(
-            gateway=build_model_gateway(self._settings),
+            gateway=BudgetedToolLoopGateway(build_model_gateway(self._settings)),
             transaction_factory=self._transactions,
             organization_id=run.organization_id,
             workflow_run_id=run.id,
@@ -1615,6 +1618,7 @@ def build_planning_job_handlers(
     *,
     trace_adapter: LangSmithTraceAdapter | None = None,
     retrieval_context: PlanningRetrievalContext | None = None,
+    candidate_sessions: async_sessionmaker[AsyncSession] | None = None,
 ) -> dict[str, JobHandler]:
     planning = PlanningJobHandler(
         settings, transaction_factory, actor_resolver, trace_adapter, retrieval_context
@@ -1624,7 +1628,7 @@ def build_planning_job_handlers(
     def revision_graph(run: WorkflowRun) -> PlanningGraph:
         return PlanningGraph(
             model_gateway=WorkflowRecordingModelGateway(
-                gateway=build_model_gateway(settings),
+                gateway=BudgetedToolLoopGateway(build_model_gateway(settings)),
                 transaction_factory=transaction_factory,
                 organization_id=run.organization_id,
                 workflow_run_id=run.id,
@@ -1668,11 +1672,59 @@ def build_planning_job_handlers(
         "proposal.revalidate": ProposalRevalidationJobHandler(transaction_factory, actor_resolver),
         "planning.finalize": PlanningFinalizationJobHandler(transaction_factory, actor_resolver),
     }
+    if candidate_sessions is not None:
+        for name in ("planning.start", "planning.resume", "proposal.ai_revise"):
+            handlers[name] = _BudgetedPlanningJobHandler(
+                handlers[name], candidate_sessions, transaction_factory, actor_resolver
+            )
     if trace_adapter is None:
         return handlers
     return {
         name: _TracedPlanningHandler(handler, trace_adapter) for name, handler in handlers.items()
     }
+
+
+class _BudgetedPlanningJobHandler:
+    def __init__(
+        self,
+        handler: JobHandler,
+        sessions: async_sessionmaker[AsyncSession],
+        transactions: PlanningTransactionFactory,
+        actors: CurrentActorResolver,
+    ) -> None:
+        self.handler, self.sessions, self.transactions, self.actors = (
+            handler,
+            sessions,
+            transactions,
+            actors,
+        )
+
+    async def __call__(self, *, job: WorkflowJob, worker_id: str) -> None:
+        async with self.transactions(job.organization_id) as transaction:
+            workflow = await transaction.repository.get_workflow_run_by_scope(
+                organization_id=job.organization_id,
+                run_id=job.workflow_run_id,
+            )
+        if workflow is None or job.lease_until is None:
+            raise RuntimeError("WORKFLOW_LEASE_LOST")
+        actor = await self.actors.resolve(
+            organization_id=job.organization_id,
+            membership_id=workflow.requested_by_membership_id,
+        )
+        if actor is None:
+            raise RuntimeError("ACTOR_CONTEXT_UNAVAILABLE")
+        async with execute_child_job(
+            self.sessions,
+            actor,
+            ChildJobClaim(
+                kind="PLANNING",
+                job_id=job.id,
+                worker_id=worker_id,
+                attempt=job.attempt_count,
+                lease_until=job.lease_until,
+            ),
+        ):
+            await self.handler(job=job, worker_id=worker_id)
 
 
 class _TracedPlanningHandler:

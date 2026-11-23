@@ -261,7 +261,7 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
             typed_input = cast(dict[str, object], handoff.typed_input)
         if handoff.target_agent_id is AgentId.RETRIEVE:
             self._retrieval_active = True
-        if capability in {"reporting.prepare_report", "reporting.explain_snapshot"}:
+        if handoff.target_agent_id is AgentId.REPORTING:
             self._report_chat_active = True
         handoff_id = uuid5(NAMESPACE_URL, f"handoff:{handoff.idempotency_key}")
         run_id = uuid5(NAMESPACE_URL, f"agent-run:{handoff.idempotency_key}")

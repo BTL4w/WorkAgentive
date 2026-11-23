@@ -8,6 +8,7 @@ from app.modules.reporting.application.generation_service import GenerationServi
 from app.modules.reporting.application.report_service import ReportService
 from app.modules.reporting.domain.commands import StoreNarrativeCommand
 from work_management_ai.agents.reporting.contracts import (
+    GoalReportSnapshotQuery,
     ReportingProposal,
     ReportingRequest,
     ReportingUsageScope,
@@ -104,16 +105,21 @@ class ChatReportingToolAdapter:
                 output = await self.contexts.read(actor, request.agent_run_id)
             else:
                 original = await self.contexts.original(actor, request.agent_run_id)
-                output = (
-                    original
-                    if original is not None
-                    else await self.service.prepare(
+                if original is not None:
+                    output = original
+                elif request.typed_input.get("operation") == "EXACT_SNAPSHOT":
+                    output = await self.service.exact_snapshot(
+                        actor=actor,
+                        value=GoalReportSnapshotQuery.model_validate(request.typed_input),
+                        context_run_id=request.agent_run_id,
+                    )
+                else:
+                    output = await self.service.prepare(
                         actor=actor,
                         intent=request.typed_input,
                         key=request.idempotency_key,
                         context_run_id=request.agent_run_id,
                     )
-                )
             return ToolExecutionResult(
                 status="SUCCEEDED", typed_output=cast(dict[str, JsonValue], output)
             )

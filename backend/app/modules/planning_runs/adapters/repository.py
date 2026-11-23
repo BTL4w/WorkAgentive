@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import CursorResult, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.execution_fence import bind_candidate_job
 from app.modules.audit.adapters.database_models import AuditEventModel
 from app.modules.audit.domain.events import AuditOutcome
 from app.modules.feedback.adapters.payload_repository import (
@@ -1279,6 +1280,7 @@ class PostgreSQLPlanningRunRepository(PlanningRunRepository):
             )
             self._session.add(job_model)
             await self._session.flush()
+            await bind_candidate_job(self._session, "PLANNING", job.id)
         return run
 
     async def get_workflow_run(
@@ -1431,6 +1433,7 @@ class PostgreSQLPlanningRunRepository(PlanningRunRepository):
         record.response_status = 202
         record.response_body = {"run_id": str(run.id)}
         await self._session.flush()
+        await bind_candidate_job(self._session, "PLANNING", job.id)
         return WorkflowRunMutationResult(run=run, replayed=False)
 
     async def find_workflow_run_mutation_replay(
@@ -1830,6 +1833,7 @@ class PostgreSQLPlanningRunRepository(PlanningRunRepository):
         record.response_status = 202
         record.response_body = body
         await self._session.flush()
+        await bind_candidate_job(self._session, "PLANNING", job.id)
         return ProposalRevisionRequestResult(
             proposal_id=proposal.id,
             base_version=expected_version,

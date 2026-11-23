@@ -377,6 +377,7 @@ async def _run_worker_with_tracing(
             actor_resolver,
             trace_adapter=trace_adapter,
             retrieval_context=planning_retrieval,
+            candidate_sessions=session_factory,
         ),
         organization_scopes=scopes,
         lease_seconds=settings.worker_lease_seconds,

@@ -9,11 +9,13 @@ from app.modules.audit.adapters import database_models as audit_models
 from app.modules.automations.adapters import database_models as automation_models
 from app.modules.automations.adapters import delivery_models
 from app.modules.feedback.adapters import database_models as feedback_models
+from app.modules.feedback.adapters import evaluation_models, payload_models
 from app.modules.identity.adapters import database_models as identity_models
 from app.modules.organization.adapters import database_models as organization_models
 from app.modules.people_capacity.adapters import database_models as people_capacity_models
 from app.modules.progress.adapters import (
     assessment_models,
+    blocker_models,
     completion_models,
     daily_update_models,
     evidence_models,
@@ -21,16 +23,24 @@ from app.modules.progress.adapters import (
     progress_models,
 )
 from app.modules.reporting.adapters import database_models as reporting_models
+from app.modules.reporting.adapters import usage_models as reporting_usage_models
+from app.modules.risk.adapters import database_models as risk_models
 from app.modules.work.adapters import database_models as work_models
+from app.modules.work.planning.assignment.adapters import database_models as team_requirement_models
+from app.modules.work.planning.assignment.adapters import recommendation_models
 
 _MODEL_MODULES = (
     session_models,
     session_usage_models,
     reporting_models,
+    reporting_usage_models,
     feedback_models,
+    evaluation_models,
+    payload_models,
     automation_models,
     delivery_models,
     assessment_models,
+    blocker_models,
     completion_models,
     assistant_models,
     audit_models,
@@ -41,14 +51,24 @@ _MODEL_MODULES = (
     progress_models,
     organization_models,
     people_capacity_models,
+    risk_models,
+    team_requirement_models,
+    recommendation_models,
     work_models,
 )
 
 
 def test_active_phase_tables_are_registered() -> None:
-    assert set(Base.metadata.tables) == {
+    # Integration tests can load optional I3 models without activating I3.
+    optional_retrieval_tables = {
+        "retrieval_attempt_reservations",
+        "retrieval_run_budgets",
+        "retrieval_source_snapshots",
+    }
+    assert set(Base.metadata.tables) - optional_retrieval_tables == {
         "orchestration_runtime_states",
         "orchestration_usage",
+        "orchestration_child_jobs",
         "orchestration_session_events",
         "orchestration_session_payloads",
         "planning_drafts",

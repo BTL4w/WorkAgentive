@@ -19,8 +19,12 @@ from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentBudget,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentRunStatus,
+    DelegationBrief,
+    GoalDirectedAgentResult,
+    InteractionOutcome,
     ProposedAction,
     ResolvedActorContext,
     RiskLevel,
@@ -204,6 +208,61 @@ async def test_create_operation_calls_manage_run_once() -> None:
     assert PlanningAgentOutput.model_validate(result.typed_output) == expected
     assert len(application.calls) == 1
     assert application.calls[0][1].operation is PlanningOperation.CREATE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("role", "choice", "expected_status"),
+    [
+        ("MANAGER", "CREATE", AgentRunStatus.COMPLETED),
+        ("MANAGER", "REVISE", AgentRunStatus.AWAITING_INPUT),
+        ("EMPLOYEE", "CREATE", AgentRunStatus.FAILED),
+    ],
+)
+async def test_planning_goal_resolves_action_with_verified_bindings(
+    role: Literal["MANAGER", "EMPLOYEE"],
+    choice: str,
+    expected_status: AgentRunStatus,
+) -> None:
+    actor = _actor(role)
+    assignment = _handoff(actor, operation=PlanningOperation.CREATE)
+    handoff = AgentHandoffV2.model_validate(
+        {
+            **assignment.model_dump(
+                exclude={"schema_version", "typed_input", "objective", "capability"}
+            ),
+            "target_agent_version": "1.1.0",
+            "locale": "en",
+            "timezone": "UTC",
+            "source_turn_ref": uuid4(),
+            "brief": DelegationBrief(objective="Plan the launch", expected_result="Project draft"),
+        }
+    )
+    output = _output(PlanningOperation.CREATE).model_copy(
+        update={
+            "workflow_status": "QUEUED",
+            "proposal_id": None,
+            "proposal_version": None,
+            "approval_id": None,
+            "awaiting": "NONE",
+        }
+    )
+    app = FakePlanningApplication(output)
+    harness = _harness(
+        actor=actor,
+        fixtures={"planning_agent.en.goal_intake": {"operation": choice}},
+        tool_executor=PlanningRunToolAdapter(application=app),
+    )
+    result = await harness.run(handoff)
+    assert isinstance(result, GoalDirectedAgentResult)
+    assert result.status is expected_status
+    if expected_status is AgentRunStatus.COMPLETED:
+        assert result.resolved_action == "planning.create"
+        assert len(app.calls) == 1 and app.calls[0][1].progressive
+    else:
+        assert not app.calls
+        if expected_status is AgentRunStatus.AWAITING_INPUT:
+            assert result.interaction_outcome is InteractionOutcome.NEEDS_INPUT
 
 
 @pytest.mark.asyncio

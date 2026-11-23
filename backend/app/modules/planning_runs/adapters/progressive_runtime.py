@@ -35,6 +35,7 @@ from work_management_ai.model_gateway.contracts import (
     StructuredModelResponse,
 )
 from work_management_ai.model_gateway.errors import ModelInvalidInputError
+from work_management_ai.runtime.run_budget import BudgetedToolLoopGateway
 from work_management_ai.schemas.progressive_planning import (
     DraftBinding,
     PlanningDecision,
@@ -397,7 +398,7 @@ async def execute_progressive_job(
 
     gateway = ProgressiveBudgetGateway(
         WorkflowRecordingModelGateway(
-            gateway=build_model_gateway(settings),
+            gateway=BudgetedToolLoopGateway(build_model_gateway(settings)),
             transaction_factory=transactions,
             organization_id=run.organization_id,
             workflow_run_id=run.id,

@@ -8,10 +8,12 @@ from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import BaseModel
 
-from work_management_ai.agents.orchestrator.contracts import ActorContextResolverPort
+from work_management_ai.agents.orchestrator.contracts import ActorContextResolverPort, ReportIntent
 from work_management_ai.agents.reporting.context import SOURCE_DETAIL_LIMIT, model_context
 from work_management_ai.agents.reporting.contracts import (
+    GoalReportSnapshotQuery,
     ReportingContext,
+    ReportingGoalChoice,
     ReportingNarrative,
     ReportingProposal,
     ReportingRequest,
@@ -29,12 +31,20 @@ from work_management_ai.model_gateway.contracts import (
     ModelMessage,
     StructuredModelRequest,
 )
-from work_management_ai.model_gateway.errors import ModelRateLimitError, ModelTimeoutError
+from work_management_ai.model_gateway.errors import (
+    ModelGatewayError,
+    ModelRateLimitError,
+    ModelTimeoutError,
+)
 from work_management_ai.runtime.contracts import (
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
+    GoalActionAccessPort,
+    GoalDirectedAgentResult,
+    InteractionOutcome,
     JsonValue,
     ProposedAction,
     RiskLevel,
@@ -43,6 +53,7 @@ from work_management_ai.runtime.contracts import (
 )
 from work_management_ai.runtime.manifests import (
     AgentManifest,
+    GoalDirectedAgentManifest,
     canonical_manifest_fingerprint,
     load_yaml_resource,
 )
@@ -62,14 +73,21 @@ class ReportingHarness:
         tool_executor: ToolExecutorPort,
         actor_resolver: ActorContextResolverPort,
         usage: ReportingUsagePort | None = None,
+        goal_access: GoalActionAccessPort | None = None,
     ):
         self.usage = usage
+        self.goal_access = goal_access
         self.gateway, self.tools, self.actors = model_gateway, tool_executor, actor_resolver
         self.manifest = load_yaml_resource(
             "work_management_ai.agents.reporting", "agent.yaml", AgentManifest
         )
+        self.goal_manifest = load_yaml_resource(
+            "work_management_ai.agents.reporting", "agent.v2.yaml", GoalDirectedAgentManifest
+        )
 
-    async def run(self, handoff: AgentHandoff) -> AgentResult:
+    async def run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
+        if isinstance(handoff, AgentHandoffV2):
+            return await self._run_goal(handoff)
         if handoff.capability in {"reporting.prepare_report", "reporting.explain_snapshot"}:
             return await self.run_chat(handoff)
         state = ReportingState()
@@ -128,8 +146,172 @@ class ReportingHarness:
                 safe_error_code="REPORTING_UNAVAILABLE",
             )
 
-    async def run_chat(self, handoff: AgentHandoff) -> AgentResult:
-        from work_management_ai.agents.orchestrator.contracts import ReportIntent
+    async def _run_goal(self, goal: AgentHandoffV2) -> GoalDirectedAgentResult:
+        version = self.goal_manifest.agent.version
+        try:
+            actor = await self.actors.resolve(goal.actor)
+            PolicyGuard().authorize_goal_action(
+                current_actor=actor,
+                handoff=goal,
+                manifest=self.goal_manifest,
+                resolved_action="reporting.prepare_report",
+                action_risk=RiskLevel.PROPOSAL_ONLY,
+            )
+            if any(ref.organization_id != actor.organization_id for ref in goal.context_references):
+                raise ValueError("REPORTING_CONTEXT_TENANT")
+            if goal.context_references:
+                if self.goal_access is None:
+                    raise ValueError("REPORT_CONTEXT_UNAVAILABLE")
+                await self.goal_access.verify(goal)
+            choice = (
+                await self.gateway.generate_structured(
+                    StructuredModelRequest(
+                        invocation_key=f"reporting.{goal.locale}.goal_intake",
+                        output_schema=ReportingGoalChoice,
+                        timeout_seconds=min(goal.budget.timeout_seconds, 30),
+                        max_output_tokens=300,
+                        messages=(
+                            ModelMessage(
+                                role="system",
+                                content=(
+                                    "Select preparation of a draft or explanation of status "
+                                    "for the given goal. Use null operation to ask for "
+                                    "clarification. Select the period requested "
+                                    "by the user and include an exact date only when specified."
+                                ),
+                            ),
+                            ModelMessage(
+                                role="user",
+                                content=json.dumps(
+                                    goal.brief.model_dump(mode="json"), ensure_ascii=False
+                                ),
+                            ),
+                        ),
+                    )
+                )
+            ).parsed
+        except (ValueError, ModelGatewayError):
+            return GoalDirectedAgentResult(
+                agent_id=AgentId.REPORTING,
+                agent_version=version,
+                status=AgentRunStatus.FAILED,
+                typed_output={},
+                stop_reason="REPORT_CONTEXT_UNAVAILABLE",
+            )
+        projects = [
+            ref for ref in goal.context_references if ref.resource_type.casefold() == "project"
+        ]
+        snapshots = [
+            ref
+            for ref in goal.context_references
+            if ref.resource_type.casefold() in {"snapshot", "report_snapshot"}
+        ]
+        exact_snapshot = None
+        if choice.operation == "EXPLAIN_STATUS" and len(snapshots) == 1:
+            ref = snapshots[0]
+            if ref.fingerprint is not None:
+                exact_snapshot = GoalReportSnapshotQuery(
+                    snapshot_id=ref.resource_id,
+                    snapshot_fingerprint=ref.fingerprint,
+                    locale=goal.locale,
+                )
+        if choice.operation is None or (
+            exact_snapshot is None and (len(projects) != 1 or bool(snapshots))
+        ):
+            return GoalDirectedAgentResult(
+                agent_id=AgentId.REPORTING,
+                agent_version=version,
+                status=AgentRunStatus.AWAITING_INPUT,
+                interaction_outcome=InteractionOutcome.NEEDS_INPUT,
+                typed_output={
+                    "question": (
+                        "Bạn muốn dùng dự án hoặc ảnh chụp báo cáo nào?"
+                        if goal.locale == "vi"
+                        else "Which Project or report snapshot should I use?"
+                    )
+                },
+                model_attempts_used=1,
+                stop_reason="REPORT_CONTEXT_REQUIRED",
+            )
+        intent = ReportIntent(
+            operation=choice.operation,
+            project_reference=str(projects[0].resource_id) if projects else "snapshot",
+            kind=choice.kind,
+            relative_period=choice.relative_period,
+            period_start=choice.period_start,
+            timezone=goal.timezone,
+            locale=goal.locale,
+        )
+        action = (
+            "reporting.prepare_report"
+            if intent.operation == "PREPARE_REPORT"
+            else "reporting.explain_snapshot"
+        )
+        try:
+            actor = await self.actors.resolve(goal.actor)
+            PolicyGuard().authorize_goal_action(
+                current_actor=actor,
+                handoff=goal,
+                manifest=self.goal_manifest,
+                resolved_action=action,
+                action_risk=RiskLevel.PROPOSAL_ONLY
+                if intent.operation == "PREPARE_REPORT"
+                else RiskLevel.READ_ONLY,
+                requested_tool_ids=("reporting.chat@1",),
+                requested_skill_ids=self.goal_manifest.allowed_skills,
+            )
+            if goal.context_references and self.goal_access is not None:
+                await self.goal_access.verify(goal)
+        except ValueError:
+            return GoalDirectedAgentResult(
+                agent_id=AgentId.REPORTING,
+                agent_version=version,
+                status=AgentRunStatus.FAILED,
+                typed_output={},
+                stop_reason="REPORT_CONTEXT_CHANGED",
+                model_attempts_used=1,
+            )
+        carried = goal.model_dump(
+            exclude={
+                "schema_version",
+                "target_agent_version",
+                "brief",
+                "source_turn_ref",
+                "locale",
+                "timezone",
+            }
+        )
+        legacy = AgentHandoff.model_validate(
+            {
+                **carried,
+                "target_agent_version": self.manifest.agent.version,
+                "objective": goal.brief.objective,
+                "capability": action,
+                "typed_input": intent.model_dump(mode="json"),
+                "budget": goal.budget.model_copy(
+                    update={
+                        "max_model_attempts": max(0, goal.budget.max_model_attempts - 1),
+                    }
+                ),
+            }
+        )
+        result = await self.run_chat(legacy, exact_snapshot=exact_snapshot, include_generation=True)
+        return GoalDirectedAgentResult.model_validate(
+            {
+                **result.model_dump(),
+                "agent_version": version,
+                "resolved_action": action,
+                "model_attempts_used": result.model_attempts_used + 1,
+            }
+        )
+
+    async def run_chat(
+        self,
+        handoff: AgentHandoff,
+        *,
+        exact_snapshot: GoalReportSnapshotQuery | None = None,
+        include_generation: bool = False,
+    ) -> AgentResult:
         from work_management_ai.runtime.contracts import (
             ProjectStatusResponseBlock,
             ReportResponseBlock,
@@ -162,7 +344,7 @@ class ReportingHarness:
                 raw = await runner.tool(
                     state,
                     "reporting.chat",
-                    cast(dict[str, JsonValue], intent.model_dump(mode="json")),
+                    cast(dict[str, JsonValue], (exact_snapshot or intent).model_dump(mode="json")),
                 )
                 if raw.get("resolution") != "UNIQUE":
                     return AgentResult(
@@ -184,14 +366,29 @@ class ReportingHarness:
                     )
                 if intent.operation == "PREPARE_REPORT":
                     card = ReportResponseBlock.model_validate(raw["card"])
+                    factual_only = include_generation and raw.get("generation_id") is None
                     return AgentResult(
                         agent_id=AgentId.REPORTING,
                         agent_version="1.0.0",
-                        status=AgentRunStatus.AWAITING_HUMAN,
-                        typed_output={"card": cast(JsonValue, card.model_dump(mode="json"))},
+                        status=AgentRunStatus.COMPLETED
+                        if factual_only
+                        else AgentRunStatus.AWAITING_HUMAN,
+                        interaction_outcome=InteractionOutcome.DRAFT_READY
+                        if factual_only
+                        else None,
+                        typed_output={
+                            "card": cast(JsonValue, card.model_dump(mode="json")),
+                            **(
+                                {"generation_id": raw["generation_id"]}
+                                if include_generation and raw.get("generation_id")
+                                else {}
+                            ),
+                        },
                         iterations_used=1,
                         tool_calls_used=state.tools,
-                        stop_reason="AWAITING_MANAGER_REVIEW",
+                        stop_reason="METRICS_ONLY_READY"
+                        if factual_only
+                        else "AWAITING_MANAGER_REVIEW",
                     )
                 context = ReportingContext.model_validate(raw["context"])
                 card = ProjectStatusResponseBlock.model_validate(raw["card"])
@@ -199,6 +396,11 @@ class ReportingHarness:
                     context.snapshot.organization_id != handoff.actor.organization_id
                     or not context.snapshot.verified_hash()
                     or context.snapshot.snapshot_hash != card.snapshot_hash
+                    or (
+                        exact_snapshot is not None
+                        and (card.snapshot_id, card.snapshot_hash)
+                        != (exact_snapshot.snapshot_id, exact_snapshot.snapshot_fingerprint)
+                    )
                 ):
                     raise ValueError("STATUS_CONTEXT_MISMATCH")
                 try:

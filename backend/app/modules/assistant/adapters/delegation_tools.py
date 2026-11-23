@@ -44,6 +44,7 @@ from work_management_ai.runtime.contracts import (
 from work_management_ai.runtime.delegation import (
     CanonicalWorkflowState,
     DelegationAdapter,
+    DelegationAdapterV2,
     DelegationToolBackend,
 )
 from work_management_ai.runtime.tool_loop_contracts import (
@@ -378,9 +379,13 @@ class PostgreSQLWorkflowWaitVerifier(_ScopedReceiptReader):
 class BackendDelegationTool:
     """Fenced candidate tool backend bridging delegate_agent to Specialists and receipts."""
 
-    def __init__(self, *, actor: AuthenticatedActor, adapter: DelegationAdapter) -> None:
+    def __init__(
+        self, *, actor: AuthenticatedActor, adapter: DelegationAdapter | DelegationAdapterV2
+    ) -> None:
         self._adapter = adapter
-        inner = DelegationToolBackend(adapter)
+        inner = (
+            adapter if isinstance(adapter, DelegationAdapterV2) else DelegationToolBackend(adapter)
+        )
         self._backend = ApplicationToolBackend(
             actor=actor,
             execute=inner.execute,
@@ -399,3 +404,9 @@ class BackendDelegationTool:
 
     async def revalidate_wait(self, context: ToolInvocationContext, wait: WaitReference) -> None:
         await self._adapter.revalidate_wait(context, wait)
+
+    async def revalidate_result(
+        self, context: ToolInvocationContext, result: BackendToolResult
+    ) -> None:
+        if isinstance(self._adapter, DelegationAdapterV2):
+            await self._adapter.revalidate_result(context, result)

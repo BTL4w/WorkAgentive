@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import cast
+from typing import Literal, cast
 from uuid import UUID
 
 from app.modules.assistant.domain.session import SessionError
@@ -19,6 +19,21 @@ DIMENSIONS = (
 )
 CAPS = dict(zip(DIMENSIONS, (8, 24, 12, 6, 48000, 8000, 4, 720000), strict=True))
 POOL_ID = UUID(int=0)
+
+type ChildJobKind = Literal["PLANNING", "REPORTING"]
+
+
+@dataclass(frozen=True, slots=True)
+class JobClaim:
+    kind: ChildJobKind
+    job_id: UUID
+    worker_id: str
+    attempt: int
+    lease_until: datetime
+
+    @property
+    def fencing_token(self) -> int:
+        return self.attempt
 
 
 def vector(**values: int) -> dict[str, int]:
@@ -95,6 +110,7 @@ class UsageEntry:
     settled: dict[str, int] | None = None
     settlement_fingerprint: str | None = None
     closed: bool = False
+    job_owned: bool = False
 
     @property
     def charge(self) -> dict[str, int]:

@@ -9,6 +9,12 @@ from uuid import UUID, uuid4
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core.execution_fence import (
+    assert_child_job_effect_fence,
+    assert_execution_fence,
+    bind_candidate_job,
+    child_job_actor,
+)
 from app.modules.audit.adapters.database_models import AuditEventModel
 from app.modules.audit.domain.events import AuditOutcome
 from app.modules.feedback.adapters.payload_repository import assert_context_live
@@ -92,6 +98,7 @@ async def enqueue_initial(
             status="PENDING",
         )
     )
+    await bind_candidate_job(session, "REPORTING", job.id)
     return job.id
 
 
@@ -544,6 +551,8 @@ class GenerationTransactions:
     async def __call__(
         self, actor: AuthenticatedActor | UUID
     ) -> AsyncGenerator[GenerationRepository]:
+        if isinstance(actor, UUID):
+            actor = child_job_actor(actor) or actor
         async with self.sessions() as session, session.begin():
             await session.execute(text("SET LOCAL ROLE app_runtime"))
             await session.execute(
@@ -560,4 +569,8 @@ class GenerationTransactions:
                     else "",
                 },
             )
+            if isinstance(actor, AuthenticatedActor):
+                await assert_child_job_effect_fence(session)
             yield cast(GenerationRepository, SQLGenerationRepository(session, actor, self.timezone))
+            if isinstance(actor, AuthenticatedActor):
+                await assert_execution_fence(session)

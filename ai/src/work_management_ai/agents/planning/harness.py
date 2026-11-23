@@ -1,5 +1,6 @@
 """Guarded proposal-only Planning Specialist Agent Harness."""
 
+import json
 from typing import cast
 from uuid import NAMESPACE_URL, uuid5
 
@@ -9,6 +10,7 @@ from work_management_ai.agents.orchestrator.contracts import ActorContextResolve
 from work_management_ai.agents.planning.contracts import (
     PlanningAgentInput,
     PlanningAgentOutput,
+    PlanningGoalChoice,
     PlanningOperation,
     PlanningStepPlan,
 )
@@ -24,15 +26,20 @@ from work_management_ai.agents.planning.workflows.graph import (
 )
 from work_management_ai.model_gateway.contracts import (
     ModelGateway,
+    ModelMessage,
     ModelRequestLimits,
     StructuredModelRequest,
 )
 from work_management_ai.model_gateway.errors import ModelGatewayError
 from work_management_ai.runtime.contracts import (
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
+    ContextReference,
+    GoalActionAccessPort,
+    GoalDirectedAgentResult,
     InteractionOutcome,
     JsonValue,
     ProposedAction,
@@ -41,7 +48,13 @@ from work_management_ai.runtime.contracts import (
     ToolExecutorPort,
     VerifierResult,
 )
-from work_management_ai.runtime.manifests import AgentManifest, ToolManifest, load_yaml_resource
+from work_management_ai.runtime.manifests import (
+    AgentManifest,
+    GoalDirectedAgentManifest,
+    ToolManifest,
+    load_yaml_resource,
+)
+from work_management_ai.runtime.policy_guard import AgentPolicyError, PolicyGuard
 
 _AGENT_PACKAGE = "work_management_ai.agents.planning"
 _TOOL_PACKAGE = "work_management_ai.tools.planning.manage_run"
@@ -63,15 +76,22 @@ class PlanningAgentHarness:
         model_gateway: ModelGateway,
         tool_executor: ToolExecutorPort,
         actor_resolver: ActorContextResolverPort,
+        goal_access: GoalActionAccessPort | None = None,
     ) -> None:
         self._model_gateway = model_gateway
         self._tool_executor = tool_executor
         self._actor_resolver = actor_resolver
+        self._goal_access = goal_access
         self._manifest = load_yaml_resource(_AGENT_PACKAGE, "agent.yaml", AgentManifest)
+        self._goal_manifest = load_yaml_resource(
+            _AGENT_PACKAGE, "agent.v2.yaml", GoalDirectedAgentManifest
+        )
         self._skill_loader = PlanningSkillLoader()
         self._graph = PlanningAgentGraph(self)
 
-    async def run(self, handoff: AgentHandoff) -> AgentResult:
+    async def run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
+        if isinstance(handoff, AgentHandoffV2):
+            return await self._run_goal(handoff)
         return await self._graph.run(
             PlanningAgentState(
                 handoff=handoff,
@@ -90,6 +110,174 @@ class PlanningAgentHarness:
                 tool_calls_used=0,
                 model_refs=(),
             )
+        )
+
+    async def _run_goal(self, goal: AgentHandoffV2) -> GoalDirectedAgentResult:
+        version = self._goal_manifest.agent.version
+        try:
+            actor = await self._actor_resolver.resolve(goal.actor)
+            PolicyGuard().authorize_goal_action(
+                current_actor=actor,
+                handoff=goal,
+                manifest=self._goal_manifest,
+                resolved_action="planning.create",
+                action_risk=RiskLevel.PROPOSAL_ONLY,
+            )
+            if any(ref.organization_id != actor.organization_id for ref in goal.context_references):
+                raise ValueError("PLANNING_CONTEXT_TENANT_MISMATCH")
+            if goal.context_references:
+                if self._goal_access is None:
+                    raise ValueError("PLANNING_CONTEXT_UNAVAILABLE")
+                await self._goal_access.verify(goal)
+            choice = (
+                await self._model_gateway.generate_structured(
+                    StructuredModelRequest(
+                        invocation_key=f"planning_agent.{goal.locale}.goal_intake",
+                        output_schema=PlanningGoalChoice,
+                        timeout_seconds=min(goal.budget.timeout_seconds, 30),
+                        max_output_tokens=300,
+                        messages=(
+                            ModelMessage(
+                                role="system",
+                                content=(
+                                    "Choose a Planning operation for this goal. Ask for "
+                                    "clarification by returning a null operation when intent "
+                                    "or the target is unclear. Return an anchor date only if "
+                                    "specified. Existing operations require the matching "
+                                    "workflow and exact draft or proposal where applicable."
+                                ),
+                            ),
+                            ModelMessage(
+                                role="user",
+                                content=json.dumps(
+                                    {
+                                        "goal": goal.brief.model_dump(mode="json"),
+                                        "available_resource_types": [
+                                            ref.resource_type for ref in goal.context_references
+                                        ],
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            ),
+                        ),
+                    )
+                )
+            ).parsed
+        except (AgentPolicyError, ModelGatewayError, ValueError):
+            return GoalDirectedAgentResult(
+                agent_id=AgentId.PLANNING,
+                agent_version=version,
+                status=AgentRunStatus.FAILED,
+                typed_output={"fallback": "manual_editable"},
+                stop_reason="PLANNING_GOAL_UNAVAILABLE",
+            )
+        try:
+            value = self._bind_goal_choice(goal, choice)
+        except ValidationError:
+            value = None
+        if value is None:
+            return GoalDirectedAgentResult(
+                agent_id=AgentId.PLANNING,
+                agent_version=version,
+                status=AgentRunStatus.AWAITING_INPUT,
+                interaction_outcome=InteractionOutcome.NEEDS_INPUT,
+                typed_output={
+                    "question": (
+                        "Bạn muốn lập kế hoạch mới hay làm tiếp một kế hoạch cụ thể?"
+                        if goal.locale == "vi"
+                        else "Should I create a new plan or work on a specific existing plan?"
+                    )
+                },
+                model_attempts_used=1,
+                stop_reason="PLANNING_GOAL_NEEDS_INPUT",
+            )
+        action = _CAPABILITY_BY_OPERATION[value.operation]
+        try:
+            actor = await self._actor_resolver.resolve(goal.actor)
+            PolicyGuard().authorize_goal_action(
+                current_actor=actor,
+                handoff=goal,
+                manifest=self._goal_manifest,
+                resolved_action=action,
+                action_risk=RiskLevel.PROPOSAL_ONLY,
+                requested_tool_ids=("planning.manage_run@1",),
+                requested_skill_ids=(
+                    "revise_project_plan@1"
+                    if value.operation is PlanningOperation.REVISE
+                    else "create_project_plan@1",
+                ),
+            )
+            if goal.context_references and self._goal_access is not None:
+                await self._goal_access.verify(goal)
+        except ValueError:
+            return GoalDirectedAgentResult(
+                agent_id=AgentId.PLANNING,
+                agent_version=version,
+                status=AgentRunStatus.FAILED,
+                typed_output={"fallback": "manual_editable"},
+                stop_reason="PLANNING_CONTEXT_CHANGED",
+                model_attempts_used=1,
+            )
+        carried = goal.model_dump(
+            exclude={
+                "schema_version",
+                "target_agent_version",
+                "brief",
+                "source_turn_ref",
+                "locale",
+                "timezone",
+            }
+        )
+        legacy = AgentHandoff.model_validate(
+            {
+                **carried,
+                "target_agent_version": self._manifest.agent.version,
+                "objective": goal.brief.objective,
+                "capability": action,
+                "typed_input": value.model_dump(mode="json"),
+            }
+        )
+        result = await self.run(legacy)
+        return GoalDirectedAgentResult.model_validate(
+            {
+                **result.model_dump(),
+                "agent_version": version,
+                "resolved_action": action,
+                "model_attempts_used": 1,
+            }
+        )
+
+    @staticmethod
+    def _bind_goal_choice(
+        goal: AgentHandoffV2,
+        choice: PlanningGoalChoice,
+    ) -> PlanningAgentInput | None:
+        operation = choice.operation
+        if operation is None:
+            return None
+        related: dict[str, ContextReference] = {}
+        for ref in goal.context_references:
+            kind = ref.resource_type.casefold()
+            if kind not in {"workflow_run", "draft", "proposal"}:
+                continue
+            if kind in related or ref.version is None:
+                return None
+            related[kind] = ref
+        workflow = related.get("workflow_run")
+        draft = related.get("draft")
+        proposal = related.get("proposal")
+        return PlanningAgentInput(
+            operation=operation,
+            locale=goal.locale,
+            brief=goal.brief.objective,
+            progressive=True,
+            workflow_run_id=workflow.resource_id if workflow is not None else None,
+            draft_id=draft.resource_id if draft is not None else None,
+            expected_draft_version=draft.version if draft is not None else None,
+            proposal_id=proposal.resource_id if proposal is not None else None,
+            expected_proposal_version=proposal.version if proposal is not None else None,
+            manager_instruction=goal.brief.objective,
+            anchor_date=choice.anchor_date,
         )
 
     async def receive_handoff(self, state: PlanningAgentState) -> dict[str, object]:

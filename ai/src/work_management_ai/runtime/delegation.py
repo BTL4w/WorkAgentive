@@ -143,6 +143,31 @@ class WorkflowWaitVerifierPort(Protocol):
     ) -> UUID | None: ...
 
 
+class ChildJobReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    resource_id: UUID
+    resolved_action: Literal[
+        "planning.create", "planning.resume", "planning.revise", "reporting.prepare_report"
+    ]
+
+
+class ChildJobReceiptsPort(Protocol):
+    async def recover_job(
+        self,
+        scope: RunScope,
+        *,
+        allocation_id: UUID,
+        child_run_id: UUID,
+        target: VersionPin,
+    ) -> ChildJobReceipt | None: ...
+
+    async def verify_reporting_job(
+        self,
+        scope: RunScope,
+        generation_id: UUID,
+    ) -> CanonicalWorkflowState | None: ...
+
+
 def filtered_delegate_tool_schema(
     base_schema: ToolSchema,
     *,
@@ -576,6 +601,8 @@ async def _inline_child_budget(
     allocation_id: UUID,
     child_budget: AgentBudget,
     brief: DelegationBrief,
+    *,
+    allow_job: bool = False,
 ) -> AsyncGenerator[None]:
     try:
         rem = await binding.store.remaining(context.scope)
@@ -588,8 +615,8 @@ async def _inline_child_budget(
             handoffs=0,
             input_tokens=min(child_budget.max_input_tokens, rem.available.input_tokens),
             output_tokens=min(child_budget.max_output_tokens, rem.available.output_tokens),
-            segments=1,
-            active_seconds=float(context.limits.segment_seconds),
+            segments=2 if allow_job else 1,
+            active_seconds=float(context.limits.segment_seconds * (2 if allow_job else 1)),
         )
         if (
             (allowance.total_model_requests == 0 and allowance.total_tool_calls == 0)
@@ -1071,6 +1098,7 @@ class DelegationAdapterV2:
         activation: ActivationContext | None = None,
         references: DelegationReferencesPort | None = None,
         workflow_verifier: WorkflowWaitVerifierPort | None = None,
+        child_job_receipts: ChildJobReceiptsPort | None = None,
     ) -> None:
         self._scope = scope
         self._parent_id = parent_agent_run_id
@@ -1091,6 +1119,7 @@ class DelegationAdapterV2:
         self._activation = activation
         self._references = references
         self._workflow_verifier = workflow_verifier
+        self._child_jobs = child_job_receipts
 
     def _target(
         self, agent_id: AgentId
@@ -1188,7 +1217,12 @@ class DelegationAdapterV2:
             raise DelegationError("DELEGATION_PEER_FORBIDDEN", stop_segment=True)
         allocation_id = uuid5(context.receipt_id, "child-budget")
         async with _inline_child_budget(
-            context, binding, allocation_id, handoff.budget, handoff.brief
+            context,
+            binding,
+            allocation_id,
+            handoff.budget,
+            handoff.brief,
+            allow_job=handoff.target_agent_id in {AgentId.PLANNING, AgentId.REPORTING},
         ):
             record = await runner.run(handoff)
         return await self._normalize(context, manifest, record)
@@ -1208,6 +1242,31 @@ class DelegationAdapterV2:
     ) -> BackendToolResult | None:
         handoff, manifest, runner = await self._prepare(context, arguments)
         record = await runner.reconcile(handoff)
+        if record is None and self._child_jobs is not None:
+            child_id = uuid5(NAMESPACE_URL, f"agent-run:{handoff.idempotency_key}")
+            committed = await self._child_jobs.recover_job(
+                context.scope,
+                allocation_id=uuid5(context.receipt_id, "child-budget"),
+                child_run_id=child_id,
+                target=self._pins[handoff.target_agent_id.value],
+            )
+            if committed is not None:
+                key = (
+                    "generation_id"
+                    if handoff.target_agent_id is AgentId.REPORTING
+                    else "workflow_run_id"
+                )
+                record = (
+                    child_id,
+                    GoalDirectedAgentResult(
+                        agent_id=handoff.target_agent_id,
+                        agent_version=handoff.target_agent_version,
+                        status=AgentRunStatus.AWAITING_HUMAN,
+                        typed_output={key: str(committed.resource_id)},
+                        resolved_action=committed.resolved_action,
+                        stop_reason="DELEGATION_JOB_RECOVERED",
+                    ),
+                )
         if record is None:
             return None
         return await self._normalize(context, manifest, record)
@@ -1215,21 +1274,23 @@ class DelegationAdapterV2:
     async def revalidate_result(
         self, context: ToolInvocationContext, result: BackendToolResult
     ) -> None:
-        handoff, manifest, runner = await self._prepare(context, context.canonical_arguments)
-        if not isinstance(result.output, DelegateAgentOutputV2):
-            raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
-        value = result.output
-        if (value.agent_id, value.agent_version) != (
-            manifest.agent.id,
-            manifest.agent.version,
-        ) or value.resolved_action not in manifest.capabilities:
-            raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
-        if value.agent_id is AgentId.RISK:
-            record = await runner.reconcile(handoff)
-            if record is None or await self._normalize(context, manifest, record) != result:
+        refs = result.evidence
+        if result.wait_ref is not None:
+            await self.revalidate_wait(context, result.wait_ref)
+        else:
+            handoff, manifest, runner = await self._prepare(context, context.canonical_arguments)
+            value = result.output
+            if not isinstance(value, DelegateAgentOutputV2) or (
+                (value.agent_id, value.agent_version) != (manifest.agent.id, manifest.agent.version)
+                or value.resolved_action not in manifest.capabilities
+            ):
                 raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
-            return
-        refs = tuple(dict.fromkeys((*result.evidence, *value.evidence, *value.artifact_refs)))
+            if value.agent_id is AgentId.RISK:
+                record = await runner.reconcile(handoff)
+                if record is None or await self._normalize(context, manifest, record) != result:
+                    raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+                return
+            refs = tuple(dict.fromkeys((*refs, *value.evidence, *value.artifact_refs)))
         if refs:
             if self._references is None:
                 raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=True)
@@ -1253,11 +1314,19 @@ class DelegationAdapterV2:
         if action is not None and action not in manifest.capabilities:
             raise DelegationError("DELEGATION_CAPABILITY_MISMATCH", stop_segment=True)
         workflow_id = _uuid_field(result.typed_output, "workflow_run_id")
-        workflow = (
-            await self._workflow_verifier.verify_workflow(context.scope, workflow_id)
-            if self._workflow_verifier is not None and workflow_id is not None
-            else None
-        )
+        generation_id = _uuid_field(result.typed_output, "generation_id")
+        workflow = None
+        if manifest.agent.id is AgentId.REPORTING and generation_id is not None:
+            if self._child_jobs is None:
+                raise DelegationError("DELEGATION_WAIT_UNVERIFIED", stop_segment=True)
+            workflow = await self._child_jobs.verify_reporting_job(context.scope, generation_id)
+            result = result.model_copy(
+                update={
+                    "typed_output": {**result.typed_output, "workflow_run_id": str(generation_id)},
+                }
+            )
+        elif self._workflow_verifier is not None and workflow_id is not None:
+            workflow = await self._workflow_verifier.verify_workflow(context.scope, workflow_id)
         output, wait, failure = _normalize_to_parts(
             context.scope,
             result,

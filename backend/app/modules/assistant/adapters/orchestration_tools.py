@@ -42,6 +42,7 @@ class ApplicationToolBackend:
             lease=session_lease(context.lease),
             operation_id=context.receipt_id,
             interval_id=binding.interval_id,
+            allow_job_enqueue=context.tool_reference == "delegate_agent@2",
         )
 
     async def execute(

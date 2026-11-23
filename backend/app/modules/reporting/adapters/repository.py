@@ -369,6 +369,17 @@ class SQLReportRepository:
             }
         )
 
+    async def get_by_snapshot(self, snapshot_id: UUID) -> ReportResult:
+        report_id = await self.session.scalar(
+            select(ReportModel.id).where(
+                ReportModel.organization_id == self.org,
+                ReportModel.snapshot_id == snapshot_id,
+            )
+        )
+        if report_id is None:
+            raise ReportError("RESOURCE_NOT_FOUND", 404)
+        return await self.get(report_id)
+
     async def get(
         self, report_id: UUID, *, replayed: bool = False, version_id: UUID | None = None
     ) -> ReportResult:

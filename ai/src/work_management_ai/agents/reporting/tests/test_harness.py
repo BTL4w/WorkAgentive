@@ -1,5 +1,6 @@
 """Real specialist handoffs with deterministic gateway and application-port doubles."""
 
+from datetime import UTC, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -14,8 +15,12 @@ from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentBudget,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentRunStatus,
+    ContextReference,
+    DelegationBrief,
+    GoalDirectedAgentResult,
     ResolvedActorContext,
     ToolExecutionRequest,
     ToolExecutionResult,
@@ -106,6 +111,67 @@ def verdict(doc: dict[str, Any], *, grounded: bool = True) -> dict[str, Any]:
         ],
         safe_codes=[],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["MANAGER", "EMPLOYEE"])
+async def test_reporting_goal_binds_weekly_project_intent_before_tool(role: str):
+    _, legacy, actors, _ = setup(role=role)
+    project_ref = ContextReference(
+        reference_id=uuid4(),
+        organization_id=legacy.actor.organization_id,
+        resource_type="project",
+        resource_id=uuid4(),
+        version=2,
+        observed_at=datetime.now(UTC),
+    )
+    goal = AgentHandoffV2.model_validate(
+        {
+            **legacy.model_dump(
+                exclude={"schema_version", "typed_input", "objective", "capability"}
+            ),
+            "target_agent_version": "1.1.0",
+            "locale": "en",
+            "timezone": "Asia/Ho_Chi_Minh",
+            "source_turn_ref": uuid4(),
+            "context_references": (project_ref,),
+            "brief": DelegationBrief(objective="Prepare a weekly report", expected_result="Draft"),
+        }
+    )
+    calls: list[ToolExecutionRequest] = []
+
+    class Access:
+        async def verify(self, handoff: AgentHandoffV2) -> None:
+            assert handoff.context_references == (project_ref,)
+
+    class Chats:
+        async def execute(self, request: ToolExecutionRequest) -> ToolExecutionResult:
+            calls.append(request)
+            return ToolExecutionResult(
+                status="SUCCEEDED", typed_output={"resolution": "AMBIGUOUS", "candidates": []}
+            )
+
+    result = await ReportingHarness(
+        model_gateway=MockModelGateway(
+            fixtures={
+                "reporting.en.goal_intake": {"operation": "PREPARE_REPORT", "kind": "WEEKLY"},
+            }
+        ),
+        tool_executor=Chats(),
+        actor_resolver=actors,
+        goal_access=Access(),
+    ).run(goal)
+    assert isinstance(result, GoalDirectedAgentResult)
+    if role == "MANAGER":
+        assert result.resolved_action == "reporting.prepare_report"
+        assert result.status is AgentRunStatus.AWAITING_INPUT
+        assert len(calls) == 1
+        assert calls[0].typed_input["project_reference"] == str(project_ref.resource_id)
+        assert calls[0].typed_input["kind"] == "WEEKLY"
+        assert calls[0].typed_input["timezone"] == goal.timezone
+    else:
+        assert result.status is AgentRunStatus.FAILED
+        assert not calls
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,11 @@ class PlanningOperation(StrEnum):
     PREPARE_ACTION = "PREPARE_ACTION"
 
 
+class PlanningGoalChoice(_StrictFrozenModel):
+    operation: PlanningOperation | None
+    anchor_date: date | None = None
+
+
 class PlanningAgentInput(_StrictFrozenModel):
     retrieval_context_refs: tuple[SourceBinding, ...] = Field(default=(), max_length=8)
     progressive: bool = False

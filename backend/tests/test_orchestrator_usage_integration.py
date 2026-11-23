@@ -2,18 +2,28 @@
 
 import asyncio
 import os
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
 
+from app.core.execution_fence import ExecutionFenceContext, WorkflowJobFence, execution_fence
 from app.modules.assistant.adapters.session_usage import PostgreSQLRunBudget
+from app.modules.assistant.adapters.tool_loop_recorder import session_scope
 from app.modules.assistant.domain.session import SessionError
+from app.modules.assistant.domain.session_usage import JobClaim
+from app.modules.planning_runs.adapters.transaction import PostgreSQLPlanningRunTransactionFactory
 from tests.test_orchestrator_session_log_integration import Journal
 from tests.test_orchestrator_session_log_integration import journal as journal
 from work_management_ai.model_gateway.contracts import ModelUsage
-from work_management_ai.runtime.run_budget import BudgetReceipt, ChildAllocation, UsageReservation
+from work_management_ai.runtime.run_budget import (
+    BudgetReceipt,
+    ChildAllocation,
+    ChildJobClaim,
+    UsageReservation,
+)
 from work_management_ai.runtime.tool_loop_contracts import RunLease, RunScope, ToolLoopUsage
 
 pytestmark = [
@@ -23,6 +33,198 @@ pytestmark = [
 
 
 foreign_journal = journal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_job_budget_survives_parent_expiry_and_denies_reclaimed_attempt(
+    journal: Journal,
+    foreign_journal: Journal,
+    interrupted: bool,
+):
+    engine, sessions, actor, _, scope, lease, _, _ = journal
+    store = PostgreSQLRunBudget(sessions, actor)
+    allocation = ChildAllocation(
+        allocation_id=uuid4(),
+        allowance=ToolLoopUsage(
+            total_model_requests=2,
+            total_tool_calls=1,
+            input_tokens=500,
+            output_tokens=200,
+            segments=1,
+            active_seconds=180,
+        ),
+    )
+    await store.allocate_child(scope, allocation, lease=lease)
+    job_id, workflow_id = uuid4(), uuid4()
+    deadline = datetime.now(UTC) + timedelta(minutes=3)
+    async with engine.begin() as conn:
+        ids = {
+            "org": scope.organization_id,
+            "actor": scope.membership_id,
+            "workflow": workflow_id,
+            "job": job_id,
+            "deadline": deadline,
+        }
+        await conn.execute(
+            text(
+                "INSERT INTO workflow_runs (id,organization_id,requested_by_membership_id,status,"
+                "workflow_name,workflow_version,verifier_version,input_goal_text) "
+                "VALUES (:workflow,:org,:actor,'RUNNING','project_planning','1.0.0','1.0.0','Test')"
+            ),
+            ids,
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO workflow_jobs (id,organization_id,workflow_run_id,job_type,status,"
+                "payload,attempt_count,locked_by_worker_id,lease_until) "
+                "VALUES (:job,:org,:workflow,'test','RUNNING','{}',1,'worker',:deadline)"
+            ),
+            ids,
+        )
+    await store.bind_job(scope, allocation.allocation_id, "PLANNING", job_id, lease=lease)
+    await store.close_child(scope, allocation.allocation_id, lease=lease)
+    _, foreign_sessions, foreign_actor, _, _, _, _, _ = foreign_journal
+    async with foreign_sessions() as foreign, foreign.begin():
+        await foreign.execute(text("SET LOCAL ROLE app_runtime"))
+        await foreign.execute(
+            text(
+                "SELECT set_config('app.organization_id',:org,true), "
+                "set_config('app.membership_id',:actor,true)"
+            ),
+            {"org": str(foreign_actor.organization_id), "actor": str(foreign_actor.membership_id)},
+        )
+        assert (
+            await foreign.scalar(
+                text("SELECT count(*) FROM orchestration_child_jobs WHERE organization_id=:org"),
+                {"org": scope.organization_id},
+            )
+            == 0
+        )
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE orchestration_runtime_states "
+                "SET lease_until=clock_timestamp()-interval '1 second' "
+                "WHERE organization_id=:org AND orchestration_run_id=:run"
+            ),
+            {"org": scope.organization_id, "run": scope.orchestration_run_id},
+        )
+    claim = ChildJobClaim(
+        kind="PLANNING",
+        job_id=job_id,
+        worker_id="worker",
+        attempt=1,
+        lease_until=deadline,
+    )
+    assert await store.job_scope(claim) == (scope, allocation.allocation_id)
+    with pytest.raises(SessionError, match="SESSION_NOT_FOUND"):
+        await PostgreSQLRunBudget(foreign_sessions, foreign_actor).job_scope(claim)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memberships SET is_active=false WHERE organization_id=:org AND id=:actor"),
+            ids,
+        )
+    with pytest.raises(SessionError, match="SESSION_NOT_FOUND"):
+        await store.job_scope(claim)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memberships SET is_active=true WHERE organization_id=:org AND id=:actor"),
+            ids,
+        )
+    active = await store.reserve_for_job(
+        scope,
+        allocation.allocation_id,
+        job_claim_token=claim,
+        reservation=UsageReservation(kind="INTERVAL", allocation_id=allocation.allocation_id),
+    )
+    receipt = await store.reserve_for_job(
+        scope,
+        allocation.allocation_id,
+        job_claim_token=claim,
+        reservation=UsageReservation(
+            kind="MODEL",
+            allocation_id=allocation.allocation_id,
+            interval_id=active.reservation.operation_id,
+            input_tokens=30,
+            output_tokens=20,
+        ),
+    )
+    await store.settle_for_job(scope, receipt, ModelUsage(input_tokens=20, output_tokens=10))
+    effect = await store.reserve_for_job(
+        scope,
+        allocation.allocation_id,
+        job_claim_token=claim,
+        reservation=UsageReservation(
+            kind="TOOL",
+            allocation_id=allocation.allocation_id,
+            interval_id=active.reservation.operation_id,
+        ),
+    )
+    fence = ExecutionFenceContext(
+        actor=actor,
+        scope=session_scope(scope),
+        lease=None,
+        operation_id=effect.reservation.operation_id,
+        interval_id=active.reservation.operation_id,
+        workflow=WorkflowJobFence(
+            allocation_id=allocation.allocation_id,
+            claim=JobClaim("PLANNING", job_id, "worker", 1, deadline),
+        ),
+    )
+    transactions = PostgreSQLPlanningRunTransactionFactory(sessions)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memberships SET role='EMPLOYEE' WHERE organization_id=:org AND id=:actor"),
+            ids,
+        )
+    with pytest.raises(SessionError, match="SESSION_NOT_FOUND"), execution_fence(fence):
+        async with transactions(actor) as transaction:
+            await transaction.commit()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE memberships SET role='MANAGER' WHERE organization_id=:org AND id=:actor"),
+            ids,
+        )
+    with execution_fence(fence):
+        async with transactions(actor) as transaction:
+            await transaction.session.execute(
+                text(
+                    "UPDATE workflow_runs SET updated_at=clock_timestamp() "
+                    "WHERE organization_id=:org AND id=:workflow"
+                ),
+                ids,
+            )
+            await transaction.commit()
+    await store.settle_for_job(scope, effect, None)
+    if not interrupted:
+        await store.settle_for_job(scope, active, None)
+        await store.close_for_job(scope, allocation.allocation_id, claim)
+        assert (await store.remaining(scope)).available.total_model_requests == 23
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE workflow_jobs SET attempt_count=2 WHERE organization_id=:org AND id=:job"),
+            ids,
+        )
+    if interrupted:
+        reclaimed = claim.model_copy(update={"attempt": 2})
+        await store.close_for_job(scope, allocation.allocation_id, reclaimed)
+        remaining = await store.remaining(scope)
+        assert remaining.available.total_model_requests == 23
+        assert remaining.usage.active_seconds == 180
+    with pytest.raises(SessionError, match="WORKFLOW_LEASE_LOST"), execution_fence(fence):
+        async with transactions(actor) as transaction:
+            await transaction.commit()
+    with pytest.raises(SessionError, match="WORKFLOW_LEASE_LOST"):
+        await store.settle_for_job(scope, receipt, ModelUsage(input_tokens=20, output_tokens=10))
+    with pytest.raises(SessionError, match="WORKFLOW_LEASE_LOST"):
+        await store.reserve_for_job(
+            scope,
+            allocation.allocation_id,
+            job_claim_token=claim,
+            reservation=UsageReservation(kind="INTERVAL", allocation_id=allocation.allocation_id),
+        )
+    assert (await store.remaining(scope)).usage.total_model_requests == 1
 
 
 async def interval(

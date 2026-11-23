@@ -27,6 +27,20 @@ class Contract(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class ReportingGoalChoice(Contract):
+    operation: Literal["PREPARE_REPORT", "EXPLAIN_STATUS"] | None
+    kind: Literal["DAILY", "WEEKLY"] = "DAILY"
+    relative_period: Literal["CURRENT", "PREVIOUS"] = "CURRENT"
+    period_start: date | None = None
+
+
+class GoalReportSnapshotQuery(Contract):
+    operation: Literal["EXACT_SNAPSHOT"] = "EXACT_SNAPSHOT"
+    snapshot_id: UUID
+    snapshot_fingerprint: str = Field(pattern=r"^[a-f0-9]{64}$")
+    locale: Literal["vi", "en"]
+
+
 class ReportingPeriod(Contract):
     kind: Literal["DAILY", "WEEKLY"]
     local_start: date

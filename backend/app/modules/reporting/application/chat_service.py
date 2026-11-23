@@ -9,7 +9,7 @@ from app.modules.identity.domain.auth import AuthenticatedActor
 from app.modules.work.application.project_service import ProjectService
 from app.modules.work.domain.projects import ProjectNotFoundError
 from work_management_ai.agents.orchestrator.contracts import ReportIntent
-from work_management_ai.agents.reporting.contracts import ReportingSnapshot
+from work_management_ai.agents.reporting.contracts import GoalReportSnapshotQuery, ReportingSnapshot
 from work_management_ai.runtime.contracts import ProjectStatusResponseBlock, ReportResponseBlock
 
 from ..domain.commands import CaptureReportCommand, CreateReportCommand
@@ -63,6 +63,36 @@ def summary(snapshot: Any, label: str) -> dict[str, Any]:
 class ReportChatService:
     def __init__(self, *, reports: ReportService, projects: ProjectService):
         self.reports, self.projects = reports, projects
+
+    async def exact_snapshot(
+        self,
+        *,
+        actor: AuthenticatedActor,
+        value: GoalReportSnapshotQuery,
+        context_run_id: UUID,
+    ) -> dict[str, Any]:
+        async with self.reports.transactions(actor) as repo:
+            await repo.authenticate()
+            result = await repo.get_by_snapshot(value.snapshot_id)
+        snapshot = result.snapshot
+        if snapshot.id != value.snapshot_id or snapshot.snapshot_hash != value.snapshot_fingerprint:
+            raise ReportError("STALE_REPORT_VERSION", 412)
+        project = await self.projects.get_project(actor=actor, project_id=snapshot.project_id)
+        card = ProjectStatusResponseBlock.model_validate(
+            {**summary(snapshot, project.name), "context_run_id": context_run_id}
+        )
+        return {
+            "resolution": "UNIQUE",
+            "card": card.model_dump(mode="json"),
+            "context": {
+                "snapshot": ReportingSnapshot.model_validate(
+                    snapshot.model_dump(mode="json")
+                ).model_dump(mode="json"),
+                "base_version_id": str(result.selected_version.id),
+                "locale": value.locale,
+                "project_label": project.name[:200],
+            },
+        }
 
     async def prepare(
         self,
@@ -127,7 +157,11 @@ class ReportChatService:
                     ),
                 }
             )
-            return dict(resolution="UNIQUE", card=card.model_dump(mode="json"))
+            return dict(
+                resolution="UNIQUE",
+                card=card.model_dump(mode="json"),
+                generation_id=str(result.generation_id) if result.generation_id else None,
+            )
         async with self.reports.transactions(actor) as repo:
             await repo.authenticate()
             await repo.authorize_project(project.id)

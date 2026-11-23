@@ -8,12 +8,14 @@ import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.modules.assistant.adapters.reporting_tools import ReportChatService
+from app.modules.reporting.domain.reports import ReportError
 from app.modules.work.adapters.project_repository import SqlAlchemyProjectTransactionFactory
 from app.modules.work.application.project_service import ProjectService
 from tests.test_report_api_integration import (
     ReportHarness,
     report_harness,  # noqa: F401
 )
+from work_management_ai.agents.reporting.contracts import GoalReportSnapshotQuery
 
 
 @pytest.mark.integration
@@ -49,6 +51,20 @@ async def test_prepare_report_returns_exact_card(report_harness: ReportHarness):
     assert stored.snapshot.period.local_start.weekday() == 0
     assert len(card["metrics"]) <= 6
     assert len(card["sources"]) <= 8
+    reference = GoalReportSnapshotQuery(
+        snapshot_id=stored.snapshot.id,
+        snapshot_fingerprint=stored.snapshot.snapshot_hash,
+        locale="en",
+    )
+    exact = await service.exact_snapshot(actor=h.actor, value=reference, context_run_id=uuid4())
+    assert exact["card"]["snapshot_id"] == str(stored.snapshot.id)
+    assert exact["context"]["snapshot"]["snapshot_hash"] == stored.snapshot.snapshot_hash
+    with pytest.raises(ReportError, match="STALE_REPORT_VERSION"):
+        await service.exact_snapshot(
+            actor=h.actor,
+            value=reference.model_copy(update={"snapshot_fingerprint": "a" * 64}),
+            context_run_id=uuid4(),
+        )
 
 
 @pytest.mark.integration

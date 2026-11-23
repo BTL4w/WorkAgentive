@@ -63,7 +63,8 @@ class ReportStatusContexts:
                 (
                     r.typed_output
                     for r in rows
-                    if r.typed_input.get("operation") in {"PREPARE_REPORT", "EXPLAIN_STATUS"}
+                    if r.typed_input.get("operation")
+                    in {"PREPARE_REPORT", "EXPLAIN_STATUS", "EXACT_SNAPSHOT"}
                 ),
                 None,
             )

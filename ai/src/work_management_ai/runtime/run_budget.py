@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from typing import Literal, Protocol, Self
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from work_management_ai.model_gateway.contracts import (
     ModelGateway,
@@ -81,6 +81,22 @@ class BudgetReceipt(_Contract):
     seconds_remaining: float = Field(default=30, gt=0, le=180)
 
 
+class ChildJobClaim(_Contract):
+    kind: Literal["PLANNING", "REPORTING"]
+    job_id: UUID
+    worker_id: str = Field(min_length=1, max_length=128)
+    attempt: int = Field(gt=0, strict=True)
+    lease_until: AwareDatetime
+
+
+class JobBudgetReceipt(_Contract):
+    scope: RunScope
+    claim: ChildJobClaim
+    reservation: UsageReservation
+    replayed: bool = False
+    seconds_remaining: float = Field(gt=0, le=180)
+
+
 class ChildAllocation(_Contract):
     allocation_id: UUID
     allowance: ToolLoopUsage
@@ -117,6 +133,49 @@ class RunBudgetPort(Protocol):
         self, scope: RunScope, receipt: BudgetReceipt, usage: ModelUsage | None
     ) -> None: ...
     async def remaining(self, scope: RunScope) -> RemainingBudget: ...
+
+
+class ChildJobBudgetPort(Protocol):
+    async def reserve_for_job(
+        self,
+        scope: RunScope,
+        allocation_id: UUID,
+        *,
+        job_claim_token: ChildJobClaim,
+        reservation: UsageReservation,
+    ) -> JobBudgetReceipt: ...
+    async def settle_for_job(
+        self,
+        scope: RunScope,
+        receipt: JobBudgetReceipt,
+        usage: ModelUsage | None,
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class ChildJobBudget:
+    scope: RunScope
+    allocation_id: UUID
+    claim: ChildJobClaim
+    store: ChildJobBudgetPort
+    interval_id: UUID
+    model_output_cap: int | None = None
+    operation_id: UUID | None = None
+    retry_of: UUID | None = None
+    repair_of: UUID | None = None
+    delegation_brief: DelegationBrief | None = None
+
+
+_CHILD_JOB: ContextVar[ChildJobBudget | None] = ContextVar("child_job_budget", default=None)
+
+
+@contextmanager
+def child_job_budget(binding: ChildJobBudget) -> Generator[None]:
+    token = _CHILD_JOB.set(binding)
+    try:
+        yield
+    finally:
+        _CHILD_JOB.reset(token)
 
 
 @dataclass(frozen=True)
@@ -202,41 +261,59 @@ class BudgetedToolLoopGateway:
         self.gateway, self.native = gateway, native
         self.image_token_bound = image_token_bound
 
-    async def _reserve(self, context: CandidateBudget, inputs: int, outputs: int) -> BudgetReceipt:
-        receipt = await context.store.reserve(
-            context.scope,
-            UsageReservation(
-                operation_id=context.operation_id or uuid4(),
-                kind="MODEL",
-                allocation_id=context.allocation_id,
-                interval_id=context.interval_id,
-                input_tokens=inputs,
-                output_tokens=outputs,
-                retry_of=context.retry_of,
-                repair_of=context.repair_of,
-            ),
-            lease=context.lease,
+    async def _reserve(
+        self,
+        context: CandidateBudget | ChildJobBudget,
+        inputs: int,
+        outputs: int,
+    ) -> BudgetReceipt | JobBudgetReceipt:
+        reservation = UsageReservation(
+            operation_id=context.operation_id or uuid4(),
+            kind="MODEL",
+            allocation_id=context.allocation_id,
+            interval_id=context.interval_id,
+            input_tokens=inputs,
+            output_tokens=outputs,
+            retry_of=context.retry_of,
+            repair_of=context.repair_of,
         )
+        if isinstance(context, ChildJobBudget):
+            receipt = await context.store.reserve_for_job(
+                context.scope,
+                context.allocation_id,
+                job_claim_token=context.claim,
+                reservation=reservation,
+            )
+        else:
+            receipt = await context.store.reserve(context.scope, reservation, lease=context.lease)
         if receipt.replayed:
             raise BudgetError("MODEL_ATTEMPT_ALREADY_RESERVED")
         return receipt
 
     @staticmethod
     async def _settle(
-        context: CandidateBudget, receipt: BudgetReceipt, usage: ModelUsage | None
+        context: CandidateBudget | ChildJobBudget,
+        receipt: BudgetReceipt | JobBudgetReceipt,
+        usage: ModelUsage | None,
     ) -> None:
-        if usage and (
+        exceeds = usage is not None and (
             usage.input_tokens > receipt.reservation.input_tokens
             or usage.output_tokens > receipt.reservation.output_tokens
-        ):
-            await context.store.settle(context.scope, receipt, None)
+        )
+        measured = None if exceeds else usage
+        if isinstance(context, ChildJobBudget) and isinstance(receipt, JobBudgetReceipt):
+            await context.store.settle_for_job(context.scope, receipt, measured)
+        elif isinstance(context, CandidateBudget) and isinstance(receipt, BudgetReceipt):
+            await context.store.settle(context.scope, receipt, measured)
+        else:
+            raise BudgetError("BUDGET_SCOPE_MISMATCH")
+        if exceeds:
             raise BudgetError("PROVIDER_USAGE_EXCEEDS_RESERVATION")
-        await context.store.settle(context.scope, receipt, usage)
 
     async def generate_structured[OutputT: BaseModel](
         self, request: StructuredModelRequest[OutputT]
     ) -> StructuredModelResponse[OutputT]:
-        context = _CANDIDATE.get()
+        context = _CANDIDATE.get() or _CHILD_JOB.get()
         if context is None:
             return await self.gateway.generate_structured(request)
         if context.delegation_brief is not None:

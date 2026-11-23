@@ -7,8 +7,10 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.modules.assistant.adapters.agent_runtime import CurrentActorResolverPort
+from app.modules.assistant.adapters.child_job_runtime import execute_child_job
 from app.modules.assistant.application.ports import AssistantTransaction
 from app.modules.identity.domain.auth import AuthenticatedActor
+from app.modules.organization.domain.roles import MembershipRole
 from work_management_ai.agents.reporting.contracts import ReportingSnapshot, ReportingUsageScope
 from work_management_ai.agents.reporting.workflows.graph import NODES
 from work_management_ai.model_gateway.contracts import (
@@ -16,6 +18,7 @@ from work_management_ai.model_gateway.contracts import (
     StructuredModelRequest,
     StructuredModelResponse,
 )
+from work_management_ai.runtime.run_budget import BudgetedToolLoopGateway, ChildJobClaim
 
 from ..domain.generation import GenerationJob
 from ..domain.snapshots import ReportMetricSnapshot
@@ -51,11 +54,39 @@ class ReportNarrativeRuntime:
         self.sessions, self.actors, self.gateway, self.timezone = (
             sessions,
             actors,
-            gateway,
+            BudgetedToolLoopGateway(gateway),
             timezone,
         )
 
     async def execute(self, job: GenerationJob, scope: ReportingUsageScope) -> bool:
+        actor = await self.actors.resolve(
+            organization_id=job.organization_id, membership_id=job.requester_membership_id
+        )
+        if actor is None or actor.role not in (MembershipRole.MANAGER, MembershipRole.ADMIN):
+            return False
+        if job.proposed_version_id is not None:
+            return await self._execute(job, scope, actor)
+        if job.lease_until is None:
+            return False
+        async with execute_child_job(
+            self.sessions,
+            actor,
+            ChildJobClaim(
+                kind="REPORTING",
+                job_id=job.id,
+                worker_id=scope.worker_id,
+                attempt=scope.fence,
+                lease_until=job.lease_until,
+            ),
+        ):
+            return await self._execute(job, scope, actor)
+
+    async def _execute(
+        self,
+        job: GenerationJob,
+        scope: ReportingUsageScope,
+        actor: AuthenticatedActor,
+    ) -> bool:
         from app.modules.assistant.adapters.agent_runtime import (
             InactivePlanningToolExecutor,
             build_agent_registry,
@@ -67,7 +98,6 @@ class ReportNarrativeRuntime:
         from app.modules.assistant.adapters.trigger_repository import TriggerTransactions
         from app.modules.assistant.adapters.work_tools import RecordingToolExecutor
         from app.modules.assistant.application.trigger_service import TriggerService
-        from app.modules.organization.domain.roles import MembershipRole
         from work_management_ai.agents.orchestrator.contracts import OrchestratorTriggerInput
         from work_management_ai.runtime.contracts import ActorReference
         from work_management_ai.runtime.triggers import (
@@ -80,11 +110,6 @@ class ReportNarrativeRuntime:
         from .generation_repository import GenerationTransactions
         from .usage import ReportingUsageStore, ScopedReportingUsage
 
-        actor = await self.actors.resolve(
-            organization_id=job.organization_id, membership_id=job.requester_membership_id
-        )
-        if actor is None or actor.role not in (MembershipRole.MANAGER, MembershipRole.ADMIN):
-            return False
         transactions = GenerationTransactions(self.sessions, self.timezone)
         service = GenerationService(transactions)
         # A committed proposal is the replay boundary, even if recorder completion was interrupted.

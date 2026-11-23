@@ -663,6 +663,44 @@ async def test_goal_retrieve_runs_and_replays_with_postgresql(
         ).scalar_one_or_none() is None
 
 
+async def test_goal_reporting_checks_job_claim_when_starting(
+    retrieval_harness: RetrievalHarness,
+) -> None:
+    from app.core.database import create_session_factory
+    from app.modules.assistant.adapters.agent_runtime import build_agent_registry
+    from app.modules.assistant.domain.models import AssistantJobClaimLost
+
+    h = retrieval_harness
+    registry, _ = build_agent_registry()
+    registry.register_resource("work_management_ai.agents.reporting", "agent.v2.yaml")
+    recorder = PostgreSQLExecutionRecorder(
+        transaction_factory=PostgreSQLAssistantTransactionFactory(create_session_factory(h.engine)),
+        registry=registry,
+        job=h.job,
+        actor=h.actor,
+    )
+    goal = AgentHandoffV2(
+        orchestration_run_id=h.orchestration_id,
+        parent_agent_run_id=await recorder.ensure_orchestrator_run(),
+        target_agent_id=AgentId.REPORTING,
+        target_agent_version="1.1.0",
+        context_references=(),
+        actor=ActorReference(
+            organization_id=h.actor.organization_id, membership_id=h.actor.membership_id
+        ),
+        source_turn_ref=h.job.turn_id,
+        brief=DelegationBrief(objective="Prepare a report", expected_result="Draft report"),
+        locale="en",
+        timezone="UTC",
+        budget=AgentBudget(max_iterations=4, max_tool_calls=4, timeout_seconds=60),
+        step_id="report-goal",
+        idempotency_key=f"{h.job.turn_id}:report-goal",
+    )
+    await h.sql("UPDATE assistant_jobs SET locked_by='other-worker' WHERE id=:id", {"id": h.job_id})
+    with pytest.raises(AssistantJobClaimLost):
+        await recorder.start_agent_run(goal)
+
+
 async def test_goal_source_turn_reads_original_under_exact_actor_and_run(journal: Journal):
     _, sessions, actor, _, scope, _, _, _ = journal
     source = PostgreSQLGoalSourceTurnReader(session_factory=sessions, actor=actor, scope=scope)

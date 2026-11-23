@@ -17,6 +17,8 @@ from app.modules.assistant.application.session_usage_ports import (
 )
 from app.modules.assistant.domain.session import SessionError, SessionLease, SessionScope
 from app.modules.assistant.domain.session_usage import (
+    ChildJobKind,
+    JobClaim,
     UsageEntry,
     add,
     balances,
@@ -33,7 +35,11 @@ class RunUsageService:
 
     @asynccontextmanager
     async def transaction(
-        self, scope: SessionScope, lease: SessionLease | None = None
+        self,
+        scope: SessionScope,
+        lease: SessionLease | None = None,
+        *,
+        job: tuple[UUID, JobClaim] | None = None,
     ) -> AsyncGenerator[UsageRepository]:
         if (scope.organization_id, scope.membership_id) != (
             self.actor.organization_id,
@@ -44,13 +50,20 @@ class RunUsageService:
             repo = tx.repository
             if not await repo.authorize(scope, self.actor):
                 raise SessionError("SESSION_NOT_FOUND")
+            if job is not None:
+                await repo.lock_job_actor(scope, self.actor)
             if lease is not None:
                 await SessionService.locked(repo, scope, lease)
             elif await repo.state(scope, lock=True) is None:
                 raise SessionError("SESSION_NOT_INITIALIZED")
+            if job is not None:
+                await repo.guard_job(scope, *job)
+                await repo.retention_deadline(scope)
             yield repo
             if lease is not None:
                 await SessionService.locked(repo, scope, lease)
+            if job is not None:
+                await repo.guard_job(scope, *job)
             await tx.commit()
 
     @asynccontextmanager
@@ -84,7 +97,7 @@ class RunUsageService:
         entries: tuple[UsageEntry, ...],
         interval_id: UUID | None,
         allocation_id: UUID | None,
-        lease: SessionLease,
+        lease: SessionLease | JobClaim,
     ) -> float:
         if interval_id is None:
             raise SessionError("ACTIVE_INTERVAL_REQUIRED")
@@ -94,6 +107,7 @@ class RunUsageService:
             or entry.closed
             or entry.allocation_id != allocation_id
             or entry.fence != lease.fencing_token
+            or entry.job_owned != isinstance(lease, JobClaim)
         ):
             raise SessionError("ACTIVE_INTERVAL_INVALID")
         seconds = (
@@ -107,7 +121,7 @@ class RunUsageService:
     async def reserve(
         self,
         scope: SessionScope,
-        lease: SessionLease,
+        lease: SessionLease | JobClaim,
         *,
         operation_id: UUID,
         kind: str,
@@ -128,13 +142,22 @@ class RunUsageService:
             repair_of=repair_of,
         )
         identity = fingerprint(command)
-        async with self.transaction(scope, lease) as repo:
+        job = isinstance(lease, JobClaim)
+        if job and (allocation_id is None or kind == "HANDOFF"):
+            raise SessionError("BUDGET_SCOPE_MISMATCH")
+        claim = (allocation_id, lease) if isinstance(lease, JobClaim) and allocation_id else None
+        parent = lease if isinstance(lease, SessionLease) else None
+        async with self.transaction(scope, parent, job=claim) as repo:
             entries = await repo.usage_entries(scope)
             old = next((e for e in entries if e.operation_id == operation_id), None)
             if old is not None:
-                if old.fingerprint != identity:
+                if old.fingerprint != identity or old.job_owned != job:
                     raise SessionError("RESERVATION_CONFLICT")
+                if job and old.fence != lease.fencing_token:
+                    raise SessionError("WORKFLOW_LEASE_LOST")
                 return True, 1
+            if not job and allocation_id is not None and await repo.has_job(scope, allocation_id):
+                raise SessionError("ALLOCATION_OWNED_BY_JOB")
             pool = next((e for e in entries if e.kind == "POOL"), None)
             if pool is None:
                 raise SessionError("BUDGET_NOT_INITIALIZED")
@@ -207,11 +230,17 @@ class RunUsageService:
                     interval_id,
                     attempt_parent,
                     attempt_kind,
+                    job_owned=job,
                 ),
             )
-            state = await repo.state(scope)
-            assert state is not None and state.lease is not None
-            seconds = min(seconds, (state.lease.expires_at - await repo.now()).total_seconds())
+            if isinstance(lease, JobClaim):
+                assert allocation_id is not None
+                deadline = await repo.guard_job(scope, allocation_id, lease)
+            else:
+                current = await repo.state(scope)
+                assert current is not None and current.lease is not None
+                deadline = current.lease.expires_at
+            seconds = min(seconds, (deadline - await repo.now()).total_seconds())
             if seconds <= 0:
                 raise SessionError("LEASE_LOST")
             return False, float(seconds)
@@ -252,6 +281,8 @@ class RunUsageService:
         self, scope: SessionScope, lease: SessionLease, allocation_id: UUID
     ) -> None:
         async with self.transaction(scope, lease) as repo:
+            if await repo.has_job(scope, allocation_id):
+                return
             entries = await repo.usage_entries(scope)
             allocation = self.entry(entries, allocation_id)
             if allocation.kind != "ALLOCATION":
@@ -262,19 +293,74 @@ class RunUsageService:
                 raise SessionError("CHILD_OPERATIONS_PENDING")
             await repo.close_allocation(scope, allocation_id)
 
-    async def settle(
+    async def bind_job(
         self,
         scope: SessionScope,
         lease: SessionLease,
+        allocation_id: UUID,
+        kind: ChildJobKind,
+        job_id: UUID,
+    ) -> None:
+        async with self.transaction(scope, lease) as repo:
+            await self.bind_job_under_lock(repo, scope, allocation_id, kind, job_id)
+
+    async def close_job(self, scope: SessionScope, allocation_id: UUID, claim: JobClaim) -> None:
+        async with self.transaction(scope, job=(allocation_id, claim)) as repo:
+            entries = await repo.usage_entries(scope)
+            allocation = self.entry(entries, allocation_id)
+            if allocation.kind != "ALLOCATION":
+                raise SessionError("ALLOCATION_INVALID")
+            if allocation.closed:
+                return
+            # Open operations outside this claim remain charged at their reserved amounts.
+            # Closing releases only unspent allowance and cannot authorize stale attempts.
+            if any(
+                e.allocation_id == allocation_id
+                and e.job_owned
+                and e.fence == claim.attempt
+                and not e.closed
+                for e in entries
+            ):
+                raise SessionError("CHILD_OPERATIONS_PENDING")
+            await repo.close_allocation(scope, allocation_id)
+
+    @staticmethod
+    async def bind_job_under_lock(
+        repo: UsageRepository,
+        scope: SessionScope,
+        allocation_id: UUID,
+        kind: ChildJobKind,
+        job_id: UUID,
+    ) -> None:
+        entry = RunUsageService.entry(await repo.usage_entries(scope), allocation_id)
+        if entry.kind != "ALLOCATION" or entry.closed:
+            raise SessionError("ALLOCATION_INVALID")
+        await repo.bind_job(scope, allocation_id, kind, job_id)
+
+    async def settle(
+        self,
+        scope: SessionScope,
+        lease: SessionLease | JobClaim,
         operation_id: UUID,
         request_fingerprint: str,
         usage: tuple[int, int] | None,
+        *,
+        allocation_id: UUID | None = None,
     ) -> None:
-        async with self.transaction(scope, lease) as repo:
+        if isinstance(lease, JobClaim) and allocation_id is None:
+            raise SessionError("BUDGET_SCOPE_MISMATCH")
+        claim = (allocation_id, lease) if isinstance(lease, JobClaim) and allocation_id else None
+        parent = lease if isinstance(lease, SessionLease) else None
+        async with self.transaction(scope, parent, job=claim) as repo:
             entries = await repo.usage_entries(scope)
             entry = self.entry(entries, operation_id)
             if entry.fingerprint != request_fingerprint or entry.kind in {"POOL", "ALLOCATION"}:
                 raise SessionError("RESERVATION_CONFLICT")
+            if entry.job_owned != isinstance(lease, JobClaim) or (
+                isinstance(lease, JobClaim)
+                and (entry.allocation_id != allocation_id or entry.fence != lease.attempt)
+            ):
+                raise SessionError("WORKFLOW_LEASE_LOST")
             if entry.kind != "MODEL" and usage is not None:
                 raise SessionError("BUDGET_SETTLEMENT_INVALID")
             identity = fingerprint(usage)

@@ -3,7 +3,16 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKeyConstraint, Index, Integer, String, text
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKeyConstraint,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -57,6 +66,10 @@ class OrchestrationUsageModel(Base):
         ),
         CheckConstraint("fence>=0 AND (kind='POOL' OR fence>0)", name="fence"),
         CheckConstraint(
+            "NOT job_owned OR (allocation_id IS NOT NULL AND kind IN ('MODEL','TOOL','INTERVAL'))",
+            name="job_owned",
+        ),
+        CheckConstraint(
             "(attempt_parent IS NULL AND attempt_kind IS NULL) OR (attempt_parent IS NOT NULL "
             "AND attempt_kind IN ('RETRY','REPAIR') AND kind='MODEL')",
             name="attempt",
@@ -98,3 +111,40 @@ class OrchestrationUsageModel(Base):
     settled: Mapped[dict[str, int] | None] = mapped_column(JSONB(none_as_null=True), nullable=True)
     settlement_fingerprint: Mapped[str | None] = mapped_column(String(64))
     closed: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
+    job_owned: Mapped[bool] = mapped_column(default=False, server_default=text("false"))
+
+
+class OrchestrationChildJobModel(Base):
+    __tablename__ = "orchestration_child_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["organization_id", "orchestration_run_id", "allocation_id"],
+            [
+                "orchestration_usage.organization_id",
+                "orchestration_usage.orchestration_run_id",
+                "orchestration_usage.operation_id",
+            ],
+            name="fk_orch_child_allocation",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "workflow_job_id"],
+            ["workflow_jobs.organization_id", "workflow_jobs.id"],
+            name="fk_orch_child_workflow_job",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "generation_job_id"],
+            ["report_generation_jobs.organization_id", "report_generation_jobs.id"],
+            name="fk_orch_child_generation_job",
+        ),
+        UniqueConstraint("organization_id", "workflow_job_id"),
+        UniqueConstraint("organization_id", "generation_job_id"),
+        CheckConstraint(
+            "(workflow_job_id IS NULL) <> (generation_job_id IS NULL)",
+            name="job",
+        ),
+    )
+    organization_id: Mapped[UUID] = mapped_column(primary_key=True)
+    orchestration_run_id: Mapped[UUID] = mapped_column(primary_key=True)
+    allocation_id: Mapped[UUID] = mapped_column(primary_key=True)
+    workflow_job_id: Mapped[UUID | None]
+    generation_job_id: Mapped[UUID | None]
