@@ -215,3 +215,77 @@ async def test_search_batch_status_is_preserved_in_measurement_denominators(
     assert report.rows[0].outcome == outcome
     assert report.completed == completed
     assert report.failed == 1 - completed
+
+
+@pytest.mark.asyncio
+async def test_gpt61_sol_uses_verified_price_and_existing_main_model() -> None:
+    from app.modules.retrieval.adapters.mock import MockRetrievalAdapter
+    from app.scripts.benchmark_retrieve_web import (
+        BenchmarkBudget,
+        MockBenchmarkGateway,
+        default_queries,
+        run_benchmark,
+    )
+
+    receipts: list[dict[str, object]] = []
+    report = await run_benchmark(
+        default_queries()[:1],
+        mode="end-to-end",
+        adapter=MockRetrievalAdapter(),
+        budget=BenchmarkBudget(max_requests=3, model_cap=Decimal("0.10"), journal=receipts.append),
+        hosted=False,
+        gateway=MockBenchmarkGateway(),
+        model="gpt-6.1-sol",
+    )
+    assert report.mode == "MOCK" and report.model == "gpt-6.1-sol"
+    assert report.rows[0].outcome == "ANSWER_READY"
+    assert report.model_attempts == 1
+    assert report.observed_model_usd == Decimal("0.0007")
+    assert any(
+        event.get("kind") == "model"
+        and event.get("status") == "RESERVED"
+        and event.get("upper_usd") == "0.04"
+        for event in receipts
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("with_gateway", "model", "reason"),
+    [
+        (True, "unpriced-model", "MODEL_PRICE_NOT_VERIFIED"),
+        (False, "gpt-6.1-sol", "MODEL_GATEWAY_UNAVAILABLE"),
+    ],
+)
+async def test_unavailable_model_reason_is_specific_and_stops_before_io(
+    with_gateway: bool,
+    model: str,
+    reason: str,
+) -> None:
+    from app.modules.retrieval.adapters.mock import MockRetrievalAdapter
+    from app.scripts.benchmark_retrieve_web import (
+        BenchmarkBudget,
+        MockBenchmarkGateway,
+        default_queries,
+        run_benchmark,
+    )
+
+    class NoIO(MockRetrievalAdapter):
+        async def search(
+            self, request: PublicSearchRequest, *, timeout_seconds: float
+        ) -> SearchBatch:
+            pytest.fail("Unavailable model must stop before paid retrieval")
+
+    budget = BenchmarkBudget()
+    report = await run_benchmark(
+        default_queries()[:1],
+        mode="end-to-end",
+        adapter=NoIO(),
+        budget=budget,
+        hosted=False,
+        gateway=MockBenchmarkGateway() if with_gateway else None,
+        model=model,
+    )
+    assert report.mode == "NOT_RUN" and report.stopped_reason == reason
+    assert report.model == model
+    assert report.attempted == budget.request_count == 0

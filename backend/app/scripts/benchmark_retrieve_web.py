@@ -68,6 +68,8 @@ PRICE_VERSION = "exa-auto7-highlights5-contents1.2026-10-23"
 SEARCH_BOUND = Decimal("0.012")  # $7/1k Auto + up to5 highlights at $1/1k pages.
 PAGE_BOUND = Decimal("0.001")  # Cache-only, text only, one URL; no summaries.
 _MODEL_PRICES = {  # USD /1M tokens; default standard tier, no cache discount assumed.
+    # https://developers.openai.com/api/docs/models/gpt-6.1-sol, checked 2026-10-23.
+    "gpt-6.1-sol": (Decimal("2.00"), Decimal("10.00")),
     "gpt-4o-mini": (Decimal("0.15"), Decimal("0.60")),
     "gpt-4o-mini-2024-07-18": (Decimal("0.15"), Decimal("0.60")),
     "gpt-5.4": (Decimal("2.50"), Decimal("15")),
@@ -245,6 +247,7 @@ class BenchmarkReport(BaseModel):
     price_version: str = PRICE_VERSION
     price_provenance: str = "https://exa.ai/pricing"
     model_price_provenance: str = "https://developers.openai.com/api/docs/pricing"
+    model_price_version: str = "openai-standard-2026-10-23"
     model: str | None = None
     usage_provenance: str = (
         "provider_report_or_unknown_charged_at_upper_bound;not_invoice_or_free_credit_entitlement"
@@ -506,8 +509,11 @@ async def run_benchmark(
             attempted=0,
             completed=0,
             failed=0,
-            stopped_reason="MODEL_PRICE_OR_GATEWAY_UNAVAILABLE",
+            stopped_reason="MODEL_GATEWAY_UNAVAILABLE"
+            if gateway is None
+            else "MODEL_PRICE_NOT_VERIFIED",
             measurement_status="NOT_RUN",
+            model=model,
         )
     for query in queries:
         if budget.stopped_reason:
