@@ -6,7 +6,14 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from typing import Protocol, cast
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    ChatMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr, ValidationError
 
@@ -149,7 +156,10 @@ def _messages(items: tuple[ToolItem, ...]) -> list[BaseMessage]:
             assert isinstance(item.content, str)
             constructors = {"system": SystemMessage, "user": HumanMessage, "assistant": AIMessage}
             assert item.role is not None
-            result.append(constructors[item.role](content=item.content))
+            if item.role == "developer":
+                result.append(ChatMessage(role="developer", content=item.content))
+            else:
+                result.append(constructors[item.role](content=item.content))
         elif item.kind == "tool_call":
             assert item.call is not None
             result.append(

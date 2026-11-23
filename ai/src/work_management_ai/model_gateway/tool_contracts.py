@@ -49,10 +49,10 @@ class ToolCall(_Contract):
 
 
 class ToolItem(_Contract):
-    """Typed visible message, assistant call or paired tool observation."""
+    """Typed instruction, conversation message, assistant call or paired tool observation."""
 
     kind: Literal["message", "tool_call", "tool_result"]
-    role: Literal["system", "user", "assistant"] | None = None
+    role: Literal["system", "developer", "user", "assistant"] | None = None
     content: JsonValue = None
     call: ToolCall | None = None
     call_id: str | None = Field(default=None, min_length=1, max_length=128)
