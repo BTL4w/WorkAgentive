@@ -59,7 +59,12 @@ class DailyUpdateToolAdapter:
             context = await self.updates.context(actor, value.task_id)
             if context.task_version != value.task_version:
                 raise DailyUpdateError("STALE_TASK")
+            if value.inherit_draft_evidence and (
+                value.action != "CONTEXT" or value.draft_id is None or value.evidence_refs
+            ):
+                raise ValueError("DAILY_UPDATE_INPUT_REQUIRED")
             if value.action == "CONTEXT":
+                evidence_refs = value.evidence_refs
                 if value.draft_id:
                     draft = await self.updates.get_draft(actor, value.draft_id)
                     if (
@@ -67,18 +72,23 @@ class DailyUpdateToolAdapter:
                         or draft.confirmed_update_id
                         or len(draft.items) != 1
                         or draft.items[0].task_id != value.task_id
+                        or draft.items[0].expected_task_version != value.task_version
                     ):
                         raise DailyUpdateError("STALE_DRAFT")
-                    if tuple(ref.model_dump() for ref in value.evidence_refs) != tuple(
-                        ref.model_dump() for ref in draft.items[0].evidence_refs
-                    ):
+                    selected = tuple(
+                        EvidenceRef.model_validate(ref.model_dump())
+                        for ref in draft.items[0].evidence_refs
+                    )
+                    if value.inherit_draft_evidence:
+                        evidence_refs = selected
+                    elif evidence_refs != selected:
                         raise DailyUpdateError("STALE_EVIDENCE")
                 result = ReportingSnapshot(
                     task_id=context.task_id,
                     task_version=context.task_version,
                     progress_version=context.progress_version,
                     reporting_date=context.reporting_date,
-                    evidence_refs=value.evidence_refs,
+                    evidence_refs=evidence_refs,
                 )
             elif value.action == "DRAFT":
                 report = value.report
@@ -131,11 +141,24 @@ class DailyUpdateToolAdapter:
                 if value.draft_id is None or value.draft_version is None:
                     raise ValueError("DAILY_UPDATE_INPUT_REQUIRED")
                 draft = await self.updates.get_draft(actor, value.draft_id)
-                if len(draft.items) != 1 or draft.items[0].task_id != value.task_id:
+                if (
+                    draft.version != value.draft_version
+                    or draft.confirmed_update_id is not None
+                    or len(draft.items) != 1
+                    or draft.items[0].task_id != value.task_id
+                    or draft.items[0].expected_task_version != value.task_version
+                ):
                     raise DailyUpdateError("STALE_DRAFT")
                 ref = await self.assessments.assess(
                     actor, draft.id, value.draft_version, request.idempotency_key, request.call_id
                 )
+                assessment = await self.assessments.get_current(actor, draft.id)
+                if (assessment.id, assessment.draft_version) != (ref.id, value.draft_version):
+                    raise DailyUpdateError("STALE_ASSESSMENT")
+                if assessment.state == "PENDING":
+                    raise DailyUpdateError("ASSESSMENT_PENDING")
+                if assessment.state == "STALE":
+                    raise DailyUpdateError("STALE_ASSESSMENT")
                 result = DailyUpdateResult(
                     draft_id=draft.id,
                     draft_version=draft.version,

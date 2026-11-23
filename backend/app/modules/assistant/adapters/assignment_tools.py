@@ -8,12 +8,14 @@ from uuid import UUID
 
 from app.modules.identity.domain.auth import AuthenticatedActor
 from app.modules.organization.application.member_service import MemberForbiddenError, MemberService
+from app.modules.organization.domain.roles import MembershipRole
 from app.modules.people_capacity.application.service import PeopleCapacityService
 from app.modules.work.application.project_service import ProjectService
 from app.modules.work.application.task_service import TaskService
 from app.modules.work.planning.application.manual_service import ManualPlanningService
 from app.modules.work.planning.assignment.application.assignment_service import (
     ExplicitAssignmentCommand,
+    ExplicitAssignmentResult,
     ExplicitTaskAssignmentService,
 )
 from app.modules.work.planning.assignment.application.recommendation_service import (
@@ -38,6 +40,7 @@ from app.modules.work.planning.assignment.domain.recommendations import (
 )
 from app.modules.work.planning.domain.project_weeks import ProjectWeek
 from work_management_ai.agents.assignment.contracts import (
+    EXPLICIT_GOAL_ASSIGNMENT_PREFIX,
     CandidateSnapshot,
     EvidenceSnapshot,
     ExplicitAssignmentSnapshot,
@@ -46,6 +49,7 @@ from work_management_ai.agents.assignment.contracts import (
     SelectedMemberSnapshot,
     TeamRecommendationSnapshot,
     TeamRequirementsPendingSnapshot,
+    VerifiedAssignmentCommand,
     WorkloadSnapshot,
 )
 from work_management_ai.agents.orchestrator.contracts import (
@@ -55,6 +59,8 @@ from work_management_ai.agents.orchestrator.contracts import (
 )
 from work_management_ai.runtime.contracts import (
     ActorReference,
+    AgentHandoffV2,
+    SourceTurnTextPort,
     ToolExecutionRequest,
     ToolExecutionResult,
 )
@@ -246,7 +252,7 @@ class AssignmentApplicationService:
                 idempotency_key=idempotency_key,
             )
         )
-        return self._recommendation_snapshot(
+        return self.recommendation_snapshot(
             organization_id=current.organization_id,
             project_id=value.project_id,
             version=version,
@@ -353,12 +359,13 @@ class AssignmentApplicationService:
                 actor=actor,
                 recommendation_id=value.recommendation_id,
                 expected_version=value.recommendation_version,
+                expected_project_id=value.project_id,
                 overrides=overrides,
                 request_id=f"assistant:{idempotency_key}",
                 idempotency_key=idempotency_key,
             )
         )
-        return self._recommendation_snapshot(
+        return self.recommendation_snapshot(
             organization_id=actor.organization_id,
             project_id=value.project_id,
             version=revised,
@@ -420,24 +427,38 @@ class AssignmentApplicationService:
                 expected_task_version=value.task_version,
                 request_id=f"assistant:{idempotency_key}",
                 idempotency_key=idempotency_key,
+                once_per_turn=idempotency_key.startswith(EXPLICIT_GOAL_ASSIGNMENT_PREFIX),
             )
         )
+        return self.assignment_snapshot(result, observed_at=datetime.now(UTC))
+
+    @staticmethod
+    def assignment_snapshot(
+        result: ExplicitAssignmentResult, *, observed_at: datetime
+    ) -> ExplicitAssignmentSnapshot:
+        membership_id = result.task.assignee_membership_id
+        if membership_id is None:
+            raise ValueError("ASSIGNMENT_RECEIPT_INVALID")
         return ExplicitAssignmentSnapshot(
-            organization_id=current.organization_id,
+            organization_id=result.task.organization_id,
             project_id=result.task.project_id,
             task_id=result.task.id,
             task_version=result.task.version,
-            membership_id=value.membership_id,
+            membership_id=membership_id,
             warning_codes=tuple(item.code for item in result.warnings),
             effective_capacity_hours=result.effective_capacity_hours,
             workload_before_hours=result.workload_before_hours,
             workload_after_hours=result.workload_after_hours,
-            observed_at=datetime.now(UTC),
+            observed_at=observed_at,
         )
 
     @staticmethod
-    def _recommendation_snapshot(
-        *, organization_id: UUID, project_id: UUID, version: RecommendationVersion
+    def recommendation_snapshot(
+        *,
+        organization_id: UUID,
+        project_id: UUID,
+        version: RecommendationVersion,
+        observed_at: datetime | None = None,
     ) -> TeamRecommendationSnapshot:
         candidates = {
             (item.requirement_id, item.membership_id): item for item in version.alternatives
@@ -508,7 +529,7 @@ class AssignmentApplicationService:
             selected_members=tuple(selected),
             alternatives=alternatives,
             uncovered_requirement_ids=tuple(item.requirement_id for item in version.uncovered),
-            observed_at=datetime.now(UTC),
+            observed_at=observed_at or datetime.now(UTC),
         )
 
 
@@ -575,13 +596,17 @@ class AssistantAssignmentContextResolver:
     def _reference(value: str) -> str:
         return _normalize_reference(value)
 
+    @classmethod
+    def is_explicit_assignment(cls, message: str) -> bool:
+        return any(pattern.match(message) for pattern in cls._PATTERNS)
+
     async def resolve_exact_assignment(
         self, *, actor: AuthenticatedActor, message: str
     ) -> ExactAssignmentContext | None:
         return (await self.resolve_assignment(actor=actor, message=message)).exact_context
 
     async def resolve_assignment(
-        self, *, actor: AuthenticatedActor, message: str
+        self, *, actor: AuthenticatedActor, message: str, require_complete: bool = False
     ) -> ExactAssignmentResolution:
         match = next(
             (pattern.match(message) for pattern in self._PATTERNS if pattern.match(message)),
@@ -624,9 +649,12 @@ class AssistantAssignmentContextResolver:
             )
         task_reference = _normalize_reference(match.group("task"))
         member_reference = _normalize_reference(match.group("member"))
+        task_limit = 20
         tasks = await self._tasks.find_visible_tasks_by_title(
-            actor=actor, query=task_reference, limit=20
+            actor=actor, query=task_reference, limit=task_limit
         )
+        if require_complete and len(tasks) >= task_limit:
+            return ExactAssignmentResolution(issue="TASK_AMBIGUOUS_OR_NOT_FOUND")
         exact_tasks = tuple(
             item for item in tasks if item.title.casefold() == task_reference.casefold()
         )
@@ -641,6 +669,8 @@ class AssistantAssignmentContextResolver:
             )
         except MemberForbiddenError:
             return ExactAssignmentResolution(issue="ASSIGNMENT_FORBIDDEN")
+        if require_complete and len(people.items) < people.total:
+            return ExactAssignmentResolution(issue="MEMBER_AMBIGUOUS_OR_NOT_FOUND")
         exact_people = tuple(
             item
             for item in people.items
@@ -658,6 +688,52 @@ class AssistantAssignmentContextResolver:
                 task_version=task.version,
                 membership_id=member.membership_id,
             )
+        )
+
+
+class AssistantAssignmentExplicitCommandAdapter:
+    """Bind command authority to the authenticated source turn and current actor."""
+
+    def __init__(
+        self,
+        *,
+        source_turn: SourceTurnTextPort,
+        actor_resolver: CurrentActorResolverPort,
+        resolver: AssistantAssignmentContextResolver,
+    ) -> None:
+        self._source_turn = source_turn
+        self._actors = actor_resolver
+        self._resolver = resolver
+
+    async def read(self, handoff: AgentHandoffV2) -> VerifiedAssignmentCommand | None:
+        actor = await self._actors.resolve(
+            organization_id=handoff.actor.organization_id,
+            membership_id=handoff.actor.membership_id,
+        )
+        if actor is None or (
+            actor.organization_id,
+            actor.membership_id,
+            actor.role,
+        ) not in {
+            (handoff.actor.organization_id, handoff.actor.membership_id, MembershipRole.ADMIN),
+            (handoff.actor.organization_id, handoff.actor.membership_id, MembershipRole.MANAGER),
+        }:
+            raise ValueError("ASSIGNMENT_ROLE_FORBIDDEN")
+        original = await self._source_turn.read(handoff)
+        if not self._resolver.is_explicit_assignment(original):
+            return None
+        exact = (
+            await self._resolver.resolve_assignment(
+                actor=actor, message=original, require_complete=True
+            )
+        ).exact_context
+        if exact is None:
+            return None
+        return VerifiedAssignmentCommand(
+            project_id=exact.project_id,
+            task_id=exact.task_id,
+            expected_task_version=exact.task_version,
+            assignee_membership_id=exact.membership_id,
         )
 
 

@@ -84,6 +84,8 @@ def fingerprint(command: RecommendationCommand) -> str:
     values.pop("request_id")
     values.pop("idempotency_key")
     if isinstance(command, ReviseRecommendationCommand):
+        if command.expected_project_id is None:
+            values.pop("expected_project_id")
         values["overrides"] = sorted(
             values["overrides"],
             key=lambda item: (str(item["requirement_id"]), str(item["selected_membership_id"])),
@@ -207,6 +209,22 @@ class SqlAlchemyRecommendationRepository:
                 except RecommendationError:
                     result = replace(result, status="STALE")
         return result
+
+    async def read_operation_receipt(
+        self, actor: AuthenticatedActor, *, project_id: UUID, recommendation_id: UUID, version: int
+    ) -> RecommendationVersion:
+        await self._actor(actor, manage=True)
+        root = await self._root(actor, recommendation_id)
+        if root.project_id != project_id:
+            raise RecommendationError("RESOURCE_NOT_FOUND")
+        row = await self._version(actor, root, version)
+        snapshot = _VERSION.validate_python(row.snapshot)
+        if root.current_version != version:
+            return replace(snapshot, status="STALE")
+        if root.status != "PROPOSED":
+            return replace(snapshot, status=cast(RecommendationStatus, root.status))
+        # Check the same live requirements and policy as the proposal read path.
+        return await self.get(actor, recommendation_id)
 
     async def team(
         self, actor: AuthenticatedActor, project_id: UUID
@@ -432,7 +450,13 @@ class SqlAlchemyRecommendationRepository:
             .with_for_update()
         )
         assert record is not None
-        if record.request_fingerprint != fingerprint(command):
+        compatible = (
+            isinstance(command, ReviseRecommendationCommand)
+            and command.expected_project_id is not None
+            and record.request_fingerprint
+            == fingerprint(replace(command, expected_project_id=None))
+        )
+        if record.request_fingerprint != fingerprint(command) and not compatible:
             raise RecommendationError("IDEMPOTENCY_KEY_REUSED")
         if record.state == IdempotencyState.COMPLETED and record.response_body:
             adapter = _FEEDBACK if isinstance(command, RecordFeedbackCommand) else _VERSION
@@ -500,6 +524,12 @@ class SqlAlchemyRecommendationRepository:
         else:
             root = await self._root(actor, command.recommendation_id, lock=True)
             project_id = root.project_id
+            if (
+                isinstance(command, ReviseRecommendationCommand)
+                and command.expected_project_id is not None
+                and command.expected_project_id != project_id
+            ):
+                raise RecommendationError("RESOURCE_NOT_FOUND")
         record, replay = await self._claim(command)
         if replay is not None:
             return replay

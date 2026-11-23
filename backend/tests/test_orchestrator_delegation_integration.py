@@ -61,7 +61,11 @@ from work_management_ai.runtime.contracts import (
     AgentId,
     AgentResult,
     AgentRunStatus,
+    ContextReference,
     DelegationBrief,
+    GoalDirectedAgentResult,
+    InteractionOutcome,
+    JsonValue,
 )
 from work_management_ai.runtime.delegation import (
     DelegationAdapter,
@@ -863,9 +867,14 @@ async def test_planning_recovery_reads_committed_effect_before_child_result(
     assert error.value.code == "DELEGATION_WORKFLOW_FAILED"
 
 
+@pytest.mark.parametrize(
+    ("goal_directed", "failed_after_effect"), [(False, False), (True, False), (True, True)]
+)
 async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
     journal: Journal,
     monkeypatch: pytest.MonkeyPatch,
+    goal_directed: bool,
+    failed_after_effect: bool,
 ) -> None:
     engine, sessions, actor, store, scope, lease, _, _ = journal
     project_id, task_id = uuid4(), uuid4()
@@ -890,6 +899,17 @@ async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
                 "project": project_id,
             },
         )
+        if goal_directed:
+            await connection.execute(
+                text(
+                    "UPDATE assistant_messages SET content_blocks = "
+                    '\'[{"kind":"text","text":"Daily update for Write report: '
+                    "I wrote the first section and am at 25 percent.\"}]'::jsonb "
+                    "WHERE organization_id=:org AND id="
+                    "(SELECT user_message_id FROM assistant_turns WHERE id=:turn)"
+                ),
+                {"org": scope.organization_id, "turn": scope.turn_id},
+            )
     updates = DailyUpdateService(SqlAlchemyDailyUpdateTransactions(sessions))
     context = await updates.context(actor, task_id)
     registry_tools = ToolRegistry.from_resources(
@@ -897,6 +917,7 @@ async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
             ("work_management_ai.tools.automation", "tool.yaml"),
             ("work_management_ai.tools.daily_update", "tool.yaml"),
             ("work_management_ai.tools.delegation", "delegate.yaml"),
+            ("work_management_ai.tools.delegation", "delegate.v2.yaml"),
         )
     )
     skills = SkillRegistry.from_resources(
@@ -910,6 +931,8 @@ async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
     )
     registry.register_resource("work_management_ai.agents.orchestrator", "agent.yaml")
     registry.register_resource("work_management_ai.agents.daily_update", "agent.yaml")
+    if goal_directed:
+        registry.register_resource("work_management_ai.agents.daily_update", "agent.v2.yaml")
     transactions = PostgreSQLAssistantTransactionFactory(sessions)
     recorder = PostgreSQLExecutionRecorder(
         transaction_factory=transactions,
@@ -924,6 +947,20 @@ async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
     )
     parent = await recorder.ensure_orchestrator_run()
     actors = CurrentActorService(SqlAlchemyAuthTransactionFactory(sessions))
+    task_reference = ContextReference(
+        reference_id=uuid4(),
+        organization_id=scope.organization_id,
+        resource_type="task",
+        resource_id=task_id,
+        version=context.task_version,
+        observed_at=datetime.now(UTC),
+    )
+
+    class GoalAccess:
+        async def verify(self, handoff: AgentHandoffV2) -> None:
+            assert handoff.context_references == (task_reference,)
+            assert (await updates.context(actor, task_id)).task_version == task_reference.version
+
     daily = DailyUpdateHarness(
         actor_resolver=CurrentAgentActorResolver(actors),
         model_gateway=BudgetedToolLoopGateway(
@@ -955,31 +992,93 @@ async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
                 ),
             )
         ),
+        goal_access=GoalAccess() if goal_directed else None,
+        source_turns=(
+            PostgreSQLGoalSourceTurnReader(session_factory=sessions, actor=actor, scope=scope)
+            if goal_directed
+            else None
+        ),
     )
     receipts = PostgreSQLDailyUpdateReceiptReader(session_factory=sessions, actor=actor)
-    adapter = DelegationAdapter(
-        agent_registry=registry,
-        specialist_pins=registry.specialist_pins(),
-        runner=DurableSpecialistRunner(recorder=recorder, harnesses={AgentId.DAILY_UPDATE: daily}),
-        actor_role="MANAGER",
-        active_phase=5,
-        parent_agent_run_id=parent,
-        daily_update_receipts=receipts,
-    )
-    (schema,) = registry_tools.candidate_schemas(("delegate_agent@1",))
-    schema = filtered_delegate_tool_schema(
-        schema,
-        allowed_capabilities={(AgentId.DAILY_UPDATE, "daily_update.prepare")},
-        daily_update_ready=True,
-    )
+    extra_arguments: dict[str, JsonValue]
+    if goal_directed:
+
+        async def check_refs(target: RunScope, refs: tuple[ContextReference, ...]) -> None:
+            assert target == scope and refs == (task_reference,)
+
+        (pin,) = registry.specialist_pins(goal_directed=True)
+        adapter = DelegationAdapterV2(
+            scope=scope,
+            parent_agent_run_id=parent,
+            actor_role="MANAGER",
+            active_phase=5,
+            locale="en",
+            timezone="UTC",
+            agent_registry=registry,
+            specialist_pins=(pin,),
+            runners={
+                AgentId.DAILY_UPDATE: PostgreSQLGoalSpecialistRunner(
+                    recorder=recorder, harness=daily, pin=pin
+                ),
+            },
+            references=VerifiedDelegationReferences(
+                scope=scope,
+                exploration=(),
+                active_context=(task_reference,),
+                completed_specialists=(),
+                recheck=check_refs,
+            ),
+            daily_update_goal_receipts=receipts,
+        )
+        (definition,) = registry_tools.candidate_definitions(("delegate_agent@2",))
+        schema = filtered_delegate_v2_tool_schema(
+            definition.schema,
+            allowed_specialists=adapter.available_specialists(),
+        )
+        tool_version, tool_fingerprint = definition.pin.version, definition.pin.fingerprint
+        output_contract = definition.output_contract
+        extra_arguments = {"context_ref_ids": [str(task_reference.reference_id)]}
+        recover_draft = receipts.recover_goal_draft
+    else:
+        adapter = DelegationAdapter(
+            agent_registry=registry,
+            specialist_pins=registry.specialist_pins(),
+            runner=DurableSpecialistRunner(
+                recorder=recorder, harnesses={AgentId.DAILY_UPDATE: daily}
+            ),
+            actor_role="MANAGER",
+            active_phase=5,
+            parent_agent_run_id=parent,
+            daily_update_receipts=receipts,
+        )
+        (schema,) = registry_tools.candidate_schemas(("delegate_agent@1",))
+        schema = filtered_delegate_tool_schema(
+            schema,
+            allowed_capabilities={(AgentId.DAILY_UPDATE, "daily_update.prepare")},
+            daily_update_ready=True,
+        )
+        tool_version, tool_fingerprint = "1.0.0", "delegation-daily"
+        output_contract = DelegateAgentOutput
+        extra_arguments = {
+            "capability": "daily_update.prepare",
+            "input": {
+                "capability": "daily_update.prepare",
+                "task_reference": str(task_id),
+                "task_version": context.task_version,
+                "locale": "en",
+                "update_text": "I wrote the first section and am at 25 percent.",
+            },
+        }
+        recover_draft = receipts.recover_draft
+    assert schema.input_contract is not None
     admitted = PreparedToolSet(
         (
             AdmittedTool(
                 schema=schema,
-                input_contract=DelegateAgentInput,
-                output_contract=DelegateAgentOutput,
-                version="1.0.0",
-                fingerprint="delegation-daily",
+                input_contract=schema.input_contract,
+                output_contract=output_contract,
+                version=tool_version,
+                fingerprint=tool_fingerprint,
             ),
         ),
         "delegation-daily",
@@ -988,23 +1087,16 @@ async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
     pipeline = ToolPipeline(
         store=store,
         policy=Policy(),
-        backends={"delegate_agent@1": BackendDelegationTool(actor=actor, adapter=adapter)},
+        backends={schema.reference: BackendDelegationTool(actor=actor, adapter=adapter)},
     )
     call = ToolCall(
         call_id="daily-draft",
         name="delegate_agent",
         arguments={
             "agent_id": "daily_update",
-            "capability": "daily_update.prepare",
             "objective": "Prepare a progress draft",
             "expected_result": "Owner review",
-            "input": {
-                "capability": "daily_update.prepare",
-                "task_reference": str(task_id),
-                "task_version": context.task_version,
-                "locale": "en",
-                "update_text": "I wrote the first section and am at 25 percent.",
-            },
+            **extra_arguments,
         },
     )
     budget = PostgreSQLRunBudget(sessions, actor)
@@ -1014,15 +1106,40 @@ async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
         assert result.status is AgentRunStatus.AWAITING_HUMAN, result
         raise RuntimeError("before child result publication")
 
+    finish = recorder.finish_goal_agent_run
+
+    async def persist_failure(
+        run_id: UUID, result: GoalDirectedAgentResult
+    ) -> GoalDirectedAgentResult:
+        assert result.status is AgentRunStatus.AWAITING_HUMAN, result
+        return await finish(
+            run_id,
+            result.model_copy(
+                update={
+                    "status": AgentRunStatus.FAILED,
+                    "interaction_outcome": InteractionOutcome.FAILED,
+                    "typed_output": {},
+                    "safe_error_code": "DAILY_UPDATE_TOOL_REJECTED",
+                }
+            ),
+        )
+
     with candidate_budget(
         CandidateBudget(
             scope=scope, lease=lease, store=budget, interval_id=interval.reservation.operation_id
         )
     ):
         with monkeypatch.context() as patch:
-            patch.setattr(recorder, "finish_agent_run", interrupt)
+            patch.setattr(
+                recorder,
+                "finish_goal_agent_run" if goal_directed else "finish_agent_run",
+                persist_failure if failed_after_effect else interrupt,
+            )
             first = await pipeline.execute(scope, call, admitted=admitted, lease=lease)
-        assert first.kind == "REJECTED" and first.safe_code == "TOOL_RECONCILIATION_REQUIRED"
+        if failed_after_effect:
+            assert isinstance(first, DeferredToolResult), first
+        else:
+            assert first.kind == "REJECTED" and first.safe_code == "TOOL_RECONCILIATION_REQUIRED"
         replayed = await pipeline.execute(scope, call, admitted=admitted, lease=lease)
         assert isinstance(replayed, DeferredToolResult), replayed
         assert replayed.wait_ref.kind == "HUMAN_DECISION"
@@ -1030,19 +1147,19 @@ async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
         assert await pipeline.execute(scope, call, admitted=admitted, lease=lease) == replayed
     receipt_id = replayed.invocation_id
     assert (
-        await receipts.recover_draft(
+        await recover_draft(
             scope, receipt_id=uuid4(), task_id=task_id, task_version=context.task_version
         )
         is None
     )
     foreign = scope.model_copy(update={"membership_id": uuid4()})
     assert (
-        await receipts.recover_draft(
+        await recover_draft(
             foreign, receipt_id=receipt_id, task_id=task_id, task_version=context.task_version
         )
         is None
     )
-    recovered = await receipts.recover_draft(
+    recovered = await recover_draft(
         scope, receipt_id=receipt_id, task_id=task_id, task_version=context.task_version
     )
     assert recovered is not None and recovered.assessment_id is not None
@@ -1078,7 +1195,10 @@ async def test_daily_draft_receipt_is_scoped_and_recovered_without_confirming(
         )
     ):
         stale_replay = await pipeline.execute(scope, call, admitted=admitted, lease=lease)
-    assert stale_replay.kind == "REJECTED" and stale_replay.safe_code == "DELEGATION_WAIT_STALE"
+    assert stale_replay.kind == "REJECTED"
+    assert stale_replay.safe_code == (
+        "DAILY_UPDATE_TOOL_REJECTED" if failed_after_effect else "DELEGATION_WAIT_STALE"
+    )
 
 
 async def test_planning_job_reclaim_rejects_an_old_attempt_from_the_same_worker(
@@ -1152,3 +1272,512 @@ async def test_planning_job_reclaim_rejects_an_old_attempt_from_the_same_worker(
             text("SELECT status FROM workflow_jobs WHERE id=:id"), {"id": job_id}
         )
     assert state == "COMPLETED"
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "ANALYZE_WORKLOAD",
+        "RECOMMEND_TEAM",
+        "REQUIREMENTS_DRAFT",
+        "REVISE_TEAM",
+        "ASSIGN_TASK_EXPLICITLY",
+    ],
+)
+async def test_goal_assignment_replays_verified_reads_and_effects(
+    journal: Journal, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    from app.modules.assistant.adapters.agent_runtime import build_agent_registry
+    from app.modules.assistant.adapters.assignment_receipts import PostgreSQLAssignmentReceiptReader
+    from app.modules.assistant.adapters.assignment_tools import (
+        AssignmentApplicationService,
+        AssistantAssignmentContextResolver,
+        AssistantAssignmentExplicitCommandAdapter,
+        AssistantAssignmentToolAdapter,
+    )
+    from app.modules.organization.adapters.member_repository import (
+        SqlAlchemyMemberTransactionFactory,
+    )
+    from app.modules.organization.application.member_service import MemberService
+    from app.modules.people_capacity.adapters.repository import (
+        SqlAlchemyPeopleCapacityTransactionFactory,
+    )
+    from app.modules.people_capacity.application.service import PeopleCapacityService
+    from app.modules.work.planning.assignment.adapters.recommendation_repository import (
+        SqlAlchemyRecommendationTransactionFactory,
+    )
+    from app.modules.work.planning.assignment.adapters.repository import (
+        SqlAlchemyExplicitAssignmentTransactionFactory,
+        SqlAlchemyTeamRequirementTransactionFactory,
+    )
+    from app.modules.work.planning.assignment.application.assignment_service import (
+        AssignmentError,
+        ExplicitAssignmentCommand,
+        ExplicitTaskAssignmentService,
+    )
+    from app.modules.work.planning.assignment.application.recommendation_service import (
+        CreateRecommendationCommand,
+        DecideRecommendationCommand,
+        TeamRecommendationService,
+    )
+    from app.modules.work.planning.assignment.application.requirement_service import (
+        ConfirmRequirementsCommand,
+        DeriveRequirementsCommand,
+        GetRequirementsQuery,
+        TeamRequirementService,
+    )
+    from app.modules.work.planning.assignment.domain.recommendations import RecommendationVersion
+    from work_management_ai.agents.assignment.contracts import explicit_goal_assignment_key
+    from work_management_ai.agents.assignment.harness import AssignmentAgentHarness
+
+    engine, sessions, actor, log, scope, lease, _, _ = journal
+    project_id, task_id, week_id, skill_id = (uuid4() for _ in range(4))
+    revise = operation == "REVISE_TEAM"
+    alternate_member = uuid4()
+    parameters = {
+        "org": scope.organization_id,
+        "member": scope.membership_id,
+        "project": project_id,
+        "task": task_id,
+        "week": week_id,
+        "skill": skill_id,
+    }
+    async with engine.begin() as connection:
+        for statement in (
+            "INSERT INTO projects (id,organization_id,name,created_by_membership_id,"
+            "updated_by_membership_id) VALUES (:project,:org,'Launch',:member,:member)",
+            "INSERT INTO project_weeks (id,organization_id,project_id,week_number,start_date,"
+            "end_date,objective,created_by_membership_id,updated_by_membership_id) "
+            "VALUES (:week,:org,:project,1,'2026-09-07','2026-09-13','Launch',:member,:member)",
+            "INSERT INTO skills (id,organization_id,name,normalized_name,"
+            "created_by_membership_id,updated_by_membership_id) "
+            "VALUES (:skill,:org,'Research','research',:member,:member)",
+            "INSERT INTO tasks (id,organization_id,project_id,project_week_id,title,status,"
+            "required_skill_labels,estimated_effort_hours,created_by_membership_id,"
+            "updated_by_membership_id) VALUES (:task,:org,:project,:week,'Discovery','TO_DO',"
+            "'[\"Research\"]',8,:member,:member)",
+            "INSERT INTO person_skills (id,organization_id,membership_id,skill_id,level,"
+            "verified_by_membership_id,verified_at) "
+            "VALUES (:id,:org,:member,:skill,5,:member,now())",
+            "INSERT INTO capacity_entries (id,organization_id,membership_id,kind,hours,"
+            "effective_from,effective_to) "
+            "VALUES (:id,:org,:member,'DEFAULT',40,'2026-01-01','2026-12-31')",
+        ):
+            await connection.execute(text(statement), {**parameters, "id": uuid4()})
+        if revise:
+            user = uuid4()
+            values = {**parameters, "user": user, "alternate": alternate_member}
+            for statement in (
+                "INSERT INTO users(id,email_normalized,email_display,display_name,password_hash) "
+                "VALUES (:user,:email,:email,'Lan','unused')",
+                "INSERT INTO memberships(id,organization_id,user_id,role) "
+                "VALUES (:alternate,:org,:user,'EMPLOYEE')",
+                "INSERT INTO person_skills (id,organization_id,membership_id,skill_id,level,"
+                "verified_by_membership_id,verified_at) "
+                "VALUES (:id,:org,:alternate,:skill,5,:member,now())",
+                "INSERT INTO capacity_entries (id,organization_id,membership_id,kind,hours,"
+                "effective_from,effective_to) "
+                "VALUES (:id,:org,:alternate,'DEFAULT',40,'2026-01-01','2026-12-31')",
+            ):
+                await connection.execute(
+                    text(statement), {**values, "id": uuid4(), "email": f"{user}@example.test"}
+                )
+
+    requirements = TeamRequirementService(SqlAlchemyTeamRequirementTransactionFactory(sessions))
+    recommendations = TeamRecommendationService(
+        SqlAlchemyRecommendationTransactionFactory(sessions)
+    )
+    explicit = operation == "ASSIGN_TASK_EXPLICITLY"
+    pending_requirements = operation == "REQUIREMENTS_DRAFT"
+    team: RecommendationVersion | None = None
+    if operation != "ANALYZE_WORKLOAD" and not pending_requirements:
+        draft = await requirements.derive(
+            DeriveRequirementsCommand(actor, project_id, "test-derive", "test-derive")
+        )
+        confirmed = await requirements.confirm(
+            ConfirmRequirementsCommand(
+                actor, project_id, draft.id, draft.version, "test-confirm", "test-confirm"
+            )
+        )
+        if explicit or revise:
+            team = await recommendations.create(
+                CreateRecommendationCommand(
+                    actor=actor,
+                    project_id=project_id,
+                    requirement_set_id=confirmed.id,
+                    requirement_version=confirmed.version,
+                    request_id="test-team",
+                    idempotency_key="test-team",
+                )
+            )
+        if explicit:
+            assert team is not None
+            await recommendations.decide(
+                DecideRecommendationCommand(
+                    actor=actor,
+                    recommendation_id=team.recommendation_id,
+                    expected_version=team.version,
+                    action="approve",
+                    request_id="test-approve",
+                    idempotency_key="test-approve",
+                )
+            )
+    projects = ProjectService(SqlAlchemyProjectTransactionFactory(sessions))
+    tasks = TaskService(SqlAlchemyTaskTransactionFactory(sessions))
+    members = MemberService(SqlAlchemyMemberTransactionFactory(sessions))
+    actors = CurrentActorService(SqlAlchemyAuthTransactionFactory(sessions))
+    project = await projects.get_project(actor=actor, project_id=project_id)
+    project_ref = ContextReference(
+        reference_id=uuid4(),
+        organization_id=scope.organization_id,
+        resource_type="project",
+        resource_id=project_id,
+        version=project.version,
+        observed_at=datetime.now(UTC),
+    )
+
+    pins = (project_ref,)
+    revision_instruction = None
+    if revise:
+        assert team is not None and len(team.selections) == 1
+        picked = team.selections[0].membership_id
+        alternatives = {
+            item.membership_id: item.display_name for item in team.alternatives if item.eligible
+        }
+        replacement = alternate_member if picked == actor.membership_id else actor.membership_id
+        revision_instruction = (
+            f"Replace {alternatives[picked]} with {alternatives[replacement]} "
+            "because the schedule changed"
+        )
+        pins += (
+            project_ref.model_copy(
+                update={
+                    "reference_id": uuid4(),
+                    "resource_type": "TEAM_RECOMMENDATION",
+                    "resource_id": team.recommendation_id,
+                    "version": team.version,
+                }
+            ),
+        )
+    task = await tasks.get_task(actor=actor, task_id=task_id)
+    if explicit:
+        current_actor = await actors.resolve(
+            organization_id=actor.organization_id, membership_id=actor.membership_id
+        )
+        assert current_actor is not None
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE assistant_messages SET content_blocks = jsonb_build_array("
+                    "jsonb_build_object('kind', 'text', 'text', CAST(:command AS text))) "
+                    "WHERE organization_id=:org AND id="
+                    "(SELECT user_message_id FROM assistant_turns WHERE id=:turn)"
+                ),
+                {
+                    **parameters,
+                    "turn": scope.turn_id,
+                    "command": f"Assign Discovery to {current_actor.display_name}",
+                },
+            )
+        pins += (
+            project_ref.model_copy(
+                update={
+                    "reference_id": uuid4(),
+                    "resource_type": "task",
+                    "resource_id": task_id,
+                    "version": task.version,
+                }
+            ),
+            project_ref.model_copy(
+                update={
+                    "reference_id": uuid4(),
+                    "resource_type": "membership",
+                    "resource_id": actor.membership_id,
+                    "version": None,
+                }
+            ),
+        )
+
+    async def check_refs(target: RunScope, refs: tuple[ContextReference, ...]) -> None:
+        assert target == scope
+        current = await projects.get_project(actor=actor, project_id=project_id)
+        for ref in refs:
+            if ref.resource_type == "TEAM_RECOMMENDATION":
+                saved = await recommendations.get(actor, ref.resource_id, ref.version)
+                assert saved.recommendation_id == ref.resource_id and saved.version == ref.version
+            elif ref.resource_type.casefold() == "task":
+                visible = await tasks.get_task(actor=actor, task_id=ref.resource_id)
+                assert visible.version == ref.version and visible.project_id == project_id
+            elif ref.resource_type.casefold() == "membership":
+                assert ref.resource_id == actor.membership_id
+            else:
+                assert ref.resource_id == project_id
+                assert ref.resource_type.casefold() in {"project", "workload"}
+                assert ref.version is None or ref.version == current.version
+
+    class GoalAccess:
+        async def verify(self, handoff: AgentHandoffV2) -> None:
+            await check_refs(scope, handoff.context_references)
+
+    registry, tools = build_agent_registry()
+    registry.register_resource("work_management_ai.agents.assignment", "agent.v2.yaml")
+    (pin,) = registry.specialist_pins(goal_directed=True)
+    transactions = PostgreSQLAssistantTransactionFactory(sessions)
+    recorder = PostgreSQLExecutionRecorder(
+        transaction_factory=transactions,
+        registry=registry,
+        actor=actor,
+        scope=ExecutionScope(
+            organization_id=scope.organization_id,
+            actor_membership_id=scope.membership_id,
+            orchestration_run_id=scope.orchestration_run_id,
+            trigger=ChatTurnTrigger(turn_id=scope.turn_id),
+        ),
+    )
+    parent = await recorder.ensure_orchestrator_run()
+    assignments = ExplicitTaskAssignmentService(
+        SqlAlchemyExplicitAssignmentTransactionFactory(sessions)
+    )
+    specialized_tools = AssistantAssignmentToolAdapter(
+        application=AssignmentApplicationService(
+            actor_resolver=actors,
+            requirements=requirements,
+            recommendations=recommendations,
+            assignments=assignments,
+            people_capacity=PeopleCapacityService(
+                SqlAlchemyPeopleCapacityTransactionFactory(sessions)
+            ),
+            planning=ManualPlanningService(SqlAlchemyManualPlanningTransactionFactory(sessions)),
+            members=members,
+        )
+    )
+    harness = AssignmentAgentHarness(
+        model_gateway=BudgetedToolLoopGateway(
+            MockModelGateway(
+                fixtures={
+                    "assignment_agent.en.goal_intake": {
+                        "operation": "RECOMMEND_TEAM" if pending_requirements else operation,
+                        "revision_instruction": revision_instruction,
+                    }
+                },
+                usage_fixtures={
+                    "assignment_agent.en.goal_intake": ModelUsage(
+                        input_tokens=100, output_tokens=20
+                    )
+                },
+            )
+        ),
+        tool_executor=BudgetedSpecialistTools(
+            RecordingToolExecutor(
+                transaction_factory=transactions,
+                tool_registry=tools,
+                backend=specialized_tools,
+            )
+        ),
+        actor_resolver=CurrentAgentActorResolver(actors),
+        goal_access=GoalAccess(),
+        explicit_command=AssistantAssignmentExplicitCommandAdapter(
+            source_turn=PostgreSQLGoalSourceTurnReader(
+                session_factory=sessions, actor=actor, scope=scope
+            ),
+            actor_resolver=actors,
+            resolver=AssistantAssignmentContextResolver(tasks=tasks, members=members),
+        ),
+    )
+    assignment_receipts = PostgreSQLAssignmentReceiptReader(session_factory=sessions, actor=actor)
+    handoffs: list[AgentHandoffV2] = []
+
+    class AssignmentChild:
+        async def run(self, handoff: AgentHandoffV2) -> AgentResult:
+            handoffs.append(handoff)
+            return await harness.run(handoff)
+
+    adapter = DelegationAdapterV2(
+        scope=scope,
+        parent_agent_run_id=parent,
+        actor_role="MANAGER",
+        active_phase=5,
+        locale="en",
+        timezone="UTC",
+        agent_registry=registry,
+        specialist_pins=(pin,),
+        runners={
+            AgentId.ASSIGNMENT: PostgreSQLGoalSpecialistRunner(
+                recorder=recorder,
+                harness=AssignmentChild(),
+                pin=pin,
+                assignment_receipts=assignment_receipts,
+            )
+        },
+        references=VerifiedDelegationReferences(
+            scope=scope,
+            exploration=(),
+            active_context=pins,
+            completed_specialists=(),
+            recheck=check_refs,
+        ),
+    )
+    delegation_tools = ToolRegistry.from_resources(
+        (("work_management_ai.tools.delegation", "delegate.v2.yaml"),)
+    )
+    (tool,) = delegation_tools.candidate_definitions(("delegate_agent@2",))
+    schema = filtered_delegate_v2_tool_schema(
+        tool.schema, allowed_specialists=adapter.available_specialists()
+    )
+    assert schema.input_contract is not None
+    admitted = PreparedToolSet(
+        (
+            AdmittedTool(
+                schema=schema,
+                input_contract=schema.input_contract,
+                output_contract=tool.output_contract,
+                version=tool.pin.version,
+                fingerprint=tool.pin.fingerprint,
+            ),
+        ),
+        "assignment-goal",
+        lambda _: True,
+    )
+    pipeline = ToolPipeline(
+        store=log,
+        policy=Policy(),
+        backends={"delegate_agent@2": BackendDelegationTool(actor=actor, adapter=adapter)},
+    )
+    budget = PostgreSQLRunBudget(sessions, actor)
+    interval = await budget.reserve(scope, UsageReservation(kind="INTERVAL"), lease=lease)
+    call = ToolCall(
+        call_id="assignment-goal",
+        name="delegate_agent",
+        arguments={
+            "agent_id": "assignment",
+            "objective": revision_instruction or "Check the project team and workload",
+            "expected_result": "A verified result",
+            "context_ref_ids": [str(ref.reference_id) for ref in pins],
+        },
+    )
+
+    interrupted: list[AgentResult] = []
+
+    async def interrupt(_run_id: UUID, result: AgentResult) -> None:
+        interrupted.append(result)
+        raise RuntimeError("before child result publication")
+
+    with candidate_budget(CandidateBudget(scope, lease, budget, interval.reservation.operation_id)):
+        if operation != "ANALYZE_WORKLOAD":
+            with monkeypatch.context() as patch:
+                patch.setattr(recorder, "finish_goal_agent_run", interrupt)
+                failed = await pipeline.execute(scope, call, admitted=admitted, lease=lease)
+            assert failed.kind == "REJECTED" and failed.safe_code == "TOOL_RECONCILIATION_REQUIRED"
+            expected_status = (
+                AgentRunStatus.COMPLETED
+                if explicit or pending_requirements
+                else AgentRunStatus.AWAITING_HUMAN
+            )
+            assert interrupted and interrupted[0].status is expected_status, interrupted
+            assert await assignment_receipts.recover_goal(handoffs[0]) is not None
+        result = await pipeline.execute(scope, call, admitted=admitted, lease=lease)
+        assert await pipeline.execute(scope, call, admitted=admitted, lease=lease) == result
+        assert len(handoffs) == 1
+    async with engine.connect() as connection:
+        if operation == "RECOMMEND_TEAM" or revise:
+            assert isinstance(result, DeferredToolResult), result
+            assert result.wait_ref.kind == "HUMAN_DECISION"
+            rows = (
+                await connection.execute(
+                    text("SELECT id, status FROM recommendations WHERE organization_id=:org"),
+                    parameters,
+                )
+            ).all()
+            assert rows == [(result.wait_ref.resource_id, "PROPOSED")]
+            assert result.wait_ref.resource_version == (2 if revise else 1)
+            if revise:
+                assert team is not None and result.wait_ref.resource_id == team.recommendation_id
+                updated = await recommendations.get(actor, team.recommendation_id, 2)
+                assert updated.selections[0].membership_id != team.selections[0].membership_id
+        elif explicit:
+            assert isinstance(result, CompletedToolResult), result
+            assert result.evidence and result.evidence[0].resource_id == task_id
+            assigned = await tasks.get_task(actor=actor, task_id=task_id)
+            assert assigned.assignee_membership_id == actor.membership_id
+            assert assigned.version == task.version + 1
+            replacement_id = uuid4()
+            async with engine.begin() as setup:
+                await setup.execute(
+                    text(
+                        "INSERT INTO tasks (id,organization_id,project_id,project_week_id,title,"
+                        "status,created_by_membership_id,updated_by_membership_id) "
+                        "VALUES (:id,:org,:project,:week,'Replacement discovery','TO_DO',"
+                        ":member,:member)"
+                    ),
+                    {**parameters, "id": replacement_id},
+                )
+            for target_id, version in ((task_id, assigned.version), (replacement_id, 1)):
+                with pytest.raises(AssignmentError, match="IDEMPOTENCY_KEY_REUSED"):
+                    await assignments.assign(
+                        ExplicitAssignmentCommand(
+                            actor=actor,
+                            task_id=target_id,
+                            assignee_membership_id=actor.membership_id,
+                            expected_task_version=version,
+                            request_id="repeat-original-command",
+                            idempotency_key=explicit_goal_assignment_key(scope.turn_id),
+                            once_per_turn=True,
+                        )
+                    )
+            replacement = await tasks.get_task(actor=actor, task_id=replacement_id)
+            assert replacement.assignee_membership_id is None
+            assert (
+                await connection.scalar(
+                    text(
+                        "SELECT count(*) FROM audit_events WHERE organization_id=:org "
+                        "AND resource_id=:task AND action='task.assigned.explicit' "
+                        "AND outcome='SUCCEEDED'"
+                    ),
+                    parameters,
+                )
+                == 1
+            )
+        elif pending_requirements:
+            assert isinstance(result, CompletedToolResult), result
+            draft = await requirements.get_for_project(
+                GetRequirementsQuery(actor=actor, project_id=project_id)
+            )
+            assert draft.status.value == "DRAFT"
+            await requirements.confirm(
+                ConfirmRequirementsCommand(
+                    actor, project_id, draft.id, draft.version, "later-confirm", "later-confirm"
+                )
+            )
+            with candidate_budget(
+                CandidateBudget(scope, lease, budget, interval.reservation.operation_id)
+            ):
+                stale = await pipeline.execute(scope, call, admitted=admitted, lease=lease)
+            assert stale.kind == "REJECTED", stale
+            assert (
+                await connection.scalar(
+                    text("SELECT count(*) FROM recommendations WHERE organization_id=:org"),
+                    parameters,
+                )
+                == 0
+            )
+        else:
+            assert isinstance(result, CompletedToolResult), result
+            assert result.evidence and result.evidence[0].resource_id == project_id
+            assert (
+                await connection.scalar(
+                    text("SELECT count(*) FROM recommendations WHERE organization_id=:org"),
+                    parameters,
+                )
+                == 0
+            )
+        assert await connection.scalar(
+            text("SELECT count(*) FROM project_team_memberships WHERE organization_id=:org"),
+            parameters,
+        ) == (1 if explicit else 0)
+        if not explicit:
+            assert (
+                await connection.scalar(
+                    text("SELECT assignee_membership_id FROM tasks WHERE id=:task"), parameters
+                )
+                is None
+            )

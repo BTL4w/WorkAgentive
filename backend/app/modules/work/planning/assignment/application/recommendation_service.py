@@ -46,6 +46,7 @@ class ReviseRecommendationCommand(MutationCommand):
     recommendation_id: UUID
     expected_version: int
     overrides: tuple[CandidateOverride, ...]
+    expected_project_id: UUID | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

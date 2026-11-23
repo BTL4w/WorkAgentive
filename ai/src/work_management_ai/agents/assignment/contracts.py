@@ -3,12 +3,16 @@
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from work_management_ai.runtime.contracts import JsonValue
+from work_management_ai.runtime.contracts import (
+    AgentHandoffV2,
+    GoalDirectedAgentResult,
+    JsonValue,
+)
 
 
 class _StrictFrozenModel(BaseModel):
@@ -20,6 +24,40 @@ class AssignmentOperation(StrEnum):
     REVISE_TEAM = "REVISE_TEAM"
     ANALYZE_WORKLOAD = "ANALYZE_WORKLOAD"
     ASSIGN_TASK_EXPLICITLY = "ASSIGN_TASK_EXPLICITLY"
+
+
+class AssignmentGoalChoice(_StrictFrozenModel):
+    operation: AssignmentOperation | None
+    revision_instruction: str | None = Field(max_length=4_000)
+
+
+class VerifiedAssignmentCommand(_StrictFrozenModel):
+    project_id: UUID
+    task_id: UUID
+    expected_task_version: int = Field(ge=1)
+    assignee_membership_id: UUID
+
+
+EXPLICIT_GOAL_ASSIGNMENT_PREFIX = "goal-assignment:"
+
+
+def explicit_goal_assignment_key(source_turn: UUID) -> str:
+    """Keep one effect per source command, including after a later name resolution."""
+    return f"{EXPLICIT_GOAL_ASSIGNMENT_PREFIX}{source_turn}"
+
+
+class AssignmentExplicitCommandPort(Protocol):
+    """Resolve exact command authority from the original, authorized user turn."""
+
+    async def read(self, handoff: AgentHandoffV2) -> VerifiedAssignmentCommand | None: ...
+
+
+class AssignmentGoalReceiptPort(Protocol):
+    async def recover_goal(self, handoff: AgentHandoffV2) -> GoalDirectedAgentResult | None: ...
+
+    async def verify_goal(
+        self, handoff: AgentHandoffV2, saved: GoalDirectedAgentResult
+    ) -> GoalDirectedAgentResult: ...
 
 
 class AssignmentAgentInput(_StrictFrozenModel):

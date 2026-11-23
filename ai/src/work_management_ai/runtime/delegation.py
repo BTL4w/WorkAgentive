@@ -12,6 +12,10 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 
+from work_management_ai.agents.assignment.contracts import (
+    AssignmentAgentOutput,
+    TeamRecommendationSnapshot,
+)
 from work_management_ai.agents.daily_update.contracts import DailyUpdateResult
 from work_management_ai.model_gateway.tool_contracts import ToolSchema
 from work_management_ai.runtime.activation import ActivationContext
@@ -95,6 +99,9 @@ _CANDIDATE_CAPABILITIES = frozenset(
 
 
 _DAILY_UPDATE_CAPABILITY = (AgentId.DAILY_UPDATE, "daily_update.prepare")
+_ASSIGNMENT_EFFECTS = frozenset(
+    {"assignment.assign_task_explicitly", "assignment.recommend_team", "assignment.revise_team"}
+)
 
 
 class DelegationError(ToolPolicyError):
@@ -133,6 +140,12 @@ class DailyUpdateDraftReceiptPort(Protocol):
     ) -> DailyUpdateResult | None: ...
 
 
+class GoalDailyUpdateDraftReceiptPort(Protocol):
+    async def recover_goal_draft(
+        self, scope: RunScope, *, receipt_id: UUID, task_id: UUID, task_version: int
+    ) -> DailyUpdateResult | None: ...
+
+
 class WorkflowWaitVerifierPort(Protocol):
     async def verify_workflow(
         self, scope: RunScope, workflow_run_id: UUID
@@ -149,6 +162,7 @@ class ChildJobReceipt(BaseModel):
     resolved_action: Literal[
         "planning.create", "planning.resume", "planning.revise", "reporting.prepare_report"
     ]
+    workflow_state: CanonicalWorkflowState | None = None
 
 
 class ChildJobReceiptsPort(Protocol):
@@ -459,6 +473,18 @@ def _normalize_to_parts(
         proposal_version = _int_field(result.typed_output, "proposal_version") or _int_field(
             result.typed_output, "draft_version"
         )
+        if isinstance(result, GoalDirectedAgentResult) and result.resolved_action in {
+            "assignment.recommend_team",
+            "assignment.revise_team",
+        }:
+            value = AssignmentAgentOutput.model_validate(result.typed_output)
+            recommendation = TeamRecommendationSnapshot.model_validate(value.deterministic_result)
+            if (
+                recommendation.organization_id != scope.organization_id
+                or recommendation.status != "PROPOSED"
+            ):
+                return None, None, "DELEGATION_WAIT_UNVERIFIED"
+            proposal_id, proposal_version = recommendation.recommendation_id, recommendation.version
         if proposal_id is None or proposal_version is None:
             return None, None, "DELEGATION_WAIT_UNVERIFIED"
         wait = WaitReference(
@@ -1038,6 +1064,10 @@ class DelegationReferencesPort(Protocol):
 
     async def revalidate(self, scope: RunScope, refs: tuple[ContextReference, ...]) -> None: ...
 
+    def recorded(
+        self, scope: RunScope, reference_ids: tuple[UUID, ...]
+    ) -> tuple[ContextReference, ...]: ...
+
 
 class VerifiedDelegationReferences:
     """Index provenance already established by the trusted turn and runtime."""
@@ -1063,12 +1093,19 @@ class VerifiedDelegationReferences:
     async def resolve(
         self, scope: RunScope, reference_ids: tuple[UUID, ...]
     ) -> tuple[ContextReference, ...]:
-        try:
-            refs = tuple(self._refs[ref_id] for ref_id in reference_ids)
-        except KeyError:
-            raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=False) from None
+        refs = self.recorded(scope, reference_ids)
         await self.revalidate(scope, refs)
         return refs
+
+    def recorded(
+        self, scope: RunScope, reference_ids: tuple[UUID, ...]
+    ) -> tuple[ContextReference, ...]:
+        if scope != self._scope:
+            raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=True)
+        try:
+            return tuple(self._refs[ref_id] for ref_id in reference_ids)
+        except KeyError:
+            raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=False) from None
 
     async def revalidate(self, scope: RunScope, refs: tuple[ContextReference, ...]) -> None:
         if scope != self._scope or any(
@@ -1099,6 +1136,7 @@ class DelegationAdapterV2:
         references: DelegationReferencesPort | None = None,
         workflow_verifier: WorkflowWaitVerifierPort | None = None,
         child_job_receipts: ChildJobReceiptsPort | None = None,
+        daily_update_goal_receipts: GoalDailyUpdateDraftReceiptPort | None = None,
     ) -> None:
         self._scope = scope
         self._parent_id = parent_agent_run_id
@@ -1120,13 +1158,19 @@ class DelegationAdapterV2:
         self._references = references
         self._workflow_verifier = workflow_verifier
         self._child_jobs = child_job_receipts
+        self._daily_goal_receipts = daily_update_goal_receipts
 
     def _target(
         self, agent_id: AgentId
     ) -> tuple[GoalDirectedAgentManifest, GoalSpecialistRunnerPort]:
         pin = self._pins.get(agent_id.value)
         runner = self._runners.get(agent_id)
-        if agent_id is AgentId.ORCHESTRATOR or pin is None or runner is None:
+        if (
+            agent_id is AgentId.ORCHESTRATOR
+            or pin is None
+            or runner is None
+            or (agent_id is AgentId.DAILY_UPDATE and self._daily_goal_receipts is None)
+        ):
             raise DelegationError("DELEGATION_TARGET_UNAVAILABLE", stop_segment=False)
         try:
             target = self._registry.resolve(
@@ -1155,7 +1199,11 @@ class DelegationAdapterV2:
         return tuple(available)
 
     async def _prepare(
-        self, context: ToolInvocationContext, arguments: BaseModel
+        self,
+        context: ToolInvocationContext,
+        arguments: BaseModel,
+        *,
+        receipt_read: bool = False,
     ) -> tuple[AgentHandoffV2, GoalDirectedAgentManifest, GoalSpecialistRunnerPort]:
         if context.scope != self._scope or context.lease.scope != self._scope:
             raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=True)
@@ -1168,7 +1216,11 @@ class DelegationAdapterV2:
         if args.context_ref_ids:
             if self._references is None:
                 raise DelegationError("DELEGATION_CONTEXT_DENIED", stop_segment=False)
-            refs = await self._references.resolve(context.scope, args.context_ref_ids)
+            # A successful effect may advance the very version that authorized dispatch.
+            if receipt_read and args.agent_id in {AgentId.ASSIGNMENT, AgentId.DAILY_UPDATE}:
+                refs = self._references.recorded(context.scope, args.context_ref_ids)
+            else:
+                refs = await self._references.resolve(context.scope, args.context_ref_ids)
             if tuple(ref.reference_id for ref in refs) != args.context_ref_ids or any(
                 ref.organization_id != context.scope.organization_id for ref in refs
             ):
@@ -1225,6 +1277,11 @@ class DelegationAdapterV2:
             allow_job=handoff.target_agent_id in {AgentId.PLANNING, AgentId.REPORTING},
         ):
             record = await runner.run(handoff)
+        if handoff.target_agent_id is AgentId.DAILY_UPDATE:
+            verified = await self._recover_goal_daily(context, handoff, record)
+            if verified is None:
+                raise DelegationError("DELEGATION_WAIT_UNVERIFIED", stop_segment=True)
+            record = verified
         return await self._normalize(context, manifest, record)
 
     async def reconcile(
@@ -1240,16 +1297,14 @@ class DelegationAdapterV2:
     async def _recover(
         self, context: ToolInvocationContext, arguments: BaseModel
     ) -> BackendToolResult | None:
-        handoff, manifest, runner = await self._prepare(context, arguments)
+        handoff, manifest, runner = await self._prepare(context, arguments, receipt_read=True)
         record = await runner.reconcile(handoff)
-        if record is None and self._child_jobs is not None:
+        if handoff.target_agent_id is AgentId.DAILY_UPDATE:
+            record = await self._recover_goal_daily(context, handoff, record)
+        committed = None
+        if record is None:
             child_id = uuid5(NAMESPACE_URL, f"agent-run:{handoff.idempotency_key}")
-            committed = await self._child_jobs.recover_job(
-                context.scope,
-                allocation_id=uuid5(context.receipt_id, "child-budget"),
-                child_run_id=child_id,
-                target=self._pins[handoff.target_agent_id.value],
-            )
+            committed = await self._read_child_job(context, handoff.target_agent_id, child_id)
             if committed is not None:
                 key = (
                     "generation_id"
@@ -1269,7 +1324,90 @@ class DelegationAdapterV2:
                 )
         if record is None:
             return None
-        return await self._normalize(context, manifest, record)
+        if self._references is not None and (
+            (
+                handoff.target_agent_id is AgentId.ASSIGNMENT
+                and record[1].resolved_action not in _ASSIGNMENT_EFFECTS
+            )
+            or (
+                handoff.target_agent_id is AgentId.DAILY_UPDATE
+                and record[1].status is not AgentRunStatus.AWAITING_HUMAN
+            )
+        ):
+            await self._references.revalidate(context.scope, handoff.context_references)
+        return await self._normalize(context, manifest, record, committed=committed)
+
+    async def _recover_goal_daily(
+        self,
+        context: ToolInvocationContext,
+        handoff: AgentHandoffV2,
+        record: tuple[UUID, GoalDirectedAgentResult] | None,
+    ) -> tuple[UUID, GoalDirectedAgentResult] | None:
+        saved = record[1] if record is not None else None
+        if saved is not None and saved.status not in {
+            AgentRunStatus.AWAITING_HUMAN,
+            AgentRunStatus.FAILED,
+        }:
+            return record
+        failed = record if saved is not None and saved.status is AgentRunStatus.FAILED else None
+        tasks = [
+            ref for ref in handoff.context_references if ref.resource_type.casefold() == "task"
+        ]
+        if (
+            self._daily_goal_receipts is None
+            or len(tasks) != 1
+            or (task_version := tasks[0].version) is None
+        ):
+            return failed
+        receipt = await self._daily_goal_receipts.recover_goal_draft(
+            context.scope,
+            receipt_id=context.receipt_id,
+            task_id=tasks[0].resource_id,
+            task_version=task_version,
+        )
+        if receipt is None:
+            return failed
+        drafts = [
+            ref
+            for ref in handoff.context_references
+            if ref.resource_type.casefold() == "daily_update_draft"
+        ]
+        if drafts and (
+            len(drafts) != 1
+            or drafts[0].resource_id != receipt.draft_id
+            or drafts[0].version != receipt.draft_version - 1
+        ):
+            raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+        if saved is not None and saved.status is AgentRunStatus.AWAITING_HUMAN:
+            if (
+                saved.resolved_action != "daily_update.prepare"
+                or saved.interaction_outcome is not InteractionOutcome.ACTION_REVIEW_REQUIRED
+                or DailyUpdateResult.model_validate(saved.typed_output) != receipt
+            ):
+                raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+            return record
+        child_id = uuid5(NAMESPACE_URL, f"agent-run:{handoff.idempotency_key}")
+        return child_id, GoalDirectedAgentResult(
+            agent_id=AgentId.DAILY_UPDATE,
+            agent_version=handoff.target_agent_version,
+            status=AgentRunStatus.AWAITING_HUMAN,
+            interaction_outcome=InteractionOutcome.ACTION_REVIEW_REQUIRED,
+            typed_output=receipt.model_dump(mode="json"),
+            stop_reason="DAILY_UPDATE_OWNER_REVIEW",
+            resolved_action="daily_update.prepare",
+        )
+
+    async def _read_child_job(
+        self, context: ToolInvocationContext, agent_id: AgentId, child_id: UUID
+    ) -> ChildJobReceipt | None:
+        if self._child_jobs is None or agent_id not in {AgentId.PLANNING, AgentId.REPORTING}:
+            return None
+        return await self._child_jobs.recover_job(
+            context.scope,
+            allocation_id=uuid5(context.receipt_id, "child-budget"),
+            child_run_id=child_id,
+            target=self._pins[agent_id.value],
+        )
 
     async def revalidate_result(
         self, context: ToolInvocationContext, result: BackendToolResult
@@ -1278,18 +1416,26 @@ class DelegationAdapterV2:
         if result.wait_ref is not None:
             await self.revalidate_wait(context, result.wait_ref)
         else:
-            handoff, manifest, runner = await self._prepare(context, context.canonical_arguments)
+            handoff, manifest, runner = await self._prepare(
+                context, context.canonical_arguments, receipt_read=True
+            )
             value = result.output
             if not isinstance(value, DelegateAgentOutputV2) or (
                 (value.agent_id, value.agent_version) != (manifest.agent.id, manifest.agent.version)
                 or value.resolved_action not in manifest.capabilities
             ):
                 raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
-            if value.agent_id is AgentId.RISK:
+            if value.agent_id in {AgentId.RISK, AgentId.ASSIGNMENT}:
                 record = await runner.reconcile(handoff)
                 if record is None or await self._normalize(context, manifest, record) != result:
                     raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
-                return
+                if value.agent_id is AgentId.RISK or value.resolved_action in _ASSIGNMENT_EFFECTS:
+                    return
+            if self._references is not None and value.agent_id in {
+                AgentId.ASSIGNMENT,
+                AgentId.DAILY_UPDATE,
+            }:
+                await self._references.revalidate(context.scope, handoff.context_references)
             refs = tuple(dict.fromkeys((*refs, *value.evidence, *value.artifact_refs)))
         if refs:
             if self._references is None:
@@ -1306,6 +1452,8 @@ class DelegationAdapterV2:
         context: ToolInvocationContext,
         manifest: GoalDirectedAgentManifest,
         record: tuple[UUID, GoalDirectedAgentResult],
+        *,
+        committed: ChildJobReceipt | None = None,
     ) -> BackendToolResult:
         child_id, result = record
         action = result.resolved_action
@@ -1325,8 +1473,22 @@ class DelegationAdapterV2:
                     "typed_output": {**result.typed_output, "workflow_run_id": str(generation_id)},
                 }
             )
-        elif self._workflow_verifier is not None and workflow_id is not None:
-            workflow = await self._workflow_verifier.verify_workflow(context.scope, workflow_id)
+        elif workflow_id is not None:
+            if manifest.agent.id is AgentId.PLANNING and action in {
+                "planning.create",
+                "planning.resume",
+                "planning.revise",
+            }:
+                if committed is None:
+                    committed = await self._read_child_job(context, AgentId.PLANNING, child_id)
+                if committed is None and action == "planning.revise":
+                    raise DelegationError("DELEGATION_WAIT_UNVERIFIED", stop_segment=True)
+                if committed is not None:
+                    if (committed.resource_id, committed.resolved_action) != (workflow_id, action):
+                        raise DelegationError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+                    workflow = committed.workflow_state
+            if workflow is None and self._workflow_verifier is not None:
+                workflow = await self._workflow_verifier.verify_workflow(context.scope, workflow_id)
         output, wait, failure = _normalize_to_parts(
             context.scope,
             result,

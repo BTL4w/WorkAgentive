@@ -711,6 +711,16 @@ class SqlAlchemyTeamRequirementRepository:
             version.created_at,
         )
 
+    async def read_operation_receipt(
+        self, actor: AuthenticatedActor, *, project_id: UUID, set_id: UUID, version: int
+    ) -> RequirementSet | None:
+        await self._activate(actor)
+        await self.authorize_project(actor, project_id)
+        snapshot = await self._get_by_set(actor, set_id)
+        if snapshot is None or (snapshot.project_id, snapshot.version) != (project_id, version):
+            return None
+        return snapshot
+
     async def derive(self, command: DeriveRequirementsCommand) -> RequirementSet:
         await self._activate(command.actor)
         await self._project(command.actor, command.project_id, lock=True)
@@ -1249,7 +1259,7 @@ class SqlAlchemyExplicitAssignmentRepository:
         )
 
     @staticmethod
-    def _fingerprint(command: ExplicitAssignmentCommand) -> str:
+    def fingerprint(command: ExplicitAssignmentCommand) -> str:
         canonical = json.dumps(
             {
                 "task_id": str(command.task_id),
@@ -1264,8 +1274,8 @@ class SqlAlchemyExplicitAssignmentRepository:
     async def _claim(
         self, command: ExplicitAssignmentCommand
     ) -> tuple[IdempotencyRecordModel, ExplicitAssignmentResult | None]:
-        operation = f"task.assign:{command.task_id}"
-        fingerprint = self._fingerprint(command)
+        operation = command.idempotency_operation
+        fingerprint = self.fingerprint(command)
         now = datetime.now(UTC)
         inserted = await self._session.scalar(
             pg_insert(IdempotencyRecordModel)

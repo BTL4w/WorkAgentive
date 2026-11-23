@@ -8,6 +8,7 @@ from uuid import NAMESPACE_URL, uuid5
 from work_management_ai.agents.daily_update.contracts import (
     DailyUpdateHandoff,
     DailyUpdateResult,
+    EvidenceRef,
     ExtractedReport,
     ReportingSnapshot,
 )
@@ -25,15 +26,25 @@ from work_management_ai.model_gateway.contracts import (
 )
 from work_management_ai.runtime.contracts import (
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentResult,
     AgentRunStatus,
+    GoalActionAccessPort,
+    GoalDirectedAgentResult,
+    InteractionOutcome,
     JsonValue,
+    RiskLevel,
+    SourceTurnTextPort,
     ToolExecutionRequest,
     ToolExecutorPort,
     VerifierResult,
 )
-from work_management_ai.runtime.manifests import AgentManifest, load_yaml_resource
+from work_management_ai.runtime.manifests import (
+    AgentManifest,
+    GoalDirectedAgentManifest,
+    load_yaml_resource,
+)
 from work_management_ai.runtime.policy_guard import PolicyGuard
 from work_management_ai.runtime.skill_bundle import (
     load_packaged_skill_manifest,
@@ -49,16 +60,23 @@ class DailyUpdateHarness:
         model_gateway: ModelGateway,
         tool_executor: ToolExecutorPort,
         actor_resolver: ActorContextResolverPort,
+        source_turns: SourceTurnTextPort | None = None,
+        goal_access: GoalActionAccessPort | None = None,
     ) -> None:
         self.gateway = model_gateway
         self.tools = tool_executor
         self.actors = actor_resolver
+        self.source_turns = source_turns
+        self.goal_access = goal_access
         self.manifest = load_yaml_resource(
             "work_management_ai.agents.daily_update", "agent.yaml", AgentManifest
         )
+        self.goal_manifest = load_yaml_resource(
+            "work_management_ai.agents.daily_update", "agent.v2.yaml", GoalDirectedAgentManifest
+        )
         self.graph = DailyUpdateGraph(self)
 
-    async def run(self, handoff: AgentHandoff) -> AgentResult:
+    async def run(self, handoff: AgentHandoff | AgentHandoffV2) -> AgentResult:
         state = DailyUpdateState(
             handoff=handoff,
             value=None,
@@ -80,17 +98,21 @@ class DailyUpdateHarness:
             state["status"] = AgentRunStatus.FAILED
         status = state["status"]
         output: dict[str, JsonValue]
+        outcome: InteractionOutcome
         if status is AgentRunStatus.AWAITING_HUMAN and state["card"] is not None:
             output = cast(dict[str, JsonValue], state["card"].model_dump(mode="json"))
             code = "AWAIT_OWNER"
+            outcome = InteractionOutcome.ACTION_REVIEW_REQUIRED
         elif status is AgentRunStatus.AWAITING_INPUT:
             output = {"question_key": "dailyUpdate.chat.clarify"}
             code = "NEEDS_INPUT"
+            outcome = InteractionOutcome.NEEDS_INPUT
         else:
             status = AgentRunStatus.FAILED
             output = {"fallback": "manual_daily_update"}
             code = "DAILY_UPDATE_MANUAL_FALLBACK"
-        return AgentResult(
+            outcome = InteractionOutcome.FAILED
+        result = AgentResult(
             agent_id=AgentId.DAILY_UPDATE,
             agent_version="1.0.0",
             status=status,
@@ -107,6 +129,48 @@ class DailyUpdateHarness:
                     verifier_version="1.0.0",
                     passed=status is not AgentRunStatus.FAILED,
                 ),
+            ),
+        )
+        if isinstance(handoff, AgentHandoffV2):
+            return GoalDirectedAgentResult.model_validate(
+                {
+                    **result.model_dump(),
+                    "agent_version": self.goal_manifest.agent.version,
+                    "interaction_outcome": outcome,
+                    "resolved_action": "daily_update.prepare" if state["value"] else None,
+                }
+            )
+        return result
+
+    async def _intake_v2(self, handoff: AgentHandoffV2) -> DailyUpdateHandoff | None:
+        tasks = tuple(r for r in handoff.context_references if r.resource_type.upper() == "TASK")
+        drafts = tuple(
+            r for r in handoff.context_references if r.resource_type.upper() == "DAILY_UPDATE_DRAFT"
+        )
+        evidence = tuple(
+            r for r in handoff.context_references if r.resource_type.upper() == "EVIDENCE"
+        )
+        if len(tasks) != 1 or tasks[0].version is None or len(drafts) > 1:
+            return None
+        if any(r.version is None or not r.freshness_required for r in (*tasks, *drafts, *evidence)):
+            return None
+        if self.source_turns is None or self.goal_access is None:
+            raise ValueError("DAILY_UPDATE_CONTEXT_UNAVAILABLE")
+        await self.goal_access.verify(handoff)
+        report = await self.source_turns.read(handoff)
+        if not report.strip():
+            return None
+        return DailyUpdateHandoff(
+            text=report,
+            locale=handoff.locale,
+            task_id=tasks[0].resource_id,
+            task_version=tasks[0].version,
+            draft_id=drafts[0].resource_id if drafts else None,
+            draft_version=drafts[0].version if drafts else None,
+            evidence_refs=tuple(
+                EvidenceRef(evidence_id=r.resource_id, version=r.version)
+                for r in evidence
+                if r.version is not None
             ),
         )
 
@@ -138,22 +202,40 @@ class DailyUpdateHarness:
         handoff = state["handoff"]
         if node == "authorize":
             actor = await self.actors.resolve(handoff.actor)
-            PolicyGuard().authorize_handoff(
-                current_actor=actor,
-                parent_agent_id=AgentId.ORCHESTRATOR,
-                handoff=handoff,
-                manifest=self.manifest,
-                requested_tool_ids=("daily_update.prepare@1",),
-                requested_skill_ids=self.manifest.allowed_skills,
-            )
             if any(r.organization_id != actor.organization_id for r in handoff.context_references):
                 raise ValueError("DAILY_UPDATE_CONTEXT_TENANT_MISMATCH")
             if handoff.budget.max_model_attempts < 1:
                 raise ValueError("DAILY_UPDATE_MODEL_BUDGET")
-            value = DailyUpdateHandoff.model_validate(handoff.typed_input)
+            if isinstance(handoff, AgentHandoffV2):
+                skills = self.goal_manifest.allowed_skills
+                PolicyGuard().authorize_goal_action(
+                    current_actor=actor,
+                    handoff=handoff,
+                    manifest=self.goal_manifest,
+                    resolved_action="daily_update.prepare",
+                    action_risk=RiskLevel.PROPOSAL_ONLY,
+                    requested_tool_ids=("daily_update.prepare@1",),
+                    requested_skill_ids=skills,
+                )
+                value = await self._intake_v2(handoff)
+                if value is None:
+                    state["status"] = AgentRunStatus.AWAITING_INPUT
+                    state["stopped"] = True
+                    return
+            else:
+                skills = self.manifest.allowed_skills
+                PolicyGuard().authorize_handoff(
+                    current_actor=actor,
+                    parent_agent_id=AgentId.ORCHESTRATOR,
+                    handoff=handoff,
+                    manifest=self.manifest,
+                    requested_tool_ids=("daily_update.prepare@1",),
+                    requested_skill_ids=skills,
+                )
+                value = DailyUpdateHandoff.model_validate(handoff.typed_input)
             state["value"] = value
             instructions: list[str] = []
-            for reference in self.manifest.allowed_skills:
+            for reference in skills:
                 name = reference.split("@", maxsplit=1)[0]
                 package = f"work_management_ai.skills.{name}"
                 skill = load_packaged_skill_manifest(package)
@@ -166,6 +248,11 @@ class DailyUpdateHarness:
                 evidence_refs=value.evidence_refs,
                 draft_id=value.draft_id,
                 draft_version=value.draft_version,
+                inherit_draft_evidence=(
+                    isinstance(handoff, AgentHandoffV2)
+                    and value.draft_id is not None
+                    and not value.evidence_refs
+                ),
             )
             return
         value, base = state["value"], state["tool_input"]
@@ -174,6 +261,16 @@ class DailyUpdateHarness:
         if node == "context":
             snapshot = ReportingSnapshot.model_validate(await self._tool(state, base))
             verify_context(value, snapshot)
+            if isinstance(handoff, AgentHandoffV2):
+                if base.inherit_draft_evidence:
+                    state["tool_input"] = base.model_copy(
+                        update={
+                            "evidence_refs": snapshot.evidence_refs,
+                            "inherit_draft_evidence": False,
+                        }
+                    )
+                elif snapshot.evidence_refs != base.evidence_refs:
+                    raise ValueError("DAILY_UPDATE_STALE_EVIDENCE")
         elif node == "extract_report":
             state["model_attempts"] += 1
             system = SYSTEM_V1 + "\n\n## Skill instructions\n" + state["instructions"]
@@ -207,16 +304,23 @@ class DailyUpdateHarness:
             report = state["report"]
             if report is None:
                 raise ValueError("DAILY_UPDATE_REPORT_REQUIRED")
-            state["card"] = DailyUpdateResult.model_validate(
+            draft = DailyUpdateResult.model_validate(
                 await self._tool(
                     state, base.model_copy(update={"action": "DRAFT", "report": report})
                 )
             )
+            if isinstance(handoff, AgentHandoffV2) and (
+                (draft.task_id, draft.task_version) != (base.task_id, base.task_version)
+                or draft.draft_version != (base.draft_version or 0) + 1
+                or (base.draft_id is not None and draft.draft_id != base.draft_id)
+            ):
+                raise ValueError("DAILY_UPDATE_DRAFT_MISMATCH")
+            state["card"] = draft
         elif node == "assess_originals":
             card = state["card"]
             if card is None:
                 raise ValueError("DAILY_UPDATE_DRAFT_REQUIRED")
-            state["card"] = DailyUpdateResult.model_validate(
+            assessed = DailyUpdateResult.model_validate(
                 await self._tool(
                     state,
                     base.model_copy(
@@ -228,6 +332,12 @@ class DailyUpdateHarness:
                     ),
                 )
             )
+            if isinstance(handoff, AgentHandoffV2) and (
+                assessed.assessment_id is None
+                or assessed.model_copy(update={"assessment_id": card.assessment_id}) != card
+            ):
+                raise ValueError("DAILY_UPDATE_ASSESSMENT_MISMATCH")
+            state["card"] = assessed
         elif node == "await_owner":
             state["status"] = AgentRunStatus.AWAITING_HUMAN
             state["stopped"] = True

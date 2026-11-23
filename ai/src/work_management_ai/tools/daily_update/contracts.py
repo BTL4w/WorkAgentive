@@ -19,6 +19,7 @@ class DailyUpdateToolInput(DailyContract):
     task_id: UUID
     task_version: int = Field(ge=1)
     evidence_refs: tuple[EvidenceRef, ...] = Field(default=(), max_length=10)
+    inherit_draft_evidence: bool = Field(default=False, exclude_if=lambda value: not value)
     draft_id: UUID | None = None
     draft_version: int | None = Field(default=None, ge=1)
     report: ExtractedReport | None = None

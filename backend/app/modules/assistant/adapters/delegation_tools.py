@@ -33,6 +33,7 @@ from app.modules.progress.adapters.assessment_repository import SqlAlchemyAssess
 from app.modules.progress.domain.daily_updates import DailyUpdateDraft, DailyUpdateError
 from app.modules.progress.domain.evidence_support import AssessmentJobRef
 from app.modules.work.adapters.database_models import IdempotencyRecordModel, IdempotencyState
+from work_management_ai.agents.assignment.contracts import AssignmentGoalReceiptPort
 from work_management_ai.agents.daily_update.contracts import DailyUpdateResult
 from work_management_ai.runtime.contracts import (
     AgentHandoffV2,
@@ -164,13 +165,17 @@ class PostgreSQLGoalSpecialistRunner:
         harness: GoalSpecialistHarness,
         pin: VersionPin,
         risk_tools: RiskToolAdapter | None = None,
+        assignment_receipts: AssignmentGoalReceiptPort | None = None,
     ) -> None:
         self._recorder = recorder
         self._harness = harness
         self._pin = pin
         self._risk_tools = risk_tools
+        self._assignment_receipts = assignment_receipts
 
     async def run(self, handoff: AgentHandoffV2) -> tuple[UUID, GoalDirectedAgentResult]:
+        if handoff.target_agent_id is AgentId.ASSIGNMENT and self._assignment_receipts is None:
+            raise ToolPolicyError("DELEGATION_RECEIPT_VERIFIER_UNAVAILABLE", stop_segment=True)
         recorded = await self._recorder.start_agent_run(handoff)
         if recorded.existing:
             recovered = await self.reconcile(handoff)
@@ -180,12 +185,15 @@ class PostgreSQLGoalSpecialistRunner:
         result = await self._harness.run(handoff)
         if not isinstance(result, GoalDirectedAgentResult):
             raise ToolPolicyError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
+        if handoff.target_agent_id is AgentId.ASSIGNMENT:
+            assert self._assignment_receipts is not None
+            result = await self._assignment_receipts.verify_goal(handoff, result)
         return recorded.id, await self._recorder.finish_goal_agent_run(recorded.id, result)
 
     async def reconcile(
         self, handoff: AgentHandoffV2
     ) -> tuple[UUID, GoalDirectedAgentResult] | None:
-        if handoff.target_agent_id is AgentId.RISK:
+        if handoff.target_agent_id in {AgentId.RISK, AgentId.ASSIGNMENT}:
             self._recorder.check_handoff_scope(handoff)
         recorded = await self._recorder.lookup_agent_run(handoff.idempotency_key)
         if recorded is None:
@@ -200,6 +208,14 @@ class PostgreSQLGoalSpecialistRunner:
         ):
             raise ToolPolicyError("DELEGATION_RECEIPT_MISMATCH", stop_segment=True)
         result = recorded.replayed_result
+        if handoff.target_agent_id is AgentId.ASSIGNMENT:
+            if self._assignment_receipts is None:
+                raise ToolPolicyError("DELEGATION_RECEIPT_VERIFIER_UNAVAILABLE", stop_segment=True)
+            if isinstance(result, GoalDirectedAgentResult):
+                recovered = await self._assignment_receipts.verify_goal(handoff, result)
+            else:
+                recovered = await self._assignment_receipts.recover_goal(handoff)
+            return (recorded.id, recovered) if recovered is not None else None
         if not isinstance(result, GoalDirectedAgentResult):
             return None
         if handoff.target_agent_id is AgentId.RISK and result.status is AgentRunStatus.COMPLETED:
@@ -215,11 +231,24 @@ class PostgreSQLDailyUpdateReceiptReader(_ScopedReceiptReader):
     async def recover_draft(
         self, scope: RunScope, *, receipt_id: UUID, task_id: UUID, task_version: int
     ) -> DailyUpdateResult | None:
+        return await self._recover_draft(
+            scope, key=f"delegate:{receipt_id}", task_id=task_id, task_version=task_version
+        )
+
+    async def recover_goal_draft(
+        self, scope: RunScope, *, receipt_id: UUID, task_id: UUID, task_version: int
+    ) -> DailyUpdateResult | None:
+        return await self._recover_draft(
+            scope, key=f"goal-delegate:{receipt_id}", task_id=task_id, task_version=task_version
+        )
+
+    async def _recover_draft(
+        self, scope: RunScope, *, key: str, task_id: UUID, task_version: int
+    ) -> DailyUpdateResult | None:
         if not self._matches_actor(scope):
             return None
         keys = {
-            str(uuid5(NAMESPACE_URL, f"daily:delegate:{receipt_id}:{step}")): step
-            for step in ("DRAFT", "ASSESS")
+            str(uuid5(NAMESPACE_URL, f"daily:{key}:{step}")): step for step in ("DRAFT", "ASSESS")
         }
         async with self._read() as session:
             repository = SqlAlchemyAssessmentRepository(session, self._actor)

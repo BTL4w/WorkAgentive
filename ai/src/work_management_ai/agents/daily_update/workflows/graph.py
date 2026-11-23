@@ -10,7 +10,12 @@ from work_management_ai.agents.daily_update.contracts import (
     DailyUpdateResult,
     ExtractedReport,
 )
-from work_management_ai.runtime.contracts import AgentHandoff, AgentResult, AgentRunStatus
+from work_management_ai.runtime.contracts import (
+    AgentHandoff,
+    AgentHandoffV2,
+    AgentResult,
+    AgentRunStatus,
+)
 from work_management_ai.tools.daily_update.contracts import DailyUpdateToolInput
 
 NODES = ("authorize", "context", "extract_report", "save_draft", "assess_originals", "await_owner")
@@ -25,7 +30,7 @@ STOP_CONDITIONS = (
 
 
 class DailyUpdateState(TypedDict):
-    handoff: AgentHandoff
+    handoff: AgentHandoff | AgentHandoffV2
     value: DailyUpdateHandoff | None
     tool_input: DailyUpdateToolInput | None
     report: ExtractedReport | None

@@ -283,6 +283,171 @@ async def test_text_and_original_prepare_draft_zero_facts_then_owner_confirms_on
     __import__("os").getenv("RUN_POSTGRES_INTEGRATION") != "1", reason="requires PostgreSQL"
 )
 @pytest.mark.asyncio
+async def test_daily_tool_does_not_publish_pending_assessment_as_owner_ready(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+):
+    from datetime import UTC, datetime
+    from decimal import Decimal
+    from uuid import UUID
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.modules.assistant.adapters.daily_update_tools import DailyUpdateToolAdapter
+    from app.modules.identity.domain.auth import AuthenticatedActor
+    from app.modules.progress.adapters.assessment_repository import (
+        SqlAlchemyAssessmentRepository,
+        SqlAlchemyAssessmentTransactions,
+    )
+    from app.modules.progress.application.assessment_service import AssessmentService
+    from app.modules.progress.domain.daily_updates import DailyUpdateItemInput
+    from tests.test_daily_update_api_integration import daily_app, seed_task
+    from work_management_ai.runtime.contracts import ToolExecutionRequest
+
+    class Actors:
+        async def resolve(
+            self, *, organization_id: UUID, membership_id: UUID
+        ) -> AuthenticatedActor:
+            return harness.actor
+
+    task_id = UUID(await seed_task(harness))
+    updates = daily_app(harness).state.daily_update_service
+    sessions = async_sessionmaker(
+        bind=harness.connection,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    )
+    assessments = AssessmentService(SqlAlchemyAssessmentTransactions(sessions))
+    draft = await updates.create_draft(
+        harness.actor,
+        (
+            DailyUpdateItemInput(
+                task_id=task_id,
+                expected_task_version=1,
+                expected_progress_version=0,
+                reporting_date=datetime.now(UTC).date(),
+                reported_percent=Decimal(50),
+                done_text="Prepared",
+            ),
+        ),
+        str(uuid4()),
+        "prepare-draft",
+    )
+    key = str(uuid4())
+
+    async def crash_before_finish(*args: object) -> None:
+        raise RuntimeError("interrupted before terminal assessment commit")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SqlAlchemyAssessmentRepository, "finish", crash_before_finish)
+        with pytest.raises(RuntimeError, match="interrupted before terminal assessment commit"):
+            await assessments.assess(harness.actor, draft.id, draft.version, key, "assess-draft")
+
+    assert (await assessments.get_current(harness.actor, draft.id)).state == "PENDING"
+    result = await DailyUpdateToolAdapter(
+        actors=Actors(), updates=updates, assessments=assessments
+    ).execute(
+        ToolExecutionRequest(
+            agent_run_id=uuid4(),
+            tool_id="daily_update.prepare",
+            tool_version="1.0.0",
+            call_id="replay-assessment",
+            actor=ActorReference(
+                membership_id=harness.actor.membership_id,
+                organization_id=harness.actor.organization_id,
+            ),
+            typed_input={
+                "action": "ASSESS",
+                "task_id": str(task_id),
+                "task_version": 1,
+                "draft_id": str(draft.id),
+                "draft_version": draft.version,
+            },
+            idempotency_key=key,
+        )
+    )
+    assert result.status == "REJECTED"
+    assert result.safe_error_code == "ASSESSMENT_PENDING"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    __import__("os").getenv("RUN_POSTGRES_INTEGRATION") != "1", reason="requires PostgreSQL"
+)
+@pytest.mark.asyncio
+async def test_daily_context_preserves_evidence_from_exact_owned_draft(harness: Harness):
+    from uuid import UUID
+
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.modules.assistant.adapters.daily_update_tools import DailyUpdateToolAdapter
+    from app.modules.identity.domain.auth import AuthenticatedActor
+    from app.modules.progress.adapters.assessment_repository import SqlAlchemyAssessmentTransactions
+    from app.modules.progress.application.assessment_service import AssessmentService
+    from tests.test_daily_update_api_integration import body, daily_app, draft, seed_task
+    from tests.test_evidence_api_integration import upload
+    from work_management_ai.runtime.contracts import ToolExecutionRequest
+
+    class Actors:
+        async def resolve(
+            self, *, organization_id: UUID, membership_id: UUID
+        ) -> AuthenticatedActor:
+            return harness.actor
+
+    task_id = await seed_task(harness)
+    app = daily_app(harness)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        proof = (await upload(client)).json()
+        refs = [{"evidence_id": proof["evidence_id"], "version": 1}]
+        saved = await draft(client, [body(task_id, evidence_refs=refs)])
+
+    sessions = async_sessionmaker(
+        bind=harness.connection,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    )
+    tools = DailyUpdateToolAdapter(
+        actors=Actors(),
+        updates=app.state.daily_update_service,
+        assessments=AssessmentService(SqlAlchemyAssessmentTransactions(sessions)),
+    )
+    request = ToolExecutionRequest(
+        agent_run_id=uuid4(),
+        tool_id="daily_update.prepare",
+        tool_version="1.0.0",
+        call_id="resolve-draft-evidence",
+        actor=ActorReference(
+            membership_id=harness.actor.membership_id,
+            organization_id=harness.actor.organization_id,
+        ),
+        typed_input={
+            "action": "CONTEXT",
+            "task_id": task_id,
+            "task_version": 1,
+            "draft_id": saved["id"],
+            "draft_version": 1,
+            "inherit_draft_evidence": True,
+        },
+        idempotency_key=str(uuid4()),
+    )
+    result = await tools.execute(request)
+    assert result.status == "SUCCEEDED", result
+    assert result.typed_output["evidence_refs"] == refs
+    stale = await tools.execute(
+        request.model_copy(update={"typed_input": {**request.typed_input, "draft_version": 2}})
+    )
+    assert stale.status == "REJECTED"
+    assert stale.safe_error_code == "STALE_DRAFT"
+    assert "evidence_refs" not in stale.typed_output
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    __import__("os").getenv("RUN_POSTGRES_INTEGRATION") != "1", reason="requires PostgreSQL"
+)
+@pytest.mark.asyncio
 async def test_usage_is_durable_and_cross_tenant_rls_hides_counters(harness: Harness):
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker

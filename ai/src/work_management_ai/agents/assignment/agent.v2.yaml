@@ -27,7 +27,7 @@ runtime:
   max_replans: 0
   timeout_seconds: 90
   checkpoint: durable
-  model_policy: grounded_explanation_only
+  model_policy: goal_intake_and_grounded_explanation
 allowed_skills: [recommend_project_team@1, analyze_workload@1]
 allowed_tools: [assignment.manage_team@1, assignment.read_workload@1, assignment.assign_task@1]
 approval:

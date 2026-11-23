@@ -39,7 +39,14 @@ from work_management_ai.agents.assignment.contracts import (
     TeamRecommendationSnapshot,
     TeamRequirementsPendingSnapshot,
 )
-from work_management_ai.runtime.contracts import ActorReference, ToolExecutionRequest
+from work_management_ai.runtime.contracts import (
+    ActorReference,
+    AgentBudget,
+    AgentHandoffV2,
+    AgentId,
+    DelegationBrief,
+    ToolExecutionRequest,
+)
 from work_management_ai.tools.assignment.manage_team.contracts import ManageTeamInput
 
 
@@ -558,3 +565,94 @@ async def test_exact_derive_replay_survives_crash_before_automatic_confirmation(
         )
 
     assert requirements.confirm_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("original_message", "allowed", "truncated"),
+    [
+        ('Assign "Launch brief" to "Lan"', True, None),
+        ("Who is free next week?", False, None),
+        ('Assign "Launch brief" to "Lan"', False, "task"),
+        ('Assign "Launch brief" to "Lan"', False, "member"),
+    ],
+)
+async def test_goal_explicit_command_uses_the_original_user_turn(
+    original_message: str, allowed: bool, truncated: str | None
+) -> None:
+    from app.modules.assistant.adapters.assignment_tools import (
+        AssistantAssignmentExplicitCommandAdapter,
+    )
+
+    actor = AuthenticatedActor(
+        user_id=uuid4(),
+        email="manager@example.test",
+        display_name="Manager",
+        membership_id=uuid4(),
+        organization_id=uuid4(),
+        organization_name="Tenant",
+        role=MembershipRole.MANAGER,
+    )
+    task = SimpleNamespace(id=uuid4(), project_id=uuid4(), version=4, title="Launch brief")
+    member = MemberSummary(uuid4(), "Lan", MembershipRole.EMPLOYEE, True)
+
+    class Tasks:
+        async def find_visible_tasks_by_title(self, *, query, **_):
+            if truncated == "task":
+                return (task, *(SimpleNamespace(title="Launch brief follow-up") for _ in range(19)))
+            return (task,) if query == "Launch brief" else ()
+
+    class Members:
+        async def list_members(self, *, query, **_):
+            items = (member,) if query == "Lan" else ()
+            return MemberPage(
+                items=items,
+                page=1,
+                page_size=100,
+                total=101 if truncated == "member" else len(items),
+            )
+
+    class Actors:
+        async def resolve(self, *, organization_id, membership_id):
+            if (organization_id, membership_id) == (actor.organization_id, actor.membership_id):
+                return actor
+            return None
+
+    class Source:
+        async def read(self, _handoff):
+            return original_message
+
+    reader = AssistantAssignmentExplicitCommandAdapter(
+        source_turn=Source(),
+        actor_resolver=Actors(),
+        resolver=AssistantAssignmentContextResolver(tasks=Tasks(), members=Members()),
+    )
+    command = await reader.read(
+        AgentHandoffV2(
+            orchestration_run_id=uuid4(),
+            parent_agent_run_id=uuid4(),
+            target_agent_id=AgentId.ASSIGNMENT,
+            target_agent_version="1.1.0",
+            brief=DelegationBrief(
+                objective='Assign "Launch brief" to "Lan"',
+                expected_result="Assignment receipt",
+            ),
+            context_references=(),
+            actor=ActorReference(
+                organization_id=actor.organization_id, membership_id=actor.membership_id
+            ),
+            source_turn_ref=uuid4(),
+            locale="en",
+            timezone="UTC",
+            budget=AgentBudget(max_iterations=1, max_tool_calls=1, timeout_seconds=30),
+            step_id="assignment",
+            idempotency_key="goal-delegate:test",
+        )
+    )
+    if allowed:
+        assert command is not None
+        assert command.task_id == task.id
+        assert command.expected_task_version == 4
+        assert command.assignee_membership_id == member.membership_id
+    else:
+        assert command is None

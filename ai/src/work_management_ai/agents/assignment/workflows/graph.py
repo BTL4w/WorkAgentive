@@ -68,6 +68,8 @@ class AssignmentAgentState(TypedDict):
     iterations_used: int
     tool_calls_used: int
     model_refs: tuple[str, ...]
+    goal_model_attempts: int | None
+    goal_assignment_key: str | None
 
 
 class AssignmentAgentNodeHandlers(Protocol):

@@ -10,6 +10,8 @@ from work_management_ai.agents.assignment.contracts import (
     AssignmentAgentOutput,
     AssignmentOperation,
     TeamRecommendationSnapshot,
+    VerifiedAssignmentCommand,
+    explicit_goal_assignment_key,
 )
 from work_management_ai.agents.assignment.harness import AssignmentAgentHarness
 from work_management_ai.agents.orchestrator.contracts import ActorContextResolverPort
@@ -22,8 +24,12 @@ from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentBudget,
     AgentHandoff,
+    AgentHandoffV2,
     AgentId,
     AgentRunStatus,
+    ContextReference,
+    DelegationBrief,
+    InteractionOutcome,
     JsonValue,
     ResolvedActorContext,
     ToolExecutionRequest,
@@ -803,3 +809,246 @@ def test_tool_manifests_declare_governed_runtime_behavior() -> None:
         assert manifest.tenant_scope == "actor_membership"
         assert manifest.timeout_seconds <= 30
         assert manifest.max_attempts <= 3
+
+
+def _goal(actor: ResolvedActorContext, objective: str, *refs: ContextReference) -> AgentHandoffV2:
+    return AgentHandoffV2(
+        orchestration_run_id=uuid4(),
+        parent_agent_run_id=uuid4(),
+        target_agent_id=AgentId.ASSIGNMENT,
+        target_agent_version="1.1.0",
+        brief=DelegationBrief(objective=objective, expected_result="Resolve the assignment goal."),
+        context_references=refs,
+        actor=ActorReference(
+            organization_id=actor.organization_id, membership_id=actor.membership_id
+        ),
+        source_turn_ref=uuid4(),
+        locale="vi",
+        timezone="Asia/Ho_Chi_Minh",
+        budget=AgentBudget(max_iterations=4, max_tool_calls=2, timeout_seconds=60),
+        step_id="assign-v2",
+        idempotency_key="goal-delegate:assignment",
+    )
+
+
+def _ref(
+    actor: ResolvedActorContext, kind: str, resource_id: UUID, version: int | None = None
+) -> ContextReference:
+    return ContextReference(
+        reference_id=uuid4(),
+        organization_id=actor.organization_id,
+        resource_type=kind,
+        resource_id=resource_id,
+        version=version,
+        observed_at=datetime.now(UTC),
+    )
+
+
+class VerifiedAccess:
+    async def verify(self, handoff: AgentHandoffV2) -> None:
+        assert all(
+            ref.organization_id == handoff.actor.organization_id
+            for ref in handoff.context_references
+        )
+
+
+@pytest.mark.asyncio
+async def test_goal_cannot_authorize_assignment_with_exact_refs_on_its_own() -> None:
+    actor = _actor()
+    executor = RecordingToolExecutor({})
+    harness = AssignmentAgentHarness(
+        model_gateway=MockModelGateway(
+            fixtures={
+                "assignment_agent.vi.goal_intake": {
+                    "operation": "ASSIGN_TASK_EXPLICITLY",
+                    "revision_instruction": None,
+                }
+            }
+        ),
+        tool_executor=executor,
+        actor_resolver=StaticActorResolver(actor),
+    )
+    result = await harness.run(
+        _goal(
+            actor,
+            "Gán task thiết kế API cho Lan ngay.",
+            _ref(actor, "TASK", uuid4(), 2),
+            _ref(actor, "MEMBERSHIP", uuid4()),
+        )
+    )
+    assert result.interaction_outcome is InteractionOutcome.NEEDS_INPUT
+    assert result.tool_calls_used == 0
+    assert not executor.requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["MANAGER", "EMPLOYEE"])
+async def test_goal_workload_is_read_only_and_manager_scoped(
+    role: Literal["MANAGER", "EMPLOYEE"],
+) -> None:
+    actor = _actor(role)
+    project_id = uuid4()
+    workload = _workload_output(actor, project_id)
+    project_ref = _ref(actor, "PROJECT", project_id)
+    executor = RecordingToolExecutor(
+        {
+            "assignment.read_workload": ToolExecutionResult(
+                status="SUCCEEDED", typed_output=workload, evidence=(project_ref,)
+            )
+        }
+    )
+    harness = AssignmentAgentHarness(
+        model_gateway=MockModelGateway(
+            fixtures={
+                "assignment_agent.vi.goal_intake": {
+                    "operation": "ANALYZE_WORKLOAD",
+                    "revision_instruction": None,
+                },
+                "assignment_agent.vi.analyze_workload_explanation": _workload_explanation(workload),
+            }
+        ),
+        tool_executor=executor,
+        actor_resolver=StaticActorResolver(actor),
+        goal_access=VerifiedAccess(),
+    )
+    result = await harness.run(_goal(actor, "Phân tích tải của dự án.", project_ref))
+    if role == "EMPLOYEE":
+        assert result.interaction_outcome is InteractionOutcome.FAILED
+        assert not executor.requests
+        return
+    assert result.interaction_outcome is InteractionOutcome.RESULT_READY
+    assert result.evidence == (project_ref,)
+    assert (
+        AssignmentAgentOutput.model_validate(result.typed_output).deterministic_result == workload
+    )
+    assert executor.requests[0].tool_id == "assignment.read_workload"
+
+
+@pytest.mark.asyncio
+async def test_goal_recommendation_requires_manager_decision() -> None:
+    actor = _actor()
+    project_id = uuid4()
+    team = _team_output(actor)
+    team["project_id"] = str(project_id)
+    executor = RecordingToolExecutor(
+        {"assignment.manage_team": ToolExecutionResult(status="SUCCEEDED", typed_output=team)}
+    )
+    harness = AssignmentAgentHarness(
+        model_gateway=MockModelGateway(
+            fixtures={
+                "assignment_agent.vi.goal_intake": {
+                    "operation": "RECOMMEND_TEAM",
+                    "revision_instruction": None,
+                },
+                "assignment_agent.vi.recommend_team_explanation": _team_explanation(
+                    team, locale="vi"
+                ),
+            }
+        ),
+        tool_executor=executor,
+        actor_resolver=StaticActorResolver(actor),
+        goal_access=VerifiedAccess(),
+    )
+    result = await harness.run(
+        _goal(actor, "Đề xuất đội hình cho dự án.", _ref(actor, "PROJECT", project_id))
+    )
+    assert result.status is AgentRunStatus.AWAITING_HUMAN
+    assert result.interaction_outcome is InteractionOutcome.ACTION_REVIEW_REQUIRED
+    assert result.proposed_actions[0].reference_id == UUID(str(team["recommendation_id"]))
+    assert result.proposed_actions[0].requires_human_gate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pinned_version", [None, 6, 7])
+async def test_goal_explicit_assignment_requires_the_command_version(
+    pinned_version: int | None,
+) -> None:
+    actor = _actor()
+    command = VerifiedAssignmentCommand(
+        project_id=uuid4(),
+        task_id=uuid4(),
+        expected_task_version=7,
+        assignee_membership_id=uuid4(),
+    )
+
+    class OriginalCommand:
+        async def read(self, handoff: AgentHandoffV2) -> VerifiedAssignmentCommand:
+            assert handoff.actor.membership_id == actor.membership_id
+            return command
+
+    executor = RecordingToolExecutor(
+        {
+            "assignment.assign_task": ToolExecutionResult(
+                status="SUCCEEDED",
+                typed_output={
+                    "organization_id": str(actor.organization_id),
+                    "project_id": str(command.project_id),
+                    "task_id": str(command.task_id),
+                    "task_version": 8,
+                    "membership_id": str(command.assignee_membership_id),
+                    "warning_codes": [],
+                    "effective_capacity_hours": 40,
+                    "workload_before_hours": 3,
+                    "workload_after_hours": 5,
+                    "observed_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        }
+    )
+    harness = AssignmentAgentHarness(
+        model_gateway=MockModelGateway(fixtures={}),
+        tool_executor=executor,
+        actor_resolver=StaticActorResolver(actor),
+        goal_access=VerifiedAccess(),
+        explicit_command=OriginalCommand(),
+    )
+    handoff = _goal(
+        actor,
+        "Gán task thiết kế API cho Lan.",
+        _ref(actor, "PROJECT", command.project_id),
+        _ref(actor, "TASK", command.task_id, pinned_version),
+        _ref(actor, "MEMBERSHIP", command.assignee_membership_id),
+    )
+    result = await harness.run(handoff)
+    if pinned_version != 7:
+        assert result.interaction_outcome is InteractionOutcome.NEEDS_INPUT
+        assert not executor.requests
+        return
+    assert result.interaction_outcome is InteractionOutcome.RESULT_READY
+    assert result.model_attempts_used == 0
+    await harness.run(handoff.model_copy(update={"idempotency_key": "another-delegation"}))
+    key = explicit_goal_assignment_key(handoff.source_turn_ref)
+    assert [request.idempotency_key for request in executor.requests] == [key, key]
+    assert executor.requests[0].typed_input == {
+        "task_id": str(command.task_id),
+        "task_version": 7,
+        "membership_id": str(command.assignee_membership_id),
+    }
+
+
+@pytest.mark.asyncio
+async def test_goal_rejects_a_tool_snapshot_for_another_project() -> None:
+    actor = _actor()
+    workload = _workload_output(actor, uuid4())
+    harness = AssignmentAgentHarness(
+        model_gateway=MockModelGateway(
+            fixtures={
+                "assignment_agent.vi.goal_intake": {
+                    "operation": "ANALYZE_WORKLOAD",
+                    "revision_instruction": None,
+                },
+            }
+        ),
+        tool_executor=RecordingToolExecutor(
+            {
+                "assignment.read_workload": ToolExecutionResult(
+                    status="SUCCEEDED", typed_output=workload
+                )
+            }
+        ),
+        actor_resolver=StaticActorResolver(actor),
+        goal_access=VerifiedAccess(),
+    )
+    result = await harness.run(_goal(actor, "Phân tích tải.", _ref(actor, "PROJECT", uuid4())))
+    assert result.interaction_outcome is InteractionOutcome.FAILED
+    assert result.typed_output == {"fallback": "manual_assignment"}

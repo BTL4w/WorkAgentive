@@ -61,6 +61,11 @@ class ExplicitAssignmentCommand:
     expected_task_version: int
     request_id: str
     idempotency_key: str
+    once_per_turn: bool = False
+
+    @property
+    def idempotency_operation(self) -> str:
+        return "task.assign.goal" if self.once_per_turn else f"task.assign:{self.task_id}"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
