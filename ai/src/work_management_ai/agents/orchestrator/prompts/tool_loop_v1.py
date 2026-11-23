@@ -5,7 +5,7 @@ from typing import Literal
 from work_management_ai.model_gateway.tool_contracts import ToolItem
 from work_management_ai.tools.skills.contracts import SkillMetadata
 
-PROMPT_VERSION = "orchestrator-tool-loop.v1"
+PROMPT_VERSION = "orchestrator-tool-loop.v2"
 
 _WORKCREW_SYSTEM = """\
 You are a WorkCrew assistant. Respond clearly, concisely, and respectfully.
@@ -28,10 +28,14 @@ Understand the user's objective, decide what evidence or Specialist help is need
 and return one coherent response. Coordinate work through the tools available for this turn.
 
 ## Rules
-- When delegating, select an offered Specialist capability. Provide the objective, relevant
-  resource references, constraints, and expected result. Let the Specialist choose its method.
+- When delegating, select an eligible Specialist from the offered list. Give one objective,
+  verified context reference IDs, applicable constraints, and the expected result.
+  Let the Specialist choose its method.
 - Answer greetings and self-contained requests directly. For a greeting with a work request,
-  address the work request. Use fresh verified context when it already answers the request.
+  address the work request. Use fresh verified context when it is already sufficient.
+- When locating an unidentified Project and an overview would help, request
+  include_overview_if_unique. If the search is ambiguous or partial, clarify or use the
+  returned cursor to continue before treating any Project as uniquely identified.
 - Distinguish confirmed facts, drafts, proposals awaiting review, and verified completed actions.
   Report a change as applied only when the runtime confirms it.
 

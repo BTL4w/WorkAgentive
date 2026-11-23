@@ -55,7 +55,7 @@ from work_management_ai.runtime.contracts import (
     SafeErrorResponseBlock,
     TextResponseBlock,
 )
-from work_management_ai.runtime.delegation import filtered_delegate_tool_schema
+from work_management_ai.runtime.delegation import DelegationError, filtered_delegate_v2_tool_schema
 from work_management_ai.runtime.run_budget import (
     BudgetedToolLoopGateway,
     BudgetError,
@@ -88,7 +88,7 @@ from work_management_ai.runtime.tool_loop_contracts import (
 )
 from work_management_ai.runtime.tool_pipeline import ToolPipeline
 from work_management_ai.tools.context.contracts import ContextReadObservation
-from work_management_ai.tools.delegation.contracts import DelegateAgentOutput
+from work_management_ai.tools.delegation.contracts import DelegateAgentOutputV2
 
 _CONTEXT_READ_TOOLS = frozenset(
     {"explore_projects@1", "read_project_context@1", "read_actor_context@1"}
@@ -115,11 +115,23 @@ def _strip_ephemeral(value: JsonValue) -> JsonValue:
     return value
 
 
-def _verified_context_summary(value: OrchestratorInput) -> dict[str, JsonValue] | None:
+def _verified_context_summary(
+    value: OrchestratorInput, references: tuple[ContextReference, ...]
+) -> dict[str, JsonValue] | None:
     """Bounded summary of already-verified active context (never dumps all Projects/profiles)."""
 
     ctx = value.active_context
     summary: dict[str, JsonValue] = {}
+    if references:
+        summary["verified_context_references"] = [
+            {
+                "reference_id": str(ref.reference_id),
+                "resource_type": ref.resource_type,
+                "resource_id": str(ref.resource_id),
+                "version": ref.version,
+            }
+            for ref in references
+        ]
     if ctx.active_planning is not None:
         summary["active_planning"] = {
             "workflow_run_id": str(ctx.active_planning.workflow_run_id),
@@ -174,6 +186,7 @@ class _SegmentRun:
     step_tools: tuple[ToolSchema, ...] = ()
     model_refs: list[str] = field(default_factory=_empty_str_list)
     observed_evidence: list[ContextReference] = field(default_factory=_empty_evidence_list)
+    history_evidence: tuple[ContextReference, ...] = ()
     observed_call_ids: list[str] = field(default_factory=_empty_str_list)
     draft_available: bool = False
     proposal_pending: bool = False
@@ -187,6 +200,16 @@ class _SegmentRun:
         if self.admitted is not None:
             self.admitted.close()
             self.admitted = None
+
+
+def _collect_delegation_evidence(run: _SegmentRun, result: DelegateAgentOutputV2) -> None:
+    run.observed_evidence.extend(result.evidence)
+    if result.interaction_outcome is InteractionOutcome.DRAFT_READY or (
+        result.draft_id is not None and result.draft_version is not None
+    ):
+        run.draft_available = True
+    if result.proposal_id is not None and result.proposal_version is not None:
+        run.proposal_pending = True
 
 
 def _collect_context_evidence(run: _SegmentRun, obs: ContextReadObservation) -> None:
@@ -300,7 +323,7 @@ class ToolLoopOrchestrator:
         driver_version: str = "tool_loop.v2",
         history_limits: HistoryLimits | None = None,
         clock: Callable[[], datetime] | None = None,
-        delegate_capabilities: Callable[[RunScope], Iterable[tuple[AgentId, str]]] | None = None,
+        delegate_specialists: Callable[[RunScope], Iterable[tuple[AgentId, str]]] | None = None,
     ) -> None:
         self.gateway = gateway
         self.catalog = catalog
@@ -316,7 +339,7 @@ class ToolLoopOrchestrator:
         self.driver_version = driver_version
         self.history_limits = history_limits or HistoryLimits()
         self.clock = clock or (lambda: datetime.now(UTC))
-        self.delegate_capabilities = delegate_capabilities
+        self.delegate_specialists = delegate_specialists
         self.limits: ToolLoopLimits = catalog.agent.manifest.runtime.limits
 
     async def run_segment(
@@ -326,8 +349,9 @@ class ToolLoopOrchestrator:
         scope: RunScope,
         checkpoint: ToolLoopCheckpoint | None,
         lease: RunLease,
+        verified_context_refs: tuple[ContextReference, ...] = (),
     ) -> OrchestratorExecutionResult:
-        """Execute one bounded Orchestrator segment from fresh turn or durable checkpoint."""
+        """Execute a segment with optional turn-scoped references bound by the caller."""
 
         if (
             lease.scope != scope
@@ -341,6 +365,16 @@ class ToolLoopOrchestrator:
             )
         ):
             raise ValueError("ORCHESTRATOR_SCOPE_MISMATCH")
+
+        if (
+            len(verified_context_refs) > 16
+            or len({ref.reference_id for ref in verified_context_refs})
+            != len(verified_context_refs)
+            or any(ref.organization_id != scope.organization_id for ref in verified_context_refs)
+        ):
+            return _fallback_response(
+                code="CONTEXT_DENIED", stop_reason="CONTEXT_DENIED", model_refs=(), call_ids=()
+            )
 
         interval_id = uuid4()
         try:
@@ -371,6 +405,7 @@ class ToolLoopOrchestrator:
                     checkpoint=checkpoint,
                     lease=lease,
                     interval_id=interval_id,
+                    verified_context_refs=verified_context_refs,
                 )
                 try:
                     graph = ToolLoopGraph(_GraphHandlers(self, run))
@@ -403,6 +438,7 @@ class ToolLoopOrchestrator:
         checkpoint: ToolLoopCheckpoint | None,
         lease: RunLease,
         interval_id: UUID,
+        verified_context_refs: tuple[ContextReference, ...],
     ) -> _SegmentRun:
         existing = checkpoint or await self.store.load_checkpoint(scope)
         if existing is None:
@@ -446,13 +482,13 @@ class ToolLoopOrchestrator:
                 lease=lease,
             )
             seq = rec.sequence
-            verified_ctx = _verified_context_summary(value)
+            verified_ctx = _verified_context_summary(value, verified_context_refs)
             if verified_ctx is not None:
                 ctx_ref = await self.store.put_payload(
                     scope,
-                    ContextPayload(category="CONTEXT", content=verified_ctx).model_dump(
-                        mode="json"
-                    ),
+                    ContextPayload(
+                        category="CONTEXT", content=verified_ctx, references=verified_context_refs
+                    ).model_dump(mode="json"),
                     classification="RAW_CONTEXT",
                     kind="CONTEXT",
                     lease=lease,
@@ -491,6 +527,18 @@ class ToolLoopOrchestrator:
             interval_id=interval_id,
             checkpoint=state,
         )
+        if (
+            existing.scope != scope
+            or existing.driver_version != self.driver_version
+            or existing.prompt_version != PROMPT_VERSION
+            or existing.model_ref != self.model_ref
+            or existing.agent_version != self.catalog.agent.manifest.agent.version
+            or existing.manifest_fingerprint != self.catalog.agent.fingerprint
+            or existing.tool_versions != self.catalog.agent.tool_pins
+        ):
+            run.recovery_error = "CHECKPOINT_VERSION_MISMATCH"
+            return run
+
         records = await self.store.read(scope, after_sequence=0)
         # Revalidate and check expiry BEFORE reading any historical payload during recovery.
         completed_refs = tuple(
@@ -549,18 +597,10 @@ class ToolLoopOrchestrator:
                         if self.projector is not None and report is not None:
                             report = self.projector.apply(report, obs)
                         _collect_context_evidence(run, obs)
-                    elif record.invocation.tool_reference == "delegate_agent@1":
-                        delegated = DelegateAgentOutput.model_validate(payload.output)
-                        run.observed_evidence.extend(delegated.evidence)
-                        if delegated.interaction_outcome is InteractionOutcome.DRAFT_READY or (
-                            delegated.draft_id is not None and delegated.draft_version is not None
-                        ):
-                            run.draft_available = True
-                        if (
-                            delegated.proposal_id is not None
-                            and delegated.proposal_version is not None
-                        ):
-                            run.proposal_pending = True
+                    elif record.invocation.tool_reference == "delegate_agent@2":
+                        _collect_delegation_evidence(
+                            run, DelegateAgentOutputV2.model_validate(payload.output)
+                        )
         return run
 
 
@@ -587,17 +627,29 @@ class _GraphHandlers:
             }
         self._run.admitted = admitted
 
-        # Build step tool schemas from real registry declarations; filter delegate_agent.
+        # Discovery filters the wire contract; the pipeline still authorizes each call.
         schemas: list[ToolSchema] = []
         for schema in admitted.schemas:
-            if (
-                schema.reference == "delegate_agent@1"
-                and self._orch.delegate_capabilities is not None
+            if schema.reference == "delegate_agent@1":
+                continue
+            if schema.reference == "explore_projects@1" and not any(
+                pin.reference == schema.reference and pin.version == "1.0.3"
+                for pin in self._orch.catalog.agent.tool_pins
             ):
-                allowed = tuple(self._orch.delegate_capabilities(self._run.scope))
-                if not allowed:
-                    continue
-                schema = filtered_delegate_tool_schema(schema, allowed_capabilities=allowed)
+                continue
+            if schema.reference == "delegate_agent@2":
+                selector = self._orch.delegate_specialists
+                try:
+                    allowed = tuple(selector(self._run.scope)) if selector is not None else ()
+                    if not allowed:
+                        continue
+                    schema = filtered_delegate_v2_tool_schema(schema, allowed_specialists=allowed)
+                except DelegationError as exc:
+                    return {
+                        "fallback_code": exc.code,
+                        "fallback_stop_reason": exc.code,
+                        "route": "fallback",
+                    }
             schemas.append(schema)
         self._run.step_tools = tuple(schemas)
 
@@ -691,6 +743,7 @@ class _GraphHandlers:
                 "route": "fallback",
             }
 
+        self._run.history_evidence = projected.evidence
         self._run.step_items = (
             build_tool_loop_prompt(
                 locale=self._run.value.locale,
@@ -920,15 +973,10 @@ class _GraphHandlers:
             if self._orch.projector is not None:
                 head = self._orch.projector.current or self._orch.projector.empty()
                 self._orch.projector.apply(head, obs)
-        elif tool_ref == "delegate_agent@1":
-            delegated = DelegateAgentOutput.model_validate(payload.output)
-            self._run.observed_evidence.extend(delegated.evidence)
-            if delegated.interaction_outcome is InteractionOutcome.DRAFT_READY or (
-                delegated.draft_id is not None and delegated.draft_version is not None
-            ):
-                self._run.draft_available = True
-            if delegated.proposal_id is not None and delegated.proposal_version is not None:
-                self._run.proposal_pending = True
+        elif tool_ref == "delegate_agent@2":
+            _collect_delegation_evidence(
+                self._run, DelegateAgentOutputV2.model_validate(payload.output)
+            )
 
         # No-progress guard: 2 identical (tool, args, resource_versions, semantic_result) calls.
         versions_fp = _digest(
@@ -984,7 +1032,7 @@ class _GraphHandlers:
             published = verify_final_candidate(
                 candidate,
                 scope=self._run.scope,
-                observed_evidence=tuple(self._run.observed_evidence),
+                observed_evidence=(*self._run.observed_evidence, *self._run.history_evidence),
                 observed_call_ids=tuple(self._run.observed_call_ids),
                 observed_artifacts=artifacts,
                 model_refs=tuple(self._run.model_refs),

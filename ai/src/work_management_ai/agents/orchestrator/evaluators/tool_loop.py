@@ -12,6 +12,7 @@ from work_management_ai.agents.orchestrator.tool_loop_contracts import (
     PublishedResponse,
 )
 from work_management_ai.runtime.contracts import (
+    AgentId,
     CapabilityUnavailableResponseBlock,
     ContextReference,
     PublicEvidenceReference,
@@ -20,7 +21,10 @@ from work_management_ai.runtime.contracts import (
     TextResponseBlock,
     WorkEvidenceResponseBlock,
 )
+from work_management_ai.runtime.delegation import filtered_delegate_v2_tool_schema
 from work_management_ai.runtime.tool_loop_contracts import RunScope, WaitReference
+from work_management_ai.runtime.tool_registry import ToolRegistry
+from work_management_ai.tools.delegation.contracts import DelegateAgentInputV2
 
 EVALUATOR_ID = "orchestrator_tool_loop@1"
 
@@ -153,13 +157,47 @@ def verify_final_candidate(
 
 
 async def evaluate_orchestrator_tool_loop() -> dict[str, object]:
-    """Registered deterministic self-check binding for orchestrator_tool_loop@1."""
+    """Check the candidate's pinned and scoped tool declarations without a hosted model."""
 
+    registry = ToolRegistry.from_resources(
+        (
+            ("work_management_ai.tools.context", "projects.v103.yaml"),
+            ("work_management_ai.tools.delegation", "delegate.v2.yaml"),
+        )
+    )
+    definitions = {
+        definition.schema.reference: definition
+        for definition in registry.candidate_definitions(("delegate_agent@2", "explore_projects@1"))
+    }
+    delegate = definitions["delegate_agent@2"]
+    summary = "Answers questions using verified work records."
+    scoped = filtered_delegate_v2_tool_schema(
+        delegate.schema, allowed_specialists=((AgentId.WORK_INTELLIGENCE, summary),)
+    )
+    properties = scoped.parameters.get("properties")
+    target = properties.get("agent_id") if isinstance(properties, dict) else None
+    flat_handoff = (
+        isinstance(properties, dict)
+        and properties.keys() == DelegateAgentInputV2.model_fields.keys()
+        and scoped.parameters.get("additionalProperties") is False
+        and isinstance(target, dict)
+        and target.get("const") == AgentId.WORK_INTELLIGENCE.value
+        and summary in scoped.description
+        and delegate.pin.version == "2.0.0"
+    )
+    explore = definitions["explore_projects@1"]
+    explore_fields = explore.schema.parameters.get("properties")
+    unique_overview = (
+        explore.pin.version == "1.0.3"
+        and isinstance(explore_fields, dict)
+        and "include_overview_if_unique" in explore_fields
+    )
     return {
         "evaluator": EVALUATOR_ID,
-        "schema_strict": True,
+        "flat_scoped_handoff": flat_handoff,
+        "unique_project_overview": unique_overview,
         "hosted_quality": "NOT_RUN",
-        "passed": True,
+        "passed": flat_handoff and unique_overview,
     }
 
 

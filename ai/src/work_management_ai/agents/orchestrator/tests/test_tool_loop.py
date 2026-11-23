@@ -3,6 +3,7 @@
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal, cast
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
@@ -13,12 +14,14 @@ from pydantic import BaseModel, SecretStr
 
 from work_management_ai.agents.orchestrator.contracts import (
     ActiveConversationContext,
+    ActivePlanningContext,
     OrchestratorInput,
     OrchestratorStatus,
 )
 from work_management_ai.agents.orchestrator.evaluators.tool_loop import (
     EVALUATOR_ID,
     ORCHESTRATOR_TOOL_LOOP_EVALUATORS,
+    evaluate_orchestrator_tool_loop,
 )
 from work_management_ai.agents.orchestrator.prompts.tool_loop_v1 import (
     PROMPT_VERSION,
@@ -26,7 +29,6 @@ from work_management_ai.agents.orchestrator.prompts.tool_loop_v1 import (
 )
 from work_management_ai.agents.orchestrator.tool_loop import ToolLoopOrchestrator
 from work_management_ai.agents.orchestrator.tool_loop_contracts import (
-    ModelFinalResponse,
     PublishedResponse,
     SuspendedWorkflow,
 )
@@ -36,8 +38,8 @@ from work_management_ai.model_gateway.errors import ModelInvalidOutputError
 from work_management_ai.model_gateway.mock import MockModelGateway
 from work_management_ai.model_gateway.openai_tools import OpenAINativeToolGateway
 from work_management_ai.model_gateway.tool_contracts import (
-    ToolItem,
     ToolModelRequest,
+    ToolModelResponse,
 )
 from work_management_ai.runtime.agent_registry import AgentRegistry
 from work_management_ai.runtime.context_exploration import (
@@ -51,8 +53,11 @@ from work_management_ai.runtime.contracts import (
     InteractionOutcome,
     JsonValue,
 )
+from work_management_ai.runtime.delegation import VerifiedDelegationReferences
 from work_management_ai.runtime.manifests import (
+    GoalDirectedAgentManifest,
     ToolLoopAgentManifest,
+    load_yaml_resource,
 )
 from work_management_ai.runtime.run_budget import (
     BudgetError,
@@ -94,7 +99,7 @@ from work_management_ai.runtime.tool_loop_contracts import (
     VersionPin,
     WaitReference,
 )
-from work_management_ai.runtime.tool_pipeline import PreparedTool, ToolPipeline
+from work_management_ai.runtime.tool_pipeline import PreparedTool, ToolPipeline, ToolPolicyError
 from work_management_ai.runtime.tool_registry import ToolRegistry
 from work_management_ai.tools.context.contracts import (
     ContextFact,
@@ -102,10 +107,14 @@ from work_management_ai.tools.context.contracts import (
     ContextReadObservation,
     ContextRef,
     EntityResolution,
+    ExploreProjectsInputV103,
     ReadCoverage,
     SourceContent,
 )
-from work_management_ai.tools.delegation.contracts import DelegateAgentInput, DelegateAgentOutput
+from work_management_ai.tools.delegation.contracts import (
+    DelegateAgentInputV2,
+    DelegateAgentOutputV2,
+)
 
 _NOW = datetime(2026, 11, 20, 10, 0, tzinfo=UTC)
 
@@ -430,6 +439,12 @@ def _make_harness(
     limits: ToolLoopLimits | None = None,
     locale: Literal["vi", "en"] = "vi",
     message: str = "Xin chào!",
+    policy: _AllowAllPolicy | None = None,
+    specialists: tuple[tuple[AgentId, str], ...] = (
+        (AgentId.WORK_INTELLIGENCE, "Answers questions from verified work records."),
+        (AgentId.ASSIGNMENT, "Analyzes workload and prepares team recommendations."),
+        (AgentId.PLANNING, "Prepares and revises plans for review."),
+    ),
 ) -> tuple[
     ToolLoopOrchestrator,
     OrchestratorInput,
@@ -472,10 +487,10 @@ def _make_harness(
     tools = ToolRegistry.from_resources(
         (
             ("work_management_ai.tools.skills", "load.yaml"),
-            ("work_management_ai.tools.context", "projects.yaml"),
+            ("work_management_ai.tools.context", "projects.v103.yaml"),
             ("work_management_ai.tools.context", "project.yaml"),
             ("work_management_ai.tools.context", "actor.yaml"),
-            ("work_management_ai.tools.delegation", "delegate.yaml"),
+            ("work_management_ai.tools.delegation", "delegate.v2.yaml"),
         )
     )
 
@@ -531,7 +546,7 @@ def _make_harness(
                 "explore_projects@1",
                 "read_project_context@1",
                 "read_actor_context@1",
-                "delegate_agent@1",
+                "delegate_agent@2",
             ],
             "approval": {"produced_writes": "NEVER", "can_self_approve": False},
             "fallback": {"strategy": "SAFE_MANUAL_FALLBACK"},
@@ -566,7 +581,7 @@ def _make_harness(
 
     pipeline = ToolPipeline(
         store=store,
-        policy=_AllowAllPolicy(),
+        policy=policy or _AllowAllPolicy(),
         backends=all_backends,
         limits=limits or ToolLoopLimits(),
     )
@@ -611,6 +626,7 @@ def _make_harness(
         observation_sink=obs_by_id,
         model_ref="mock:orchestrator-v2",
         clock=lambda: _NOW,
+        delegate_specialists=lambda _: specialists,
     )
     return orchestrator, value, scope, lease, gateway, store, resources, projector
 
@@ -663,7 +679,7 @@ def _answer_fixture(
 
 
 @pytest.mark.asyncio
-async def test_model_final_response_passes_real_openai_sdk_strict_schema_offline() -> None:
+async def test_candidate_request_passes_openai_sdk_strict_schema_offline(tmp_path: Path) -> None:
     captured: list[dict[str, object]] = []
     final_json = json.dumps(
         {
@@ -703,6 +719,15 @@ async def test_model_final_response_passes_real_openai_sdk_strict_schema_offline
             },
         )
 
+    specialists = tuple(
+        (manifest.agent.id, manifest.delegation_summary)
+        for package in ("assignment", "work_intelligence")
+        for manifest in (
+            load_yaml_resource(
+                f"work_management_ai.agents.{package}", "agent.v2.yaml", GoalDirectedAgentManifest
+            ),
+        )
+    )
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
 
         def factory(**kwargs: object) -> object:
@@ -719,25 +744,58 @@ async def test_model_final_response_passes_real_openai_sdk_strict_schema_offline
         adapter = OpenAINativeToolGateway(
             model_name="configured-model", api_key=SecretStr("fake"), chat_model_factory=factory
         )
-        req = ToolModelRequest[ModelFinalResponse](
-            invocation_key="t10-sdk-schema",
-            items=(
-                build_tool_loop_prompt(locale="vi", skills=()),
-                ToolItem(kind="message", role="user", content="Xin chào"),
-            ),
-            tools=(),
-            response_schema=ModelFinalResponse,
-            max_output_tokens=200,
-            timeout_seconds=30,
+        orch, value, scope, lease, _, _, _, _ = _make_harness(
+            responses=(),
+            message="Xin chào",
+            specialists=specialists,
         )
-        resp = await adapter.generate_step(req)
+        orch.gateway = adapter
+        result = await orch.run_segment(value, scope=scope, checkpoint=None, lease=lease)
 
-    assert resp.final is not None
-    assert resp.final.outcome == "ANSWER"
+    assert isinstance(result, PublishedResponse)
+    assert result.output.status is OrchestratorStatus.COMPLETED
     assert len(captured) == 1
-    messages = cast(list[dict[str, str]], captured[0]["messages"])
+    wire_request = captured[0]
+    messages = cast(list[dict[str, str]], wire_request["messages"])
     assert [message["role"] for message in messages] == ["system", "user"]
-    assert [message["content"] for message in messages] == [item.content for item in req.items]
+    assert messages[1]["content"] == "Xin chào"
+    assert messages[0]["content"].count("(`explore_work_context@1`)") == 1
+    assert "include_overview_if_unique" in messages[0]["content"]
+    skill_catalog = messages[0]["content"].split("## Available skills", maxsplit=1)[1]
+    assert len([line for line in skill_catalog.splitlines() if line.startswith("- ")]) == 1
+    tools = {
+        function["name"]: function
+        for tool in cast(list[dict[str, Any]], wire_request["tools"])
+        for function in (tool["function"],)
+    }
+    assert set(tools) == {
+        "explore_projects",
+        "read_project_context",
+        "read_actor_context",
+        "load_skill",
+        "delegate_agent",
+    }
+    assert all(function["strict"] is True for function in tools.values())
+    delegate = tools["delegate_agent"]
+    params = delegate["parameters"]
+    assert set(params["required"]) == {
+        "agent_id",
+        "objective",
+        "context_ref_ids",
+        "constraints",
+        "expected_result",
+    }
+    assert params["additionalProperties"] is False
+    assert params["properties"]["agent_id"]["enum"] == ["assignment", "work_intelligence"]
+    assert "anyOf" not in json.dumps(params)
+    eligible_catalog = delegate["description"].split("Eligible Specialists:\n", maxsplit=1)[1]
+    assert eligible_catalog.splitlines() == [
+        f"- {agent.value}: {summary}" for agent, summary in specialists
+    ]
+    (tmp_path / "task-10.1-openai-request.json").write_text(
+        json.dumps(wire_request, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     fmt = cast(dict[str, Any], captured[0]["response_format"])
     assert fmt["type"] == "json_schema"
     assert fmt["json_schema"]["strict"] is True
@@ -748,11 +806,15 @@ async def test_model_final_response_passes_real_openai_sdk_strict_schema_offline
 
 
 @pytest.mark.asyncio
-async def test_greeting_zero_tools_with_real_descriptions_and_skill_metadata() -> None:
+@pytest.mark.parametrize("locale", ["vi", "en"])
+async def test_greeting_zero_tools_with_real_descriptions_and_skill_metadata(
+    locale: Literal["vi", "en"],
+) -> None:
+    greeting = "Xin chào" if locale == "vi" else "Hello"
     orch, value, scope, lease, gw, _, resources, _ = _make_harness(
-        responses=(_answer_fixture("Xin chào! Bạn cần hỗ trợ công việc nào?"),),
-        message="Xin chào",
-        locale="vi",
+        responses=(_answer_fixture(greeting),),
+        message=greeting,
+        locale=locale,
     )
     result = await orch.run_segment(value, scope=scope, checkpoint=None, lease=lease)
 
@@ -778,7 +840,12 @@ async def test_greeting_zero_tools_with_real_descriptions_and_skill_metadata() -
     system = str(req.items[0].content)
     assert "observed facts" in system
     assert "Let the Specialist choose its method." in system
-    assert "Respond in Vietnamese unless the user requests English." in system
+    language = "Vietnamese" if locale == "vi" else "English"
+    assert f"Respond in {language} unless the user requests " in system
+    assert by_wire["delegate_agent"].reference == "delegate_agent@2"
+    assert "include_overview_if_unique" in cast(
+        dict[str, object], by_wire["explore_projects"].parameters["properties"]
+    )
     assert "explore-work-context" in system
     assert "explore_work_context@1" in system
     assert "UNTRUSTED_SOURCE_CONTENT" not in system
@@ -795,8 +862,8 @@ async def test_workload_observation_changes_next_model_decision_for_same_prompt(
     ref_id = uuid4()
 
     async def _delegate_handler(ctx: ToolInvocationContext, args: BaseModel) -> BackendToolResult:
-        parsed = DelegateAgentInput.model_validate(args.model_dump())
-        if parsed.capability == "assignment.analyze_workload":
+        parsed = DelegateAgentInputV2.model_validate(args.model_dump())
+        if parsed.agent_id is AgentId.ASSIGNMENT:
             ev = ContextReference(
                 reference_id=ref_id,
                 organization_id=ctx.scope.organization_id,
@@ -806,10 +873,10 @@ async def test_workload_observation_changes_next_model_decision_for_same_prompt(
                 observed_at=_NOW,
             )
             return BackendToolResult(
-                output=DelegateAgentOutput(
+                output=DelegateAgentOutputV2(
                     agent_id=AgentId.ASSIGNMENT,
                     agent_version="1.0.0",
-                    capability="assignment.analyze_workload",
+                    resolved_action="assignment.analyze_workload",
                     child_agent_run_id=uuid4(),
                     status=AgentRunStatus.COMPLETED,
                     interaction_outcome=InteractionOutcome.RESULT_READY,
@@ -820,7 +887,7 @@ async def test_workload_observation_changes_next_model_decision_for_same_prompt(
                 ),
                 evidence=(ev,),
             )
-        assert parsed.capability == "assignment.recommend_team"
+        assert parsed.agent_id is AgentId.PLANNING
         return BackendToolResult(
             wait_ref=WaitReference(
                 wait_id=uuid5(NAMESPACE_URL, f"wait:team:{proposal_id}"),
@@ -840,15 +907,10 @@ async def test_workload_observation_changes_next_model_decision_for_same_prompt(
             "name": "delegate_agent",
             "arguments": {
                 "agent_id": "assignment",
-                "capability": "assignment.analyze_workload",
                 "objective": "Check workload for Project Sao Mai",
                 "context_ref_ids": [],
                 "constraints": [],
                 "expected_result": "Verified member workload hours",
-                "input": {
-                    "capability": "assignment.analyze_workload",
-                    "project_reference": str(project_id),
-                },
             },
         },
     }
@@ -873,17 +935,11 @@ async def test_workload_observation_changes_next_model_decision_for_same_prompt(
                 "call_id": "call-rebalance-2",
                 "name": "delegate_agent",
                 "arguments": {
-                    "agent_id": "assignment",
-                    "capability": "assignment.recommend_team",
-                    "objective": "Propose team rebalance because Minh is overloaded at 48h/40h",
-                    "context_ref_ids": [],
+                    "agent_id": "planning",
+                    "objective": "Propose a plan adjustment because Minh is overloaded at 48h/40h",
+                    "context_ref_ids": [str(ref_id)],
                     "constraints": ["Prepare proposal for Manager approval; never auto-apply."],
                     "expected_result": "Team rebalance proposal awaiting Manager decision",
-                    "input": {
-                        "capability": "assignment.recommend_team",
-                        "project_reference": str(project_id),
-                        "instruction": "Rebalance Minh's 48h/40h overload",
-                    },
                 },
             }
         }
@@ -891,7 +947,7 @@ async def test_workload_observation_changes_next_model_decision_for_same_prompt(
 
     orch, value, scope, lease, gw, _, _, _ = _make_harness(
         responses=responses,
-        backends={"delegate_agent@1": delegate_backend},
+        backends={"delegate_agent@2": delegate_backend},
         message="Kiểm tra xem Project Sao Mai có ai quá tải không và xử lý nếu cần.",
         locale="vi",
     )
@@ -899,6 +955,13 @@ async def test_workload_observation_changes_next_model_decision_for_same_prompt(
 
     gw.assert_complete()
     assert isinstance(result, PublishedResponse)
+    usage = (await orch.budget.remaining(scope)).usage
+    assert usage.handoffs == (1 if hours == 32 else 2)
+    assert usage.total_tool_calls == 0
+    assert [
+        DelegateAgentInputV2.model_validate(args.model_dump()).agent_id
+        for _, args in delegate_backend.calls
+    ] == ([AgentId.ASSIGNMENT] if hours == 32 else [AgentId.ASSIGNMENT, AgentId.PLANNING])
     # Request N+1 observed exact call ID & workload output before deciding
     assert len(gw.step_requests) == 2
     second_items = gw.step_requests[1].items
@@ -907,6 +970,13 @@ async def test_workload_observation_changes_next_model_decision_for_same_prompt(
     ]
     assert len(observed) == 1
     assert f"{hours}h/40h" in json.dumps(observed[0].content)
+    assert set(t.wire_name for t in gw.step_requests[0].tools) == {
+        "explore_projects",
+        "read_project_context",
+        "read_actor_context",
+        "load_skill",
+        "delegate_agent",
+    }
 
     if hours == 32:
         assert result.output.status is OrchestratorStatus.COMPLETED
@@ -1140,6 +1210,8 @@ async def test_actual_driver_handles_narrow_explore_scenarios(scenario: str) -> 
     p1, p2 = uuid4(), uuid4()
 
     async def _explore_handler(ctx: ToolInvocationContext, args: BaseModel) -> BackendToolResult:
+        assert ctx.tool_version == "1.0.3"
+        assert isinstance(args, ExploreProjectsInputV103) and args.include_overview_if_unique
         if scenario == "ambiguous":
             r1 = ContextRef(
                 ref_id=uuid5(ctx.invocation_id, "p1"),
@@ -1186,7 +1258,7 @@ async def test_actual_driver_handles_narrow_explore_scenarios(scenario: str) -> 
                 coverage=(
                     ReadCoverage(
                         requested=("overview",),
-                        returned=("overview",),
+                        returned=(),
                         status="COMPLETE",
                         query_fingerprint="a" * 64,
                     ),
@@ -1273,7 +1345,7 @@ async def test_actual_driver_handles_narrow_explore_scenarios(scenario: str) -> 
             coverage=(
                 ReadCoverage(
                     requested=("overview",),
-                    returned=("overview",),
+                    returned=(),
                     status="PARTIAL",
                     query_fingerprint="c" * 64,
                     cursor="opaque-next",
@@ -1287,7 +1359,12 @@ async def test_actual_driver_handles_narrow_explore_scenarios(scenario: str) -> 
         "tool_call": {
             "call_id": f"call-{scenario}",
             "name": "explore_projects",
-            "arguments": {"query": "Sao Mai", "cursor": None, "page_size": 10},
+            "arguments": {
+                "query": "Sao Mai",
+                "cursor": None,
+                "page_size": 10,
+                "include_overview_if_unique": True,
+            },
         }
     }
     if scenario == "ambiguous":
@@ -1316,6 +1393,14 @@ async def test_actual_driver_handles_narrow_explore_scenarios(scenario: str) -> 
     gw.assert_complete()
     assert isinstance(result, PublishedResponse)
     assert projector.current is not None
+    if scenario != "injection":
+        observation = next(
+            item.content for item in gw.step_requests[1].items if item.kind == "tool_result"
+        )
+        output = ContextReadObservation.model_validate(observation)
+        assert all("overview" not in record.returned for record in output.coverage)
+        assert {fact.field for fact in output.facts} == {"project.name"}
+        assert output.source_content_refs == ()
     if scenario == "ambiguous":
         assert result.output.status is OrchestratorStatus.AWAITING_INPUT
         assert len(projector.unresolved_resources(projector.current)) == 2
@@ -1335,6 +1420,7 @@ async def test_deferred_workflow_suspends_segment_with_workflow_wait() -> None:
     wf_id = uuid4()
 
     async def _workflow_delegate(ctx: ToolInvocationContext, args: BaseModel) -> BackendToolResult:
+        assert isinstance(args, DelegateAgentInputV2) and args.agent_id is AgentId.PLANNING
         return BackendToolResult(
             wait_ref=WaitReference(
                 wait_id=uuid5(NAMESPACE_URL, f"wait:wf:{wf_id}"),
@@ -1352,18 +1438,16 @@ async def test_deferred_workflow_suspends_segment_with_workflow_wait() -> None:
             "name": "delegate_agent",
             "arguments": {
                 "agent_id": "planning",
-                "capability": "planning.create",
                 "objective": "Create AI course plan",
                 "context_ref_ids": [],
                 "constraints": [],
                 "expected_result": "Planning workflow",
-                "input": {"capability": "planning.create", "goal": "AI course for 20 staff"},
             },
         }
     }
     orch, value, scope, lease, gw, store, _, _ = _make_harness(
         responses=(call,),
-        backends={"delegate_agent@1": _SimpleToolBackend(_workflow_delegate)},
+        backends={"delegate_agent@2": _SimpleToolBackend(_workflow_delegate)},
         message="Lập kế hoạch đào tạo AI cho 20 nhân viên",
     )
     result = await orch.run_segment(value, scope=scope, checkpoint=None, lease=lease)
@@ -1372,13 +1456,14 @@ async def test_deferred_workflow_suspends_segment_with_workflow_wait() -> None:
     assert isinstance(result, SuspendedWorkflow)
     assert result.wait_ref.kind == "WORKFLOW_RESULT"
     assert result.wait_ref.resource_id == wf_id
+    assert len(gw.step_requests) == 1
     saved = await store.load_checkpoint(scope)
     assert saved is not None and saved.pending_wait == result.wait_ref
 
 
 def test_prompt_and_evaluator_identities_match_plan() -> None:
     assert WORKFLOW_ID == "orchestrator.tool_loop.v1"
-    assert PROMPT_VERSION == "orchestrator-tool-loop.v1"
+    assert PROMPT_VERSION == "orchestrator-tool-loop.v2"
     assert EVALUATOR_ID == "orchestrator_tool_loop@1"
     assert EVALUATOR_ID in ORCHESTRATOR_TOOL_LOOP_EVALUATORS
     system = build_tool_loop_prompt(locale="en", skills=())
@@ -1401,7 +1486,8 @@ def test_prompt_and_evaluator_identities_match_plan() -> None:
 
 
 @pytest.mark.asyncio
-async def test_verified_context_and_fresh_project_creation_skip_unnecessary_reads() -> None:
+@pytest.mark.parametrize("has_verified_context", [False, True])
+async def test_planning_handoff_skips_unnecessary_reads(has_verified_context: bool) -> None:
     explore_calls = 0
 
     async def _explore(ctx: ToolInvocationContext, args: BaseModel) -> BackendToolResult:
@@ -1410,13 +1496,26 @@ async def test_verified_context_and_fresh_project_creation_skip_unnecessary_read
         raise AssertionError("Should not list Projects when creating a fresh Project")
 
     draft_id = uuid4()
+    workflow_id = uuid4()
+    reference_ids = (uuid4(), uuid4()) if has_verified_context else ()
+    references: tuple[ContextReference, ...] = ()
+    resolver: VerifiedDelegationReferences | None = None
+    objective = (
+        "Update the verified AI training draft with the new workshop"
+        if has_verified_context
+        else "Create AI training plan for 20 employees"
+    )
 
     async def _delegate_draft(ctx: ToolInvocationContext, args: BaseModel) -> BackendToolResult:
+        assert isinstance(args, DelegateAgentInputV2) and args.objective == objective
+        assert resolver is not None
+        assert await resolver.resolve(ctx.scope, args.context_ref_ids) == references
+        assert args.context_ref_ids == reference_ids
         return BackendToolResult(
-            output=DelegateAgentOutput(
+            output=DelegateAgentOutputV2(
                 agent_id=AgentId.PLANNING,
                 agent_version="1.0.0",
-                capability="planning.create",
+                resolved_action="planning.start",
                 child_agent_run_id=uuid4(),
                 status=AgentRunStatus.COMPLETED,
                 interaction_outcome=InteractionOutcome.DRAFT_READY,
@@ -1433,12 +1532,10 @@ async def test_verified_context_and_fresh_project_creation_skip_unnecessary_read
             "name": "delegate_agent",
             "arguments": {
                 "agent_id": "planning",
-                "capability": "planning.create",
-                "objective": "Create AI training plan for 20 employees",
-                "context_ref_ids": [],
+                "objective": objective,
+                "context_ref_ids": [str(ref_id) for ref_id in reference_ids],
                 "constraints": [],
                 "expected_result": "Operational draft",
-                "input": {"capability": "planning.create", "goal": "AI training for 20 employees"},
             },
         }
     }
@@ -1447,20 +1544,149 @@ async def test_verified_context_and_fresh_project_creation_skip_unnecessary_read
         "Bạn muốn chỉnh sửa gì trước khi gửi duyệt?",
         artifact_state="DRAFT_AVAILABLE",
     )
-    orch, value, scope, lease, gw, _, _, _ = _make_harness(
+    orch, value, scope, lease, gw, _, resources, _ = _make_harness(
         responses=(plan_call, final_draft),
         backends={
             "explore_projects@1": _SimpleToolBackend(_explore),
-            "delegate_agent@1": _SimpleToolBackend(_delegate_draft),
+            "delegate_agent@2": _SimpleToolBackend(_delegate_draft),
         },
         message="Tạo dự án đào tạo AI mới cho 20 nhân viên",
     )
-    result = await orch.run_segment(value, scope=scope, checkpoint=None, lease=lease)
+    if has_verified_context:
+        references = tuple(
+            ContextReference(
+                reference_id=ref_id,
+                organization_id=scope.organization_id,
+                resource_type=kind,
+                resource_id=resource_id,
+                version=1,
+                observed_at=_NOW,
+            )
+            for ref_id, kind, resource_id in zip(
+                reference_ids, ("workflow_run", "draft"), (workflow_id, draft_id), strict=True
+            )
+        )
+        value = value.model_copy(
+            update={
+                "message": "Thêm workshop mới vào bản nháp kế hoạch đã mở",
+                "active_context": ActiveConversationContext(
+                    recent_messages=(),
+                    active_planning=ActivePlanningContext(
+                        workflow_run_id=workflow_id,
+                        workflow_status="DRAFT_READY",
+                        proposal_id=None,
+                        draft_id=draft_id,
+                        draft_version=1,
+                    ),
+                ),
+            }
+        )
+
+    async def recheck(actual_scope: RunScope, actual_refs: tuple[ContextReference, ...]) -> None:
+        assert actual_scope == scope and actual_refs == references
+
+    resolver = VerifiedDelegationReferences(
+        scope=scope,
+        exploration=(),
+        active_context=references,
+        completed_specialists=(),
+        recheck=recheck,
+    )
+    result = await orch.run_segment(
+        value, scope=scope, checkpoint=None, lease=lease, verified_context_refs=references
+    )
 
     gw.assert_complete()
     assert explore_calls == 0
+    assert (await orch.budget.remaining(scope)).usage.total_tool_calls == 0
+    assert resources.bodies_read == 0
+    if has_verified_context:
+        messages = json.dumps([item.content for item in gw.step_requests[0].items])
+        assert all(str(ref_id) in messages for ref_id in reference_ids)
+        assert str(workflow_id) in messages
     assert isinstance(result, PublishedResponse)
     assert result.output.status is OrchestratorStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_verified_active_context_can_ground_final_without_tool_call() -> None:
+    project_id, ref_id = uuid4(), uuid4()
+    orch, value, scope, lease, gw, _, _, _ = _make_harness(
+        message="Dự án hiện tại là dự án nào?",
+        responses=(
+            _answer_fixture(
+                "Đây là dự án hiện tại.",
+                citations=[
+                    {
+                        "evidence_id": str(ref_id),
+                        "resource_type": "project",
+                        "resource_id": str(project_id),
+                        "version": 3,
+                    }
+                ],
+            ),
+        ),
+    )
+    ref = ContextReference(
+        reference_id=ref_id,
+        organization_id=scope.organization_id,
+        resource_type="project",
+        resource_id=project_id,
+        version=3,
+        observed_at=_NOW,
+    )
+
+    result = await orch.run_segment(
+        value, scope=scope, checkpoint=None, lease=lease, verified_context_refs=(ref,)
+    )
+
+    gw.assert_complete()
+    assert isinstance(result, PublishedResponse)
+    assert result.output.status is OrchestratorStatus.COMPLETED
+    assert result.output.evidence_call_ids == ()
+    assert len(gw.step_requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict", "stop_reason"),
+    [
+        ("cross_tenant", "CONTEXT_DENIED"),
+        ("stale", "CONTEXT_STALE"),
+        ("revoked", "CONTEXT_REVOKED"),
+    ],
+)
+async def test_unavailable_active_context_never_reaches_model(
+    verdict: str,
+    stop_reason: str,
+) -> None:
+    orch, value, scope, lease, gw, _, _, _ = _make_harness(responses=())
+
+    class ContextAccess(_AllowContextAccess):
+        async def revalidate(self, scope: RunScope, refs: tuple[Any, ...]) -> RevalidatedContext:
+            has_context = any(isinstance(ref, ContextReference) for ref in refs)
+            return RevalidatedContext(
+                references=refs,
+                allowed=not (has_context and verdict == "revoked"),
+                fresh=not (has_context and verdict == "stale"),
+            )
+
+    orch.access = ContextAccess()
+    ref = ContextReference(
+        reference_id=uuid4(),
+        organization_id=uuid4() if verdict == "cross_tenant" else scope.organization_id,
+        resource_type="draft",
+        resource_id=uuid4(),
+        version=1,
+        observed_at=_NOW,
+    )
+    result = await orch.run_segment(
+        value, scope=scope, checkpoint=None, lease=lease, verified_context_refs=(ref,)
+    )
+
+    assert isinstance(result, PublishedResponse)
+    assert result.output.stop_reason == stop_reason
+    assert not gw.step_requests
 
 
 # --- 11) Recovery replays overflow reads & rejects fake report revisions / stale refs ---
@@ -1666,11 +1892,11 @@ async def test_budgeted_tool_loop_gateway_charges_exactly_one_root_model_request
 
 
 @pytest.mark.asyncio
-async def test_filtered_delegate_capabilities_hide_inactive_branches_from_model_request() -> None:
+async def test_filtered_delegate_specialists_hide_inactive_branches_from_model_request() -> None:
     def _allowed(_scope: RunScope) -> tuple[tuple[AgentId, str], ...]:
         return (
-            (AgentId.WORK_INTELLIGENCE, "work.answer_question"),
-            (AgentId.ASSIGNMENT, "assignment.analyze_workload"),
+            (AgentId.WORK_INTELLIGENCE, "Answers work questions from evidence."),
+            (AgentId.ASSIGNMENT, "Analyzes verified workload."),
         )
 
     orch, value, scope, lease, gw, _, _, _ = _make_harness(
@@ -1678,28 +1904,33 @@ async def test_filtered_delegate_capabilities_hide_inactive_branches_from_model_
         message="Hello",
         locale="en",
     )
-    orch.delegate_capabilities = _allowed
+    orch.delegate_specialists = _allowed
     result = await orch.run_segment(value, scope=scope, checkpoint=None, lease=lease)
 
     gw.assert_complete()
     assert isinstance(result, PublishedResponse)
     delegate_schema = next(t for t in gw.step_requests[0].tools if t.wire_name == "delegate_agent")
-    dumped = json.dumps(delegate_schema.parameters)
-    assert "work.answer_question" in dumped
-    assert "assignment.analyze_workload" in dumped
-    assert "retrieval.search_web" not in dumped
-    assert "planning.create" not in dumped
+    assert delegate_schema.reference == "delegate_agent@2"
+    assert set(cast(dict[str, object], delegate_schema.parameters["properties"])) == {
+        "agent_id",
+        "objective",
+        "context_ref_ids",
+        "constraints",
+        "expected_result",
+    }
+    assert "anyOf" not in json.dumps(delegate_schema.parameters)
+    assert "work_intelligence: Answers work questions from evidence." in delegate_schema.description
+    assert "assignment: Analyzes verified workload." in delegate_schema.description
+    assert "planning" not in delegate_schema.description
+    assert "retrieve" not in delegate_schema.description
 
 
 @pytest.mark.asyncio
-async def test_filtered_delegate_capabilities_block_excluded_branch_at_dispatch() -> None:
-    from work_management_ai.model_gateway.tool_contracts import (
-        ToolCall,
-        ToolModelResponse,
-    )
+async def test_filtered_delegate_specialists_block_excluded_branch_at_dispatch() -> None:
+    from work_management_ai.model_gateway.tool_contracts import ToolCall
 
     def _allowed(_scope: RunScope) -> tuple[tuple[AgentId, str], ...]:
-        return ((AgentId.WORK_INTELLIGENCE, "work.answer_question"),)
+        return ((AgentId.WORK_INTELLIGENCE, "Answers work questions from evidence."),)
 
     called = 0
 
@@ -1720,30 +1951,111 @@ async def test_filtered_delegate_capabilities_block_excluded_branch_at_dispatch(
                     name="delegate_agent",
                     arguments={
                         "agent_id": "planning",
-                        "capability": "planning.create",
                         "objective": "Attempt excluded capability",
                         "context_ref_ids": [],
                         "constraints": [],
                         "expected_result": "Blocked",
-                        "input": {"capability": "planning.create", "goal": "Should fail"},
                     },
                 ),
             )
 
     orch, value, scope, lease, _, _, _, _ = _make_harness(
         responses=(),
-        backends={"delegate_agent@1": _SimpleToolBackend(_delegate)},
+        backends={"delegate_agent@2": _SimpleToolBackend(_delegate)},
         message="Create plan",
         locale="en",
     )
     orch.gateway = _BypassGateway()
-    orch.delegate_capabilities = _allowed
+    orch.delegate_specialists = _allowed
     result = await orch.run_segment(value, scope=scope, checkpoint=None, lease=lease)
 
     assert called == 0
     assert isinstance(result, PublishedResponse)
     assert result.output.status is OrchestratorStatus.FAILED
     assert result.output.stop_reason == "TOOL_ARGUMENTS_INVALID"
+
+
+@pytest.mark.asyncio
+async def test_execution_revocation_after_wire_admission_denies_handoff() -> None:
+    class RevocablePolicy(_AllowAllPolicy):
+        allowed = True
+
+        async def guard(
+            self,
+            context: ToolInvocationContext,
+            tool: AdmittedTool,
+            evidence: tuple[ContextReference, ...],
+        ) -> None:
+            assert tool.reference == "delegate_agent@2"
+            if not self.allowed:
+                raise ToolPolicyError("PERMISSION_DENIED")
+
+    policy = RevocablePolicy()
+
+    async def unreachable(_ctx: ToolInvocationContext, _args: BaseModel) -> BackendToolResult:
+        raise AssertionError("revoked Specialist must never run")
+
+    backend = _SimpleToolBackend(unreachable)
+    orch, value, scope, lease, gateway, store, _, _ = _make_harness(
+        policy=policy,
+        backends={"delegate_agent@2": backend},
+        responses=(
+            {
+                "tool_call": {
+                    "call_id": "revoke-after-admission",
+                    "name": "delegate_agent",
+                    "arguments": {
+                        "agent_id": "planning",
+                        "objective": "Prepare revised plan",
+                        "context_ref_ids": [],
+                        "constraints": [],
+                        "expected_result": "Draft plan",
+                    },
+                }
+            },
+        ),
+    )
+
+    class RevokeAfterRequest:
+        async def generate_step(self, request: ToolModelRequest[Any]) -> ToolModelResponse[Any]:
+            response = await gateway.generate_step(request)
+            schema = next(tool for tool in request.tools if tool.reference == "delegate_agent@2")
+            assert "planning: Prepares and revises plans" in schema.description
+            policy.allowed = False
+            return response
+
+    orch.gateway = RevokeAfterRequest()
+    result = await orch.run_segment(value, scope=scope, checkpoint=None, lease=lease)
+
+    gateway.assert_complete()
+    assert isinstance(result, PublishedResponse)
+    assert result.output.status is OrchestratorStatus.FAILED
+    assert result.output.stop_reason == "PERMISSION_DENIED"
+    assert backend.calls == []
+    usage = (await orch.budget.remaining(scope)).usage
+    assert (usage.handoffs, usage.total_tool_calls) == (1, 0)
+    invocation_id = ToolPipeline.invocation_id(scope, "revoke-after-admission")
+    receipt = await store.get_invocation(scope, invocation_id)
+    assert receipt is not None and receipt.settlement is not None
+    assert receipt.settlement.status == "REJECTED"
+    assert receipt.settlement.safe_code == "PERMISSION_DENIED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("no_selector", [False, True])
+async def test_no_admitted_specialists_omits_delegate_tool(no_selector: bool) -> None:
+    orch, value, scope, lease, gw, _, _, _ = _make_harness(
+        responses=(_answer_fixture("Hello."),),
+        specialists=(),
+    )
+    if no_selector:
+        orch.delegate_specialists = None
+
+    result = await orch.run_segment(value, scope=scope, checkpoint=None, lease=lease)
+
+    gw.assert_complete()
+    assert isinstance(result, PublishedResponse)
+    assert "delegate_agent" not in {tool.wire_name for tool in gw.step_requests[0].tools}
 
 
 # --- 15) Recovery with expired historical payload stops safely before reading body ---
@@ -1844,37 +2156,41 @@ async def test_recovery_with_expired_historical_payload_stops_safely_without_rea
 
 
 @pytest.mark.asyncio
-async def test_reconcile_pending_call_completes_without_reinvoking_model_for_same_call() -> None:
+@pytest.mark.parametrize("replay", ["pending", "committed", "legacy_pin"])
+async def test_recovery_honors_protocol_pin_and_restores_v2_without_redispatch(
+    replay: str,
+) -> None:
     project_id = uuid4()
     ref_id = uuid4()
 
     async def _never_execute(_ctx: ToolInvocationContext, _args: BaseModel) -> BackendToolResult:
         raise AssertionError("Pending invocation must be reconciled, not executed a second time")
 
-    async def _reconcile(ctx: ToolInvocationContext, _args: BaseModel) -> BackendToolResult | None:
-        return BackendToolResult(
-            output=DelegateAgentOutput(
-                agent_id=AgentId.WORK_INTELLIGENCE,
-                agent_version="1.0.0",
-                capability="work.answer_question",
-                child_agent_run_id=uuid4(),
-                status=AgentRunStatus.COMPLETED,
-                interaction_outcome=InteractionOutcome.RESULT_READY,
-                summary="Recovered verified answer for Project Alpha.",
-                evidence=(
-                    ContextReference(
-                        reference_id=ref_id,
-                        organization_id=ctx.scope.organization_id,
-                        resource_type="project",
-                        resource_id=project_id,
-                        version=2,
-                        fingerprint="fp-rec-1",
-                        observed_at=_NOW,
-                    ),
+    def recovered_result(organization_id: UUID) -> DelegateAgentOutputV2:
+        return DelegateAgentOutputV2(
+            agent_id=AgentId.WORK_INTELLIGENCE,
+            agent_version="1.1.0",
+            resolved_action="work.answer_question",
+            child_agent_run_id=uuid4(),
+            status=AgentRunStatus.COMPLETED,
+            interaction_outcome=InteractionOutcome.RESULT_READY,
+            summary="Recovered verified answer for Project Alpha.",
+            evidence=(
+                ContextReference(
+                    reference_id=ref_id,
+                    organization_id=organization_id,
+                    resource_type="project",
+                    resource_id=project_id,
+                    version=2,
+                    fingerprint="fp-rec-1",
+                    observed_at=_NOW,
                 ),
-                stop_reason="ANSWER_VERIFIED",
-            )
+            ),
+            stop_reason="ANSWER_VERIFIED",
         )
+
+    async def _reconcile(ctx: ToolInvocationContext, _args: BaseModel) -> BackendToolResult | None:
+        return BackendToolResult(output=recovered_result(ctx.scope.organization_id))
 
     backend = _SimpleToolBackend(_never_execute, reconciler=_reconcile)
     final_after_reconcile = _answer_fixture(
@@ -1890,7 +2206,7 @@ async def test_reconcile_pending_call_completes_without_reinvoking_model_for_sam
     )
     orch, value, scope, lease, gw, store, _, _ = _make_harness(
         responses=(final_after_reconcile,),
-        backends={"delegate_agent@1": backend},
+        backends={"delegate_agent@2": backend},
         message="Tóm tắt Project Alpha",
         locale="vi",
     )
@@ -1912,21 +2228,15 @@ async def test_reconcile_pending_call_completes_without_reinvoking_model_for_sam
     )
     args_dict: dict[str, JsonValue] = {
         "agent_id": "work_intelligence",
-        "capability": "work.answer_question",
         "objective": "Answer status of Project Alpha",
         "context_ref_ids": [],
         "constraints": [],
         "expected_result": "Verified summary",
-        "input": {
-            "capability": "work.answer_question",
-            "question": "Status of Project Alpha",
-            "locale": "vi",
-        },
     }
-    args_model = DelegateAgentInput.model_validate(args_dict)
+    args_model = DelegateAgentInputV2.model_validate(args_dict)
     import hashlib
 
-    from work_management_ai.runtime.session_history import ToolArgumentsPayload
+    from work_management_ai.runtime.session_history import ToolArgumentsPayload, ToolResultPayload
 
     body = ToolArgumentsPayload(
         arguments=args_model.model_dump(mode="json"),
@@ -1956,7 +2266,7 @@ async def test_reconcile_pending_call_completes_without_reinvoking_model_for_sam
     desc = InvocationDescriptor(
         invocation_id=inv_id,
         call_id="call-pending-1",
-        tool_reference="delegate_agent@1",
+        tool_reference="delegate_agent@2",
         tool_version=tool_ver,
         arguments_fingerprint=body_fp,
     )
@@ -1989,15 +2299,56 @@ async def test_reconcile_pending_call_completes_without_reinvoking_model_for_sam
     started_receipt = await store.get_invocation(scope, inv_id)
     assert started_receipt is not None
     assert await store.start_invocation(scope, started_receipt, lease=lease) is True
-    ckpt = ckpt.model_copy(update={"sequence": r2.sequence})
+    sequence = r2.sequence
+    if replay == "committed":
+        payload = ToolResultPayload(
+            output=recovered_result(scope.organization_id).model_dump(mode="json")
+        )
+        payload_ref = await store.put_payload(
+            scope,
+            payload.model_dump(mode="json"),
+            classification="RAW_CONTEXT",
+            kind="TOOL_RESULT",
+            lease=lease,
+        )
+        settled = await store.settle_invocation(
+            scope,
+            started_receipt,
+            SettledInvocation(status="COMPLETED", payload_ref=payload_ref),
+            lease=lease,
+        )
+        sequence = settled.sequence
+    ckpt = ckpt.model_copy(
+        update={
+            "sequence": sequence,
+            "prompt_version": "orchestrator-tool-loop.v1"
+            if replay == "legacy_pin"
+            else PROMPT_VERSION,
+        }
+    )
     await store.checkpoint(scope, ckpt, lease=lease)
 
     result = await orch.run_segment(value, scope=scope, checkpoint=ckpt, lease=lease)
 
+    if replay == "legacy_pin":
+        assert isinstance(result, PublishedResponse)
+        assert result.output.stop_reason == "CHECKPOINT_VERSION_MISMATCH"
+        assert not gw.step_requests
+        assert backend.calls == [] and backend.reconcile_calls == []
+        return
     gw.assert_complete()
     assert len(backend.calls) == 0
-    assert len(backend.reconcile_calls) == 1
+    assert len(backend.reconcile_calls) == (1 if replay == "pending" else 0)
     assert len(gw.step_requests) == 1
     assert isinstance(result, PublishedResponse)
     assert result.output.status is OrchestratorStatus.COMPLETED
     assert "call-pending-1" in result.output.evidence_call_ids
+
+
+@pytest.mark.asyncio
+async def test_registered_evaluator_checks_candidate_tool_contracts() -> None:
+    report = await evaluate_orchestrator_tool_loop()
+    assert report["passed"] is True
+    assert report["flat_scoped_handoff"] is True
+    assert report["unique_project_overview"] is True
+    assert report["hosted_quality"] == "NOT_RUN"
