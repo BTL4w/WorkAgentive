@@ -604,13 +604,21 @@ class AssistantJobModel(Base):
             ondelete="RESTRICT",
         ),
         UniqueConstraint("organization_id", "id"),
-        UniqueConstraint("organization_id", "orchestration_run_id", "job_type"),
         UniqueConstraint(
             "organization_id", "id", "orchestration_run_id", name="uq_session_job_scope"
         ),
         CheckConstraint(
-            "job_type IN ('assistant.turn.execute', 'assistant.conversation.title')",
+            "job_type IN ('assistant.turn.execute', 'assistant.conversation.title', "
+            "'assistant.turn.resume')",
             name="job_type",
+        ),
+        Index(
+            "uq_assistant_jobs_run_initial",
+            "organization_id",
+            "orchestration_run_id",
+            "job_type",
+            unique=True,
+            postgresql_where=text("job_type <> 'assistant.turn.resume'"),
         ),
         Index(
             "uq_assistant_jobs_conversation_title",

@@ -170,6 +170,7 @@ class PostgreSQLSessionRepository:
                     j.turn_id == scope.turn_id,
                     j.conversation_id == scope.conversation_id,
                     j.requester_membership_id == scope.membership_id,
+                    j.status.in_(("QUEUED", "RUNNING")),
                 )
             )
             is not None

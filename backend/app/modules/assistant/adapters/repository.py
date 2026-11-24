@@ -189,7 +189,7 @@ def _event(model: AssistantEventModel) -> AssistantEvent:
     )
 
 
-def _agent_run(model: AgentRunModel) -> AgentRun:
+def agent_run_domain(model: AgentRunModel) -> AgentRun:
     return AgentRun(
         id=model.id,
         organization_id=model.organization_id,
@@ -1209,7 +1209,7 @@ class PostgreSQLAssistantRepository:
                 AgentRunModel.id == run_id,
             )
         )
-        return _agent_run(model) if model is not None else None
+        return agent_run_domain(model) if model is not None else None
 
     async def get_agent_run_turn_context(
         self, *, organization_id: UUID, run_id: UUID
@@ -1231,7 +1231,7 @@ class PostgreSQLAssistantRepository:
         ).one_or_none()
         if row is None:
             return None
-        return _agent_run(row[0]), row[1]
+        return agent_run_domain(row[0]), row[1]
 
     async def has_planning_conversation_link(
         self, *, actor: AuthenticatedActor, turn_id: UUID, workflow_run_id: UUID
@@ -1332,7 +1332,7 @@ class PostgreSQLAssistantRepository:
             model.projected_workflow_sequence = 0
         model.updated_at = datetime.now(UTC)
         await self._session.flush()
-        return _agent_run(model)
+        return agent_run_domain(model)
 
     async def list_unprojected_workflow_events(
         self, *, organization_id: UUID, limit: int
@@ -1381,7 +1381,7 @@ class PostgreSQLAssistantRepository:
         ).all()
         return tuple(
             LinkedWorkflowEvent(
-                agent_run=_agent_run(row[0]),
+                agent_run=agent_run_domain(row[0]),
                 turn_id=row[1],
                 conversation_id=row[2],
                 event=WorkflowEvent(
@@ -1429,6 +1429,31 @@ class PostgreSQLAssistantRepository:
         )
         if agent is None or (agent.projected_workflow_sequence or 0) >= event.sequence:
             return False
+        source = (
+            await self._session.execute(
+                select(
+                    OrchestrationRunModel.actor_membership_id,
+                    OrchestrationRunModel.checkpoint["continuation_protocol"].astext,
+                ).where(
+                    OrchestrationRunModel.organization_id == organization_id,
+                    OrchestrationRunModel.id == agent.orchestration_run_id,
+                    OrchestrationRunModel.turn_id == item.turn_id,
+                )
+            )
+        ).one_or_none()
+        if source is not None and source[0] is not None:
+            from app.modules.assistant.adapters.session_continuations import PostgreSQLContinuations
+
+            route = await PostgreSQLContinuations(self._session).route_linked_workflow_event(
+                item, source[0]
+            )
+            if route == "PENDING":
+                return False
+            if route == "HANDLED" or source[1] == "2.0":
+                agent.projected_workflow_sequence = event.sequence
+                agent.updated_at = datetime.now(UTC)
+                await self._session.flush()
+                return True
         conversation = await self._session.scalar(
             select(AssistantConversationModel)
             .where(
@@ -1643,6 +1668,9 @@ class PostgreSQLAssistantRepository:
                     .where(
                         OrchestrationRunModel.organization_id == organization_id,
                         OrchestrationRunModel.status == OrchestrationRunStatus.AWAITING_HUMAN.value,
+                        OrchestrationRunModel.checkpoint[
+                            "continuation_protocol"
+                        ].astext.is_distinct_from("2.0"),
                         live_payload(OrchestrationRunModel, "orchestration_runs"),
                     )
                     .order_by(OrchestrationRunModel.updated_at, OrchestrationRunModel.id)
@@ -1781,7 +1809,7 @@ class PostgreSQLAssistantRepository:
         model.safe_error_code = run.safe_error_code
         model.updated_at = run.updated_at
         await self._session.flush()
-        return _agent_run(model)
+        return agent_run_domain(model)
 
     async def append_handoff(self, *, handoff: AgentHandoffRecord) -> None:
         self._session.add(

@@ -111,6 +111,10 @@ async def assert_execution_fence(
         await repo.retention_deadline(scope)
     if not await repo.authorize(scope, actor):
         raise SessionError("SESSION_NOT_FOUND")
+    if child is not None:
+        # guard_job has already checked the exact allocation, claim and whether
+        # a transferred run can complete its previously admitted child job.
+        return
     active = await session.scalar(
         text(
             "SELECT status NOT IN ('COMPLETED','FAILED') FROM "

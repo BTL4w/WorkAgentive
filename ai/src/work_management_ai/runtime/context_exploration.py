@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Protocol
 from uuid import UUID, uuid5
 
+from work_management_ai.runtime.continuation import UserClarificationPort
 from work_management_ai.runtime.tool_loop_contracts import RunScope, VersionPin
 from work_management_ai.runtime.tool_pipeline import ToolPolicyError
 from work_management_ai.tools.context.contracts import (
@@ -58,7 +59,7 @@ class ExplorationProjector:
         )
         self._initial = self._new_empty()
         self._current: ExplorationReport = self._initial
-        self._tool_versions = frozenset((pin.reference, pin.version) for pin in tool_pins)
+        self._tool_pins = {(pin.reference, pin.version): pin for pin in tool_pins}
 
     @property
     def current(self) -> ExplorationReport | None:
@@ -85,7 +86,7 @@ class ExplorationProjector:
         ):
             raise ValueError("CANONICAL_CONTEXT_REQUIRED")
         observation = ContextReadObservation.model_validate(o)
-        if (observation.tool_reference, observation.tool_version) not in self._tool_versions:
+        if (observation.tool_reference, observation.tool_version) not in self._tool_pins:
             raise ToolPolicyError("CONTEXT_TOOL_VERSION_CONFLICT", stop_segment=True)
         return observation
 
@@ -249,6 +250,69 @@ class ExplorationProjector:
             )
         return frozenset(unresolved)
 
+    async def check_clarification(
+        self,
+        report: ExplorationReport,
+        *,
+        refs: tuple[ContextRef, ...],
+        decision: ContextAccessDecision,
+        choices: UserClarificationPort,
+        user_turn_id: UUID,
+    ) -> UseOutcome:
+        self.verify(report)
+        if user_turn_id == self.scope.turn_id:
+            return "NEEDS_INPUT"
+        for invocation_id in report.source_invocation_ids:
+            observation = self._source(invocation_id)
+            for entity in observation.entities:
+                if entity.resolution == "UNIQUE":
+                    continue
+                candidates = {
+                    ref.ref_id: ref
+                    for ref in observation.context_refs
+                    if ref.ref_id in entity.candidate_ref_ids
+                }
+                resource_ids = {ref.resource_id for ref in candidates.values()}
+                requested = tuple(
+                    ref
+                    for ref in refs
+                    if ref.resource_type == "project" and ref.resource_id in resource_ids
+                )
+                if not requested:
+                    continue
+                if entity.resolution != "AMBIGUOUS":
+                    return "NEEDS_INPUT"
+                binding = await choices.accepted(
+                    source_scope=self.scope,
+                    user_turn_id=user_turn_id,
+                    source_invocation_id=invocation_id,
+                )
+                if binding is None or (
+                    binding.source_scope != self.scope
+                    or binding.user_turn_id != user_turn_id
+                    or binding.source_invocation_id != invocation_id
+                    or binding.query_fingerprint != entity.query_fingerprint
+                    or binding.selected_ref_id not in candidates
+                ):
+                    return "NEEDS_INPUT"
+                selected = candidates[binding.selected_ref_id]
+                if any(ref.resource_id != selected.resource_id for ref in requested):
+                    return "NEEDS_INPUT"
+                if (
+                    binding.source_tool_pin
+                    != self._tool_pins[observation.tool_reference, observation.tool_version]
+                    or binding.resource_id != selected.resource_id
+                    or binding.actor_revision != decision.actor_revision
+                    or binding.policy_revision != decision.policy_revision
+                    or any(
+                        (ref.version, ref.fingerprint)
+                        != (binding.resource_version, binding.resource_fingerprint)
+                        for ref in (selected, *requested)
+                    )
+                ):
+                    return "REFRESH_REQUIRED"
+        return "ACCEPTED"
+
     def select(
         self, report: ExplorationReport, context_ref_ids: tuple[UUID, ...]
     ) -> ExplorationReport:
@@ -269,8 +333,16 @@ class ExplorationProjector:
 
 
 class ContextUseValidator:
-    def __init__(self, *, projector: ExplorationProjector, access: ContextUseAccessPort):
+    def __init__(
+        self,
+        *,
+        projector: ExplorationProjector,
+        access: ContextUseAccessPort,
+        choices: UserClarificationPort | None = None,
+        user_turn_id: UUID | None = None,
+    ):
         self.projector, self.access = projector, access
+        self._choices, self._user_turn_id = choices, user_turn_id
 
     async def validate(
         self,
@@ -297,7 +369,16 @@ class ContextUseValidator:
                 if decision.outcome == "ACCEPTED" and any(
                     (r.resource_type, r.resource_id) in ambiguous for r in refs
                 ):
-                    decision = decision.model_copy(update={"outcome": "NEEDS_INPUT"})
+                    outcome = "NEEDS_INPUT"
+                    if self._choices is not None and self._user_turn_id is not None:
+                        outcome = await self.projector.check_clarification(
+                            report,
+                            refs=refs,
+                            decision=decision,
+                            choices=self._choices,
+                            user_turn_id=self._user_turn_id,
+                        )
+                    decision = decision.model_copy(update={"outcome": outcome})
         return ContextUseValidation(
             scope=scope,
             target_tool=target_tool,

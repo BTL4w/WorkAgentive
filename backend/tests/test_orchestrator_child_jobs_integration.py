@@ -25,8 +25,11 @@ from app.modules.assistant.adapters.execution_recorder import PostgreSQLExecutio
 from app.modules.assistant.adapters.planning_tools import AssistantPlanningToolAdapter
 from app.modules.assistant.adapters.report_projection import ReportStatusContexts
 from app.modules.assistant.adapters.reporting_tools import ChatReportingToolAdapter
+from app.modules.assistant.adapters.session_continuations import continuation_service
 from app.modules.assistant.adapters.session_usage import PostgreSQLRunBudget
 from app.modules.assistant.adapters.transaction import PostgreSQLAssistantTransactionFactory
+from app.modules.assistant.application.projection_service import AssistantProjectionService
+from app.modules.assistant.domain.continuation import WaitDraft
 from app.modules.identity.adapters.auth_repository import SqlAlchemyAuthTransactionFactory
 from app.modules.identity.application.current_actor_service import CurrentActorService
 from app.modules.planning_runs.adapters.ai_runtime import (
@@ -38,6 +41,7 @@ from app.modules.planning_runs.adapters.transaction import PostgreSQLPlanningRun
 from app.modules.planning_runs.application.job_service import JobService
 from app.modules.planning_runs.application.proposal_service import ProposalService
 from app.modules.planning_runs.application.run_service import PlanningRunService
+from app.modules.planning_runs.domain.models import WorkflowJob
 from app.modules.reporting.adapters.generation_repository import GenerationTransactions
 from app.modules.reporting.adapters.narrative_runtime import ReportNarrativeRuntime
 from app.modules.reporting.adapters.transaction import ReportTransactions
@@ -46,6 +50,7 @@ from app.modules.reporting.application.job_service import ReportJobService
 from app.modules.reporting.application.report_service import ReportService
 from app.modules.work.adapters.project_repository import SqlAlchemyProjectTransactionFactory
 from app.modules.work.application.project_service import ProjectService
+from tests.test_orchestrator_continuation_integration import submit_target, suspend_fixture_job
 from tests.test_orchestrator_session_log_integration import Journal
 from tests.test_orchestrator_session_log_integration import journal as journal
 from tests.test_orchestrator_tool_pipeline_integration import Policy
@@ -204,13 +209,16 @@ async def _seed_planning_target(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("agent_id", "operation", "job_type", "interrupted"),
+    ("agent_id", "operation", "job_type", "interrupted", "transfer", "exhausted"),
     [
-        (AgentId.PLANNING, "CREATE", "planning.start", True),
-        (AgentId.PLANNING, "RESUME_INPUT", "planning.resume", True),
-        (AgentId.PLANNING, "REVISE", "proposal.ai_revise", True),
-        (AgentId.PLANNING, "REVISE", "proposal.ai_revise", False),
-        (AgentId.REPORTING, "CREATE", None, True),
+        (AgentId.PLANNING, "CREATE", "planning.start", True, False, False),
+        (AgentId.PLANNING, "RESUME_INPUT", "planning.resume", True, False, False),
+        (AgentId.PLANNING, "REVISE", "proposal.ai_revise", True, False, False),
+        (AgentId.PLANNING, "REVISE", "proposal.ai_revise", False, False, False),
+        (AgentId.REPORTING, "CREATE", None, True, False, False),
+        (AgentId.PLANNING, "CREATE", "planning.start", False, True, False),
+        (AgentId.REPORTING, "CREATE", None, False, True, False),
+        (AgentId.REPORTING, "CREATE", None, False, True, True),
     ],
 )
 async def test_uses_canonical_child_job_for_dispatch_and_replay(
@@ -219,6 +227,8 @@ async def test_uses_canonical_child_job_for_dispatch_and_replay(
     operation: Literal["CREATE", "RESUME_INPUT", "REVISE"],
     job_type: str | None,
     interrupted: bool,
+    transfer: bool,
+    exhausted: bool,
 ) -> None:
     engine, sessions, actor, log, scope, lease, _, _ = journal
     registry, _ = build_agent_registry()
@@ -556,24 +566,57 @@ async def test_uses_canonical_child_job_for_dispatch_and_replay(
         assert awaiting.wait_ref.resource_version == new_version.version_number
     if operation != "CREATE":
         return
-    async with engine.begin() as conn:
-        await conn.execute(
-            text(
-                "UPDATE orchestration_runtime_states SET lease_until=clock_timestamp() "
-                "WHERE organization_id=:org AND orchestration_run_id=:run"
-            ),
-            {"org": scope.organization_id, "run": scope.orchestration_run_id},
+    target = None
+    if transfer:
+        assert result.wait_ref is not None
+        target = await submit_target(journal)
+        await suspend_fixture_job(journal, result.wait_ref)
+        service = continuation_service(sessions)
+        wait = await service.open_wait(actor, WaitDraft(reference=result.wait_ref, lease=lease))
+        handed_off = await service.transfer(
+            actor,
+            wait_id=wait.reference.wait_id,
+            expected_version=wait.version,
+            target_run_id=target,
         )
+        assert handed_off.wait.owner_run_id == target
+    else:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "UPDATE orchestration_runtime_states SET lease_until=clock_timestamp() "
+                    "WHERE organization_id=:org AND orchestration_run_id=:run"
+                ),
+                {"org": scope.organization_id, "run": scope.orchestration_run_id},
+            )
     settings = Settings(environment="test", ai_provider="mock")
     if agent_id is AgentId.PLANNING:
+        handlers = build_planning_job_handlers(
+            settings, planning, actors, candidate_sessions=sessions
+        )
+        original_handler = handlers["planning.start"]
+        if transfer:
+
+            async def project_between_commits(*, job: WorkflowJob, worker_id: str) -> None:
+                await original_handler(job=job, worker_id=worker_id)
+                projection = AssistantProjectionService(transaction_factory=transactions)
+                await projection.project_once(organization_id=scope.organization_id)
+                async with engine.connect() as conn:
+                    assert (
+                        await conn.scalar(
+                            text(
+                                "SELECT count(*) FROM assistant_jobs WHERE organization_id=:org "
+                                "AND job_type='assistant.turn.resume'"
+                            ),
+                            {"org": scope.organization_id},
+                        )
+                        == 0
+                    )
+
+            handlers["planning.start"] = project_between_commits
         planning_worker = JobService(
             transaction_factory=planning,
-            handlers=build_planning_job_handlers(
-                settings,
-                planning,
-                actors,
-                candidate_sessions=sessions,
-            ),
+            handlers=handlers,
             organization_scopes={scope.organization_id},
         )
         assert await planning_worker.run_once("child-worker", scope.organization_id)
@@ -587,10 +630,47 @@ async def test_uses_canonical_child_job_for_dispatch_and_replay(
                 timezone="UTC",
             ),
         )
-        assert await reporting_worker.run_once(
+        if exhausted:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE report_generation_jobs SET claims=3 WHERE id=:id"),
+                    {"id": finished[0]},
+                )
+        claimed = await reporting_worker.run_once(
             worker_id="child-worker",
             organization_id=scope.organization_id,
         )
+        assert claimed is not exhausted
+    if target is not None:
+        projection = AssistantProjectionService(transaction_factory=transactions)
+        await projection.project_once(organization_id=scope.organization_id)
+        async with engine.connect() as conn:
+            owner = await conn.scalar(
+                text(
+                    "SELECT orchestration_run_id FROM assistant_jobs "
+                    "WHERE organization_id=:org AND job_type='assistant.turn.resume'"
+                ),
+                {"org": scope.organization_id},
+            )
+        assert owner == target
+        completion = [
+            record
+            for record in await log.read(scope, after_sequence=0)
+            if record.kind == "continuation.received"
+        ]
+        assert len(completion) == 1
+        assert completion[0].correlation_id == result.wait_ref.wait_id
+    if exhausted:
+        async with engine.connect() as conn:
+            queued = await conn.scalar(
+                text(
+                    "SELECT payload->>'outcome' FROM assistant_jobs "
+                    "WHERE orchestration_run_id=:run AND job_type='assistant.turn.resume'"
+                ),
+                {"run": target},
+            )
+        assert queued == "AI_UNAVAILABLE"
+        return
     review_proposal: tuple[UUID, int] | None = None
     async with engine.connect() as conn:
         if agent_id is AgentId.PLANNING:

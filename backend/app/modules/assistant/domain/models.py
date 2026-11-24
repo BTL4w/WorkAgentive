@@ -415,6 +415,22 @@ class OrchestrationRun:
             updated_at=current,
         )
 
+    def mark_continuation_transferred(self, wait_kind: str, now: datetime) -> "OrchestrationRun":
+        expected = {
+            "USER_INPUT": OrchestrationRunStatus.AWAITING_INPUT,
+            "HUMAN_DECISION": OrchestrationRunStatus.AWAITING_HUMAN,
+            "WORKFLOW_RESULT": OrchestrationRunStatus.RUNNING,
+        }.get(wait_kind)
+        if self.status is not expected:
+            raise InvalidAssistantTransitionError("CONTINUATION_SOURCE_NOT_WAITING")
+        return replace(
+            self,
+            status=OrchestrationRunStatus.COMPLETED,
+            stop_reason="CONTINUATION_TRANSFERRED",
+            completed_at=now,
+            updated_at=now,
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class AgentRun:
@@ -697,7 +713,9 @@ class AssistantJob:
     turn_id: UUID
     orchestration_run_id: UUID
     requester_membership_id: UUID
-    job_type: Literal["assistant.turn.execute", "assistant.conversation.title"]
+    job_type: Literal[
+        "assistant.turn.execute", "assistant.conversation.title", "assistant.turn.resume"
+    ]
     payload: dict[str, Any]
     status: AssistantJobStatus
     attempt_count: int

@@ -69,6 +69,7 @@ def test_active_phase_tables_are_registered() -> None:
         "orchestration_runtime_states",
         "orchestration_usage",
         "orchestration_child_jobs",
+        "orchestration_waits",
         "orchestration_session_events",
         "orchestration_session_payloads",
         "planning_drafts",

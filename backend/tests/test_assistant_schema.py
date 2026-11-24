@@ -76,11 +76,20 @@ def test_conversation_transcript_and_job_uniqueness_is_retry_safe() -> None:
         "conversation_id",
         "sequence",
     ) in _unique_columns("assistant_events")
-    assert (
+    initial_job = next(
+        index
+        for index in Base.metadata.tables["assistant_jobs"].indexes
+        if index.name == "uq_assistant_jobs_run_initial"
+    )
+    assert initial_job.unique
+    assert tuple(initial_job.columns.keys()) == (
         "organization_id",
         "orchestration_run_id",
         "job_type",
-    ) in _unique_columns("assistant_jobs")
+    )
+    assert str(initial_job.dialect_options["postgresql"]["where"]) == (
+        "job_type <> 'assistant.turn.resume'"
+    )
 
 
 def test_queue_and_owner_indexes_begin_with_tenant() -> None:

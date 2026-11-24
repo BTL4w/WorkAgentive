@@ -325,8 +325,8 @@ class SessionService:
                 replace(state, checkpoint_payload_id=payload.id, checkpoint_sequence=sequence)
             )
 
-    async def _append(
-        self,
+    @staticmethod
+    async def append_locked(
         repo: SessionRepository,
         state: RuntimeState,
         event: SessionEvent,
@@ -341,7 +341,7 @@ class SessionService:
         if type(expected_sequence) is not int or expected_sequence != state.sequence:
             raise SessionError("SEQUENCE_CONFLICT")
         if event.payload_id is not None:
-            payload = await self._payload(repo, state.scope, event.payload_id)
+            payload = await SessionService._payload(repo, state.scope, event.payload_id)
             if event.kind == "tool.requested" and (
                 payload.kind != "TOOL_ARGUMENTS"
                 or payload.fingerprint != event.arguments_fingerprint
@@ -369,7 +369,7 @@ class SessionService:
             raise SessionError("USE_SETTLE_INVOCATION")
         async with self._transaction(actor, scope) as repo:
             state = await self.locked(repo, scope, lease)
-            return await self._append(repo, state, event, expected_sequence)
+            return await self.append_locked(repo, state, event, expected_sequence)
 
     async def start_invocation(
         self,
@@ -399,7 +399,7 @@ class SessionService:
                 for r in history
             ):
                 return False
-            await self._append(repo, state, event, state.sequence)
+            await self.append_locked(repo, state, event, state.sequence)
             return True
 
     async def read(
@@ -453,4 +453,4 @@ class SessionService:
                     return existing
                 if existing.event.settlement_status is not None or event.wait_id is not None:
                     raise SessionError("INVOCATION_CONFLICT")
-            return await self._append(repo, state, event, state.sequence)
+            return await self.append_locked(repo, state, event, state.sequence)

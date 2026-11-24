@@ -301,3 +301,62 @@ def test_event_overflow_and_runtime_owned_metadata_cannot_be_forged():
     _, _, _, fresh = fixture()
     with pytest.raises(ValueError):
         fresh.select(fresh.empty().model_copy(update={"status": "COMPLETE"}), ())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("choice_kind", "expected"),
+    [
+        ("verified", "ACCEPTED"),
+        ("missing", "NEEDS_INPUT"),
+        ("stale", "REFRESH_REQUIRED"),
+        ("changed_pin", "REFRESH_REQUIRED"),
+    ],
+)
+async def test_only_fresh_verified_user_choice_resolves_matching_ambiguity(
+    choice_kind: str, expected: UseOutcome
+) -> None:
+    from work_management_ai.runtime.continuation import ResolvedContextBinding
+
+    scope, objective, sources, projector = fixture()
+    observation_value = observation(scope, objective, resolution="AMBIGUOUS", count=2)
+    sources.values[observation_value.invocation_id] = observation_value
+    report = projector.apply(projector.empty(), observation_value)
+    selected, unselected = report.context_refs
+    accepted_turn_id = uuid4()
+    source_pin = (
+        ToolRegistry.from_resources((("work_management_ai.tools.context", "projects.yaml"),))
+        .candidate_definitions(("explore_projects@1",))[0]
+        .pin
+    )
+    if choice_kind == "changed_pin":
+        source_pin = source_pin.model_copy(update={"fingerprint": "different"})
+
+    class Choices:
+        async def accepted(
+            self, *, source_scope: RunScope, user_turn_id: UUID, source_invocation_id: UUID
+        ) -> ResolvedContextBinding | None:
+            if choice_kind == "missing":
+                return None
+            return ResolvedContextBinding(
+                source_scope=scope,
+                user_turn_id=accepted_turn_id,
+                source_invocation_id=observation_value.invocation_id,
+                query_fingerprint=observation_value.entities[0].query_fingerprint,
+                source_tool_pin=source_pin,
+                selected_ref_id=selected.ref_id,
+                resource_id=selected.resource_id,
+                resource_version=2 if choice_kind == "stale" else 1,
+                resource_fingerprint=selected.fingerprint,
+                actor_revision="actor1",
+                policy_revision="policy1",
+            )
+
+    validator = ContextUseValidator(
+        projector=projector, access=Access(), choices=Choices(), user_turn_id=accepted_turn_id
+    )
+    for ref, outcome in ((selected, expected), (unselected, "NEEDS_INPUT")):
+        result = await validator.validate(
+            scope, target_tool="delegate_agent@2", input_fingerprint="d" * 64, refs=(ref,)
+        )
+        assert result.outcome == outcome

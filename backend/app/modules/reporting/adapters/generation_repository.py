@@ -467,6 +467,7 @@ class SQLGenerationRepository:
             succeeded=succeeded,
             code=row.safe_error_code,
         )
+        await self._route_completion(row)
 
     async def claim(self, worker_id: str) -> GenerationJob | None:
         row = await self.session.scalar(
@@ -495,6 +496,7 @@ class SQLGenerationRepository:
             await self.audit(
                 "report.generation.failed", row.report_id, succeeded=False, code=row.safe_error_code
             )
+            await self._route_completion(row)
             return None
         row.claims += 1
         row.fence += 1
@@ -541,6 +543,14 @@ class SQLGenerationRepository:
             succeeded=row.state == "AWAITING_REVIEW",
             code=row.safe_error_code,
         )
+
+        await self._route_completion(row)
+
+    async def _route_completion(self, row: ReportGenerationJobModel) -> None:
+        from app.modules.assistant.adapters.session_continuations import PostgreSQLContinuations
+
+        await self.session.flush()
+        await PostgreSQLContinuations(self.session).route_report_completion(row)
 
 
 class GenerationTransactions:
