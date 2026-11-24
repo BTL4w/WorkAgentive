@@ -200,6 +200,7 @@ async def test_permission_review_stale_replay_and_audit(report_harness: ReportHa
 async def test_deduplication_and_split_separation(report_harness: ReportHarness):
     h = report_harness
     _, feedback_id = await reviewed(h)
+    _, second_feedback = await reviewed(h)
     service = await admin_service(h)
     first = await service.prepare(
         actor=h.actor, feedback_id=feedback_id, idempotency_key=str(uuid4())
@@ -210,7 +211,6 @@ async def test_deduplication_and_split_separation(report_harness: ReportHarness)
         expected_version=1,
         idempotency_key=str(uuid4()),
     )
-    _, second_feedback = await reviewed(h)
     second = await service.prepare(
         actor=h.actor, feedback_id=second_feedback, idempotency_key=str(uuid4())
     )

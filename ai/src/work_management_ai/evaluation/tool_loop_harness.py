@@ -405,6 +405,7 @@ def make_harness(
     message: str = "Xin chào!",
     policy: AllowAllPolicy | None = None,
     use_packaged_manifest: bool = False,
+    model_ref: str = "mock:orchestrator-v2",
     specialists: tuple[tuple[AgentId, str], ...] = (
         (AgentId.WORK_INTELLIGENCE, "Answers questions from verified work records."),
         (AgentId.ASSIGNMENT, "Analyzes workload and prepares team recommendations."),
@@ -543,7 +544,7 @@ def make_harness(
         skills=skills,
         resources=resources,
         catalog=catalog,
-        model_ref="mock:orchestrator-v2",
+        model_ref=model_ref,
     )
     store = InMemorySessionLog()
     history = SessionHistory(store, now=lambda: FIXTURE_TIME)
@@ -583,7 +584,7 @@ def make_harness(
     seq_key = f"orchestrator.tool_loop:{run_id}"
     gateway = MockModelGateway(
         fixtures={},
-        model_ref="mock:orchestrator-v2",
+        model_ref=model_ref,
         tool_sequence_fixtures={seq_key: responses},
     )
 
@@ -598,7 +599,7 @@ def make_harness(
         skill_loader=skill_loader,
         projector=projector,
         observation_sink=obs_by_id,
-        model_ref="mock:orchestrator-v2",
+        model_ref=model_ref,
         clock=lambda: FIXTURE_TIME,
         delegate_specialists=lambda _: specialists,
     )

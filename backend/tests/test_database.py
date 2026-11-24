@@ -49,12 +49,14 @@ def test_metadata_has_stable_constraint_naming_convention() -> None:
     assert NAMING_CONVENTION["fk"].startswith("fk_%(table_name)s")
 
 
-def test_alembic_environment_has_one_continuation_head() -> None:
+def test_alembic_environment_has_one_interval_recovery_head() -> None:
     backend_root = Path(__file__).resolve().parents[1]
     config = Config(backend_root / "alembic.ini")
     scripts = ScriptDirectory.from_config(config)
 
-    assert scripts.get_heads() == ["20261116_orch_waits"]
+    assert scripts.get_heads() == ["20261124_orch_interval"]
+    interval = scripts.get_revision("20261124_orch_interval")
+    assert interval is not None and interval.down_revision == "20261116_orch_waits"
     waits = scripts.get_revision("20261116_orch_waits")
     assert waits is not None and waits.down_revision == "20261122_orch_child_jobs"
     child_jobs = scripts.get_revision("20261122_orch_child_jobs")
