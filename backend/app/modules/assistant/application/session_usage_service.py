@@ -21,6 +21,7 @@ from app.modules.assistant.domain.session_usage import (
     JobClaim,
     UsageEntry,
     add,
+    assistant_job_interval,
     balances,
     subtract,
     validate_vector,
@@ -155,6 +156,25 @@ class RunUsageService:
                     raise SessionError("RESERVATION_CONFLICT")
                 if job and old.fence != lease.fencing_token:
                     raise SessionError("WORKFLOW_LEASE_LOST")
+                if (
+                    parent is not None
+                    and kind == "INTERVAL"
+                    and allocation_id is None
+                    and operation_id == assistant_job_interval(parent.job_id)
+                ):
+                    state = await SessionService.locked(repo, scope, parent)
+                    assert state.lease is not None
+                    now = await repo.now()
+                    remaining = (
+                        old.amount["active_milliseconds"] / 1000
+                        - (now - old.started_at).total_seconds()
+                    )
+                    seconds = min(remaining, (state.lease.expires_at - now).total_seconds())
+                    if old.closed or seconds <= 0:
+                        raise SessionError("BUDGET_EXHAUSTED")
+                    if old.fence != parent.fencing_token:
+                        await repo.update_interval_fence(scope, operation_id, parent.fencing_token)
+                    return True, float(seconds)
                 return True, 1
             if not job and allocation_id is not None and await repo.has_job(scope, allocation_id):
                 raise SessionError("ALLOCATION_OWNED_BY_JOB")

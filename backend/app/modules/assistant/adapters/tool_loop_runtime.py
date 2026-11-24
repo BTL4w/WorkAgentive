@@ -38,8 +38,10 @@ from app.modules.assistant.application.session_service import SessionService
 from app.modules.assistant.domain.continuation import WaitDraft, WakeReceipt
 from app.modules.assistant.domain.models import AssistantJob, AssistantTurn
 from app.modules.assistant.domain.session import SessionError
+from app.modules.assistant.domain.session_usage import assistant_job_interval
 from app.modules.identity.application.current_actor_service import CurrentActorService
 from app.modules.identity.domain.auth import AuthenticatedActor
+from app.modules.planning_runs.adapters.draft_repository import lock_planning_workflow
 from app.modules.work.adapters.project_repository import SqlAlchemyProjectTransactionFactory
 from app.modules.work.application.project_service import ProjectService
 from work_management_ai.agents.orchestrator.contracts import (
@@ -73,6 +75,7 @@ from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentId,
     ContextReference,
+    ProposalResponseBlock,
     TextResponseBlock,
 )
 from work_management_ai.runtime.manifests import (
@@ -85,7 +88,7 @@ from work_management_ai.runtime.session_history import (
     MessagePayload,
     SessionHistory,
 )
-from work_management_ai.runtime.session_log import EventDraft
+from work_management_ai.runtime.session_log import EventDraft, SettledInvocation
 from work_management_ai.runtime.skill_loading import (
     ApprovedPackageResources,
     SkillLoader,
@@ -98,6 +101,7 @@ from work_management_ai.runtime.tool_loop_contracts import (
     RunScope,
     ToolLoopCheckpoint,
     VersionPin,
+    WaitReference,
 )
 from work_management_ai.runtime.tool_pipeline import RecoverableToolBackend, ToolPipeline
 from work_management_ai.runtime.tool_registry import ToolRegistry
@@ -482,6 +486,18 @@ class ToolLoopTurnExecutor:
         lease, checkpoint = await self._prepare_history(
             scope, log, catalog, job, pin, turn.objective
         )
+        if (
+            wake is None
+            and checkpoint.pending_wait is not None
+            and checkpoint.pending_wait.kind == "WORKFLOW_RESULT"
+        ):
+            async with self._transactions(actor) as transaction:
+                await transaction.repository.assert_job_claim(job=job)
+                await PostgreSQLContinuations(transaction.session).open_wait(
+                    actor, WaitDraft(reference=checkpoint.pending_wait, lease=lease)
+                )
+                await transaction.commit()
+            return
         if inbound is not None:
             imported = await self._import_choice(scope, log, lease, inbound, access, pin)
             if specialized.observe is not None:
@@ -518,7 +534,22 @@ class ToolLoopTurnExecutor:
             delegate_specialists=specialized.specialists,
             evidence_sink=specialized.observe,
         )
-        if wake is not None and wake.outcome == "REJECTED":
+        recovered = (
+            await self._recover_publication(scope, log, lease, checkpoint, access)
+            if job.attempt_count > 1
+            else None
+        )
+        proposal = (
+            wake.proposal if wake is not None and wake.wait.reference.scope == scope else None
+        )
+        if recovered is not None:
+            result = recovered
+        elif wake is not None and proposal is not None:
+            await access.ensure_authorized(scope)
+            result = await self._publish_proposal_wait(
+                scope, log, lease, checkpoint, wake, turn.locale
+            )
+        elif wake is not None and wake.outcome == "REJECTED":
             text = "Đề xuất đã bị từ chối." if turn.locale == "vi" else "The proposal was rejected."
             result = PublishedResponse(
                 output=OrchestratorOutputV2(
@@ -555,16 +586,32 @@ class ToolLoopTurnExecutor:
                                 and wake.wait.reference.kind != "USER_INPUT"
                                 else None
                             ),
+                            interval_id=assistant_job_interval(job.id),
                         )
                     finally:
                         heartbeat.cancel()
         if isinstance(result, PublishedResponse):
             blocks = await self._public_blocks(actor, result)
-            await recorder.finish_orchestrator_run(root_id, result.output)
+            if proposal is None:
+                await recorder.finish_orchestrator_run(root_id, result.output)
         else:
             blocks = ()
         async with self._transactions(actor) as transaction:
+            if proposal is not None:
+                await lock_planning_workflow(
+                    transaction.session, actor.organization_id, proposal.workflow_id
+                )
             await transaction.repository.assert_job_claim(job=job)
+            if proposal is not None and isinstance(result, PublishedResponse):
+                current = await PostgreSQLContinuations(transaction.session).load_wake(actor, job)
+                if current != wake:
+                    raise SessionError("CONTINUATION_OUTCOME_STALE")
+                await recorder.record_orchestrator_output(
+                    transaction.repository,
+                    root_id,
+                    result.output,
+                    {**result.output.model_dump(mode="json"), "blocks": list(blocks)},
+                )
             if isinstance(result, PublishedResponse):
                 await transaction.repository.append_assistant_blocks(
                     job=job,
@@ -589,6 +636,110 @@ class ToolLoopTurnExecutor:
                     ),
                 )
             await transaction.commit()
+
+    async def _publish_proposal_wait(
+        self,
+        scope: RunScope,
+        log: PostgreSQLToolLoopRecorder,
+        lease: RunLease,
+        checkpoint: ToolLoopCheckpoint,
+        wake: WakeReceipt,
+        locale: Literal["vi", "en"],
+    ) -> PublishedResponse:
+        proposal = wake.proposal
+        assert proposal is not None
+        source = wake.wait.reference
+        wait = WaitReference(
+            wait_id=uuid5(
+                source.source_invocation_id,
+                f"decision:{proposal.proposal_id}:{proposal.proposal_version}",
+            ),
+            scope=scope,
+            kind="HUMAN_DECISION",
+            source_invocation_id=source.source_invocation_id,
+            resource_id=proposal.proposal_id,
+            resource_version=proposal.proposal_version,
+        )
+        receipt = await log.get_invocation(scope, source.source_invocation_id)
+        if (
+            receipt is None
+            or receipt.settlement is None
+            or receipt.settlement.wait_ref not in (source, wait)
+        ):
+            raise SessionError("CONTINUATION_WAIT_MISMATCH")
+        if receipt.settlement.wait_ref == source:
+            await log.settle_invocation(
+                scope, receipt, SettledInvocation(status="DEFERRED", wait_ref=wait), lease=lease
+            )
+        records = await log.read(scope, after_sequence=checkpoint.sequence)
+        if records:
+            checkpoint = checkpoint.model_copy(
+                update={"sequence": records[-1].sequence, "pending_wait": wait}
+            )
+            await log.checkpoint(scope, checkpoint, lease=lease)
+        elif checkpoint.pending_wait != wait:
+            raise SessionError("CONTINUATION_WAIT_MISMATCH")
+        message = (
+            "Đề xuất đã sẵn sàng và đang chờ phê duyệt của Manager."
+            if locale == "vi"
+            else "A proposal is ready and awaiting Manager approval."
+        )
+        return PublishedResponse(
+            output=OrchestratorOutputV2(
+                status=OrchestratorStatus.AWAITING_HUMAN,
+                blocks=(
+                    TextResponseBlock(text=message),
+                    ProposalResponseBlock(
+                        workflow_run_id=proposal.workflow_id,
+                        proposal_id=proposal.proposal_id,
+                        proposal_version=proposal.proposal_version,
+                        approval_id=proposal.approval_id,
+                    ),
+                ),
+                stop_reason="AWAITING_HUMAN_DECISION",
+            ),
+            wait_ref=wait,
+        )
+
+    async def _recover_publication(
+        self,
+        scope: RunScope,
+        log: PostgreSQLToolLoopRecorder,
+        lease: RunLease,
+        checkpoint: ToolLoopCheckpoint,
+        access: CandidateAccess,
+    ) -> PublishedResponse | None:
+        records = await log.read(scope, after_sequence=max(0, checkpoint.sequence - 1))
+        if not records:
+            return None
+        record = records[-1]
+        payload_ref = record.payload_ref
+        if (
+            record.kind != "turn.completed"
+            or record.correlation_id != lease.job_id
+            or payload_ref is None
+        ):
+            return None
+        message = MessagePayload.model_validate(await log.get_payload(scope, payload_ref))
+        if message.role != "assistant" or message.verified_publication is None:
+            raise SessionError("PUBLICATION_RECEIPT_INVALID")
+        await access.assert_refs(scope, message.references)
+        result = PublishedResponse.model_validate(message.verified_publication)
+        if result.wait_ref is not None and result.wait_ref.scope != scope:
+            raise SessionError("PUBLICATION_RECEIPT_INVALID")
+        if record.sequence > checkpoint.sequence:
+            await log.checkpoint(
+                scope,
+                checkpoint.model_copy(
+                    update={
+                        "sequence": record.sequence,
+                        "pending_wait": result.wait_ref,
+                        "payload_refs": (*checkpoint.payload_refs, payload_ref),
+                    }
+                ),
+                lease=lease,
+            )
+        return result
 
     async def _renew(self, job: AssistantJob, actor: AuthenticatedActor, lease: RunLease) -> None:
         scope = session_scope(lease.scope)
@@ -784,7 +935,11 @@ class ToolLoopTurnExecutor:
         if job.locked_by is None:
             raise SessionError("LEASE_LOST")
         lease = await log.claim(
-            scope, job_id=job.id, worker_id=job.locked_by, lease_seconds=self._lease_seconds
+            scope,
+            job_id=job.id,
+            worker_id=job.locked_by,
+            lease_seconds=self._lease_seconds,
+            job_attempt=job.attempt_count,
         )
         if state.objective_ref is None:
             records = await log.read(scope, after_sequence=0)

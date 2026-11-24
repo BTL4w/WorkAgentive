@@ -355,6 +355,7 @@ class ToolLoopOrchestrator:
         lease: RunLease,
         verified_context_refs: tuple[ContextReference, ...] = (),
         resume_wait: WaitReference | None = None,
+        interval_id: UUID | None = None,
     ) -> OrchestratorExecutionResult:
         """Execute a segment with optional turn-scoped references bound by the caller."""
 
@@ -384,7 +385,7 @@ class ToolLoopOrchestrator:
         if resume_wait is not None and resume_wait.scope != scope:
             raise ValueError("ORCHESTRATOR_SCOPE_MISMATCH")
 
-        interval_id = uuid4()
+        interval_id = interval_id or uuid4()
         try:
             interval_receipt = await self.budget.reserve(
                 scope,
@@ -699,9 +700,28 @@ class _GraphHandlers:
             and projected.pending_wait == self._run.resume_wait
         )
         if projected.status == "WAITING" and projected.pending_wait is not None and not resumed:
+            wait = projected.pending_wait
+            if (
+                wait.kind == "WORKFLOW_RESULT"
+                and self._run.checkpoint.pending_wait != wait
+                and projected.pending_call is not None
+            ):
+                budget_receipt = await self._orch.budget.recover_tool(
+                    self._run.scope,
+                    wait.source_invocation_id,
+                    lease=self._run.lease,
+                    interval_id=self._run.interval_id,
+                    allocation_id=None,
+                )
+                await self._orch.budget.settle(self._run.scope, budget_receipt, None)
+                updated = self._run.checkpoint.model_copy(
+                    update={"sequence": seq, "pending_wait": wait}
+                )
+                await self._orch.store.checkpoint(self._run.scope, updated, lease=self._run.lease)
+                self._run.checkpoint = updated
             return {
                 "result": _wait_result(
-                    wait_ref=projected.pending_wait,
+                    wait_ref=wait,
                     log_cursor=seq,
                     model_refs=tuple(self._run.model_refs),
                     call_ids=tuple(self._run.observed_call_ids),
@@ -1092,7 +1112,14 @@ class _GraphHandlers:
         seq = records[-1].sequence if records else 0
         msg_ref = await self._orch.store.put_payload(
             self._run.scope,
-            MessagePayload(role="assistant", text=candidate.summary).model_dump(mode="json"),
+            MessagePayload(
+                role="assistant",
+                text=candidate.summary,
+                references=tuple(
+                    dict.fromkeys((*self._run.observed_evidence, *self._run.history_evidence))
+                ),
+                verified_publication=published.model_dump(mode="json"),
+            ).model_dump(mode="json"),
             classification="RAW_CONTEXT",
             kind="MODEL_OUTPUT",
             lease=self._run.lease,
@@ -1103,6 +1130,7 @@ class _GraphHandlers:
                 event_id=uuid5(self._run.scope.orchestration_run_id, f"turn.completed:{seq}"),
                 kind="turn.completed",
                 payload_ref=msg_ref,
+                correlation_id=self._run.lease.job_id,
             ),
             expected_sequence=seq,
             lease=self._run.lease,

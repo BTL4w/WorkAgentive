@@ -32,6 +32,7 @@ async def execute_child_job(
         return
     scope, allocation_id = binding
     try:
+        output_cap = await store.child_job_output_cap(scope, allocation_id, claim)
         interval = await store.reserve_for_job(
             scope,
             allocation_id,
@@ -69,7 +70,14 @@ async def execute_child_job(
                 with (
                     execution_fence(fence),
                     child_job_budget(
-                        ChildJobBudget(scope, allocation_id, claim, store, interval_id)
+                        ChildJobBudget(
+                            scope,
+                            allocation_id,
+                            claim,
+                            store,
+                            interval_id,
+                            model_output_cap=output_cap,
+                        )
                     ),
                 ):
                     yield

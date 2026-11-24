@@ -38,6 +38,7 @@ class SessionLease:
     worker_id: str
     fencing_token: int
     expires_at: datetime
+    job_attempt: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

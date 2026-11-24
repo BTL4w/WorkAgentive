@@ -1,5 +1,7 @@
 """Application-service-only workload Tool adapter."""
 
+import json
+from hashlib import sha256
 from uuid import NAMESPACE_URL, uuid5
 
 from pydantic import ValidationError
@@ -12,7 +14,16 @@ from work_management_ai.runtime.contracts import (
 from work_management_ai.tools.assignment.read_workload.contracts import (
     ReadWorkloadApplicationPort,
     ReadWorkloadInput,
+    ReadWorkloadOutput,
 )
+
+
+def workload_fingerprint(snapshot: ReadWorkloadOutput) -> str:
+    rows = sorted(snapshot.workloads, key=lambda row: (row.project_week_id, row.membership_id))
+    payload = snapshot.model_copy(update={"workloads": tuple(rows)}).model_dump(
+        mode="json", exclude={"observed_at"}
+    )
+    return sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 class ReadWorkloadToolAdapter:
@@ -27,7 +38,10 @@ class ReadWorkloadToolAdapter:
         except ValidationError:
             return _rejected("TOOL_INPUT_INVALID")
         output = await self._application.read_workload(actor=request.actor, value=value)
-        if output.organization_id != request.actor.organization_id:
+        if (
+            output.organization_id != request.actor.organization_id
+            or output.project_id != value.project_id
+        ):
             return _rejected("TOOL_TENANT_MISMATCH")
         return ToolExecutionResult(
             status="SUCCEEDED",
@@ -41,6 +55,7 @@ class ReadWorkloadToolAdapter:
                     organization_id=output.organization_id,
                     resource_type="WORKLOAD",
                     resource_id=output.project_id,
+                    fingerprint=workload_fingerprint(output),
                     observed_at=output.observed_at,
                 ),
             ),

@@ -4,7 +4,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Literal
-from uuid import UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -20,7 +20,11 @@ from app.modules.assistant.adapters.database_models import (
     AssistantTurnModel,
     OrchestrationRunModel,
 )
-from app.modules.assistant.adapters.repository import agent_run_domain, orchestration_domain
+from app.modules.assistant.adapters.repository import (
+    PostgreSQLAssistantRepository,
+    agent_run_domain,
+    orchestration_domain,
+)
 from app.modules.assistant.adapters.session_models import OrchestrationRuntimeStateModel
 from app.modules.assistant.adapters.session_repository import PostgreSQLSessionRepository
 from app.modules.assistant.adapters.session_usage_models import OrchestrationChildJobModel
@@ -31,6 +35,7 @@ from app.modules.assistant.application.driver_admission import ContinuationAdmis
 from app.modules.assistant.application.ports import LinkedWorkflowEvent
 from app.modules.assistant.application.session_service import SessionService
 from app.modules.assistant.domain.continuation import (
+    PendingProposalReceipt,
     TransferReceipt,
     WaitDraft,
     WaitRecord,
@@ -42,6 +47,7 @@ from app.modules.assistant.domain.session import SessionError, SessionEvent
 from app.modules.feedback.adapters.payload_repository import live_payload
 from app.modules.identity.adapters.auth_repository import SqlAlchemyAuthRepository
 from app.modules.identity.domain.auth import AuthenticatedActor
+from app.modules.organization.domain.roles import MembershipRole
 from app.modules.planning_runs.adapters.database_models import (
     ApprovalModel,
     ProposalModel,
@@ -251,6 +257,18 @@ class PostgreSQLContinuations:
         scope = session_scope(reference.scope)
         if not await self._journal.authorize(scope, actor):
             raise SessionError("CONTINUATION_NOT_FOUND")
+        allocation = uuid5(reference.source_invocation_id, "child-budget")
+        child = await self._session.get(
+            OrchestrationChildJobModel,
+            (scope.organization_id, scope.orchestration_run_id, allocation),
+        )
+        if (
+            child is not None
+            and child.workflow_job_id is not None
+            and reference.kind == "WORKFLOW_RESULT"
+        ):
+            # Projection can already hold the Agent Run while waiting for a wait row.
+            await self._repair_planning_link(actor, reference, child.workflow_job_id)
         run, turn = await self._run(actor, scope.orchestration_run_id, scope.conversation_id)
         previous = await self._wait(actor, reference.wait_id, lock=False)
         if previous is not None:
@@ -297,10 +315,6 @@ class PostgreSQLContinuations:
                 raise SessionError("CONTINUATION_ALREADY_WAITING")
             active.closed = True
             await self._session.flush()
-        allocation = uuid5(reference.source_invocation_id, "child-budget")
-        child = await self._session.get(
-            OrchestrationChildJobModel, (scope.organization_id, run.id, allocation)
-        )
         if reference.policy_fingerprint is not None or (
             reference.source_fingerprint is not None
             and (child is None or child.generation_job_id is None)
@@ -352,6 +366,53 @@ class PostgreSQLContinuations:
         elif row.kind in {"WORKFLOW_RESULT", "HUMAN_DECISION"}:
             await self._catch_up_workflow(actor, row)
         return _record(row)
+
+    async def _repair_planning_link(
+        self, actor: AuthenticatedActor, reference: WaitReference, job_id: UUID
+    ) -> None:
+        """A job may commit before the caller can link its Planning Agent Run."""
+        job, workflow = WorkflowJobModel, WorkflowRunModel
+        workflow_id = await self._session.scalar(
+            select(job.workflow_run_id)
+            .join(
+                workflow,
+                (workflow.organization_id == job.organization_id)
+                & (workflow.id == job.workflow_run_id),
+            )
+            .where(
+                job.organization_id == actor.organization_id,
+                job.id == job_id,
+                workflow.id == reference.resource_id,
+                workflow.requested_by_membership_id == actor.membership_id,
+            )
+        )
+        child = AgentRunModel
+        linked = (
+            await self._session.execute(
+                select(child.id, child.workflow_run_id).where(
+                    child.organization_id == actor.organization_id,
+                    child.orchestration_run_id == reference.scope.orchestration_run_id,
+                    child.id
+                    == uuid5(
+                        NAMESPACE_URL,
+                        f"agent-run:goal-delegate:{reference.source_invocation_id}",
+                    ),
+                    child.agent_id == "planning",
+                )
+            )
+        ).one_or_none()
+        if workflow_id is None or linked is None:
+            raise SessionError("CONTINUATION_WAIT_MISMATCH")
+        child_id, existing = linked
+        if existing == workflow_id:
+            return
+        if existing is not None:
+            raise SessionError("CONTINUATION_WAIT_MISMATCH")
+        await PostgreSQLAssistantRepository(self._session).link_agent_workflow_run(
+            organization_id=actor.organization_id,
+            agent_run_id=child_id,
+            workflow_run_id=workflow_id,
+        )
 
     async def _catch_up_workflow(
         self, actor: AuthenticatedActor, row: OrchestrationWaitModel
@@ -768,6 +829,7 @@ class PostgreSQLContinuations:
             raise SessionError("CONTINUATION_WAKE_NOT_FOUND")
         await self._journal.retention_deadline(source)
         outcome: str | None = None
+        proposal: PendingProposalReceipt | None = None
         if row.workflow_event_id is not None:
             event = await self._session.get(WorkflowEventModel, row.workflow_event_id)
             if event is not None and event.organization_id == row.organization_id:
@@ -798,6 +860,21 @@ class PostgreSQLContinuations:
                         ),
                     )
                     outcome = await self._workflow_outcome(actor, row, linked)
+                    if outcome == "WAITING_FOR_DECISION" and row.kind == "WORKFLOW_RESULT":
+                        current_actor = await SqlAlchemyAuthRepository(
+                            self._session
+                        ).find_current_actor_by_membership(
+                            organization_id=actor.organization_id,
+                            membership_id=actor.membership_id,
+                        )
+                        if current_actor is None or current_actor.role not in {
+                            MembershipRole.ADMIN,
+                            MembershipRole.MANAGER,
+                        }:
+                            raise SessionError("CONTINUATION_CONTEXT_DENIED")
+                        proposal = await self._pending_proposal(event)
+                        if proposal is None:
+                            raise SessionError("CONTINUATION_OUTCOME_STALE")
         elif row.child_allocation_id is not None:
             binding, generation = OrchestrationChildJobModel, ReportGenerationJobModel
             outcome = await self._session.scalar(
@@ -819,7 +896,38 @@ class PostgreSQLContinuations:
             )
         if outcome is None or outcome != job.payload.get("outcome"):
             raise SessionError("CONTINUATION_OUTCOME_STALE")
-        return WakeReceipt(wait, outcome)
+        return WakeReceipt(wait, outcome, proposal)
+
+    async def _pending_proposal(self, event: WorkflowEventModel) -> PendingProposalReceipt | None:
+        payload = event.public_payload
+        try:
+            proposal_id = UUID(str(payload["proposal_id"]))
+            approval_id = UUID(str(payload["approval_id"]))
+            version = payload["version"]
+        except (ValueError, KeyError):
+            return None
+        if type(version) is not int or version < 1:
+            return None
+        p, a = ProposalModel, ApprovalModel
+        verified = await self._session.scalar(
+            select(p.id)
+            .join(a, (a.organization_id == p.organization_id) & (a.proposal_id == p.id))
+            .where(
+                p.organization_id == event.organization_id,
+                p.workflow_run_id == event.workflow_run_id,
+                p.id == proposal_id,
+                p.current_version_number == version,
+                p.status == "READY_FOR_DECISION",
+                p.approval_id == approval_id,
+                a.id == approval_id,
+                a.proposal_version_number == version,
+                a.status == "PENDING",
+                a.decided_by_membership_id.is_(None),
+            )
+        )
+        if verified is None:
+            return None
+        return PendingProposalReceipt(event.workflow_run_id, proposal_id, version, approval_id)
 
     async def receive_event(
         self, actor: AuthenticatedActor, event: LinkedWorkflowEvent

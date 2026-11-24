@@ -776,3 +776,117 @@ async def test_canonical_checkpoint_admits_only_one_candidate_wait(journal: Jour
             {"run": scope.orchestration_run_id},
         )
     assert stored == reference.wait_id
+
+
+@pytest.mark.parametrize("changed", ["none", "version", "role"])
+async def test_ready_proposal_wake_checks_current_approval_and_manager_role(
+    journal: Journal, changed: str
+) -> None:
+    from app.modules.assistant.adapters.session_continuations import (
+        PostgreSQLContinuations,
+        continuation_service,
+    )
+    from app.modules.assistant.domain.continuation import WaitDraft
+
+    engine, sessions, actor, _, scope, lease, _, _ = journal
+    workflow_id, proposal_id, approval_id = uuid4(), uuid4(), uuid4()
+    reference = await prepare_wait(journal, workflow_id=workflow_id)
+    service = continuation_service(sessions)
+    await service.open_wait(actor, WaitDraft(reference=reference, lease=lease))
+    _, linked = await seed_workflow_events(journal, workflow_id)
+    event = replace(
+        linked.event,
+        id=uuid4(),
+        sequence=3,
+        event_type="proposal.ready",
+        public_payload={
+            "proposal_id": str(proposal_id),
+            "approval_id": str(approval_id),
+            "version": 1,
+        },
+    )
+    transactions = PostgreSQLAssistantTransactionFactory(sessions)
+    async with transactions(actor) as tx:
+        row = ProposalModel(
+            id=proposal_id,
+            organization_id=actor.organization_id,
+            workflow_run_id=workflow_id,
+            current_version_number=1,
+            status="READY_FOR_DECISION",
+        )
+        tx.session.add(row)
+        await tx.session.flush()
+        tx.session.add(
+            ProposalVersionModel(
+                id=uuid4(),
+                organization_id=actor.organization_id,
+                proposal_id=proposal_id,
+                version_number=1,
+                created_by_membership_id=actor.membership_id,
+                content={},
+            )
+        )
+        await tx.session.flush()
+        tx.session.add(
+            ApprovalModel(
+                id=approval_id,
+                organization_id=actor.organization_id,
+                proposal_id=proposal_id,
+                proposal_version_number=1,
+                status="PENDING",
+            )
+        )
+        await tx.session.flush()
+        row.approval_id = approval_id
+        await tx.session.execute(
+            text("UPDATE workflow_runs SET status='WAITING_FOR_DECISION' WHERE id=:id"),
+            {"id": workflow_id},
+        )
+        tx.session.add(
+            WorkflowEventModel(
+                id=event.id,
+                organization_id=actor.organization_id,
+                workflow_run_id=workflow_id,
+                sequence=event.sequence,
+                event_type=event.event_type,
+                public_payload=event.public_payload,
+            )
+        )
+        await tx.commit()
+    assert (await service.receive_event(actor, replace(linked, event=event))).outcome == "QUEUED"
+    async with engine.begin() as conn:
+        if changed == "version":
+            await conn.execute(
+                text("UPDATE approvals SET status='SUPERSEDED', version=version+1 WHERE id=:id"),
+                {"id": approval_id},
+            )
+        if changed == "role":
+            await conn.execute(
+                text("UPDATE memberships SET role='EMPLOYEE' WHERE id=:id"),
+                {"id": actor.membership_id},
+            )
+    async with transactions(actor) as tx:
+        now = datetime.now(UTC)
+        job = await tx.repository.claim_job(
+            organization_id=scope.organization_id,
+            job_type="assistant.turn.resume",
+            worker_id="proposal-test",
+            now=now,
+            lease_until=now,
+        )
+        assert job is not None
+        port = PostgreSQLContinuations(tx.session)
+        if changed == "none":
+            wake = await port.load_wake(actor, job)
+            assert wake.proposal is not None
+            assert (
+                wake.proposal.proposal_id,
+                wake.proposal.proposal_version,
+                wake.proposal.approval_id,
+            ) == (proposal_id, 1, approval_id)
+        else:
+            code = (
+                "CONTINUATION_CONTEXT_DENIED" if changed == "role" else "CONTINUATION_OUTCOME_STALE"
+            )
+            with pytest.raises(SessionError, match=code):
+                await port.load_wake(actor, job)

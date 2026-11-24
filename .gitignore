@@ -13,6 +13,7 @@ docs/
 node_modules/
 .next/
 .next-e2e/
+.next-orchestrator-e2e/
 .next-retrieval-e2e/
 .next-redis-e2e/
 out/

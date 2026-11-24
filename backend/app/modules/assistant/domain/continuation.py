@@ -38,3 +38,12 @@ class WakeDecision:
 class WakeReceipt:
     wait: WaitRecord
     outcome: str
+    proposal: "PendingProposalReceipt | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingProposalReceipt:
+    workflow_id: UUID
+    proposal_id: UUID
+    proposal_version: int
+    approval_id: UUID

@@ -166,36 +166,45 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
     async def finish_orchestrator_run(
         self, run_id: UUID, output: OrchestratorOutput | OrchestratorOutputV2
     ) -> None:
-        if run_id != uuid5(NAMESPACE_URL, f"orchestrator:{self._identity}"):
-            raise RuntimeError("ORCHESTRATOR_AGENT_RUN_SCOPE_MISMATCH")
         stored_output = output.model_dump(mode="json")
         if self._block_projector is not None and self._actor is not None:
             prepare = getattr(self._block_projector, "prepare_for_storage", None)
             if prepare is not None:
                 stored_output = await prepare(self._actor, stored_output)
         async with self._transactions(self._context) as transaction:
-            await self.check_claim(transaction.repository)
-            run = await transaction.repository.get_agent_run(
-                organization_id=self._scope.organization_id, run_id=run_id
+            await self.record_orchestrator_output(
+                transaction.repository, run_id, output, stored_output
             )
-            if run is None:
-                raise RuntimeError("ORCHESTRATOR_AGENT_RUN_NOT_FOUND")
-            if not run.status.is_terminal:
-                if output.status.value == "FAILED":
-                    updated = run.mark_failed("ORCHESTRATOR_MANUAL_FALLBACK")
-                elif output.status.value in {"AWAITING_INPUT", "AWAITING_HUMAN"}:
-                    updated = run.mark_awaiting(
-                        status=DomainAgentRunStatus(output.status.value),
-                        typed_output=stored_output,
-                        stop_reason=output.stop_reason,
-                    )
-                else:
-                    updated = run.mark_completed(
-                        typed_output=stored_output,
-                        stop_reason=output.stop_reason,
-                    )
-                await transaction.repository.finish_agent_run(run=updated)
             await transaction.commit()
+
+    async def record_orchestrator_output(
+        self,
+        repository: AssistantRepository,
+        run_id: UUID,
+        output: OrchestratorOutput | OrchestratorOutputV2,
+        stored_output: dict[str, Any],
+    ) -> None:
+        if run_id != uuid5(NAMESPACE_URL, f"orchestrator:{self._identity}"):
+            raise RuntimeError("ORCHESTRATOR_AGENT_RUN_SCOPE_MISMATCH")
+        await self.check_claim(repository)
+        run = await repository.get_agent_run(
+            organization_id=self._scope.organization_id, run_id=run_id
+        )
+        if run is None:
+            raise RuntimeError("ORCHESTRATOR_AGENT_RUN_NOT_FOUND")
+        if run.status.is_terminal:
+            return
+        if output.status.value == "FAILED":
+            updated = run.mark_failed("ORCHESTRATOR_MANUAL_FALLBACK")
+        elif output.status.value in {"AWAITING_INPUT", "AWAITING_HUMAN"}:
+            updated = run.mark_awaiting(
+                status=DomainAgentRunStatus(output.status.value),
+                typed_output=stored_output,
+                stop_reason=output.stop_reason,
+            )
+        else:
+            updated = run.mark_completed(typed_output=stored_output, stop_reason=output.stop_reason)
+        await repository.finish_agent_run(run=updated)
 
     async def load_checkpoint(self, orchestration_run_id: UUID) -> ExecutionCheckpoint | None:
         if orchestration_run_id != self._scope.orchestration_run_id:

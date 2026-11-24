@@ -4,7 +4,7 @@ UV := uv
 
 .DEFAULT_GOAL := check
 
-.PHONY: sync lint format-check typecheck test eval eval-retrieve eval-context check
+.PHONY: sync lint format-check typecheck test eval eval-retrieve eval-context eval-orchestrator check
 
 sync:
 	$(UV) sync --locked
@@ -29,5 +29,8 @@ eval-retrieve:
 
 eval-context:
 	$(UV) run --locked python -m work_management_ai.evaluation.context_exploration
+
+eval-orchestrator:
+	$(UV) run --locked python -m work_management_ai.evaluation.orchestrator_tool_loop
 
 check: lint format-check typecheck test eval eval-retrieve eval-context

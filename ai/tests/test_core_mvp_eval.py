@@ -17,8 +17,12 @@ def test_existing_suite_failure_cannot_be_hidden_by_reporting():
             "phase4_daily_update_risk",
             "phase5_reporting",
             "progressive_planning",
+            "orchestrator_tool_loop",
         )
     }
     assert evaluate_core_gate(suites)
+    suites["orchestrator_tool_loop"] = False
+    assert not evaluate_core_gate(suites)
+    suites["orchestrator_tool_loop"] = True
     suites["phase4_risk"] = False
     assert not evaluate_core_gate(suites)

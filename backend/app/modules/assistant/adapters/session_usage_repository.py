@@ -335,6 +335,13 @@ class PostgreSQLUsageRepository(PostgreSQLSessionRepository):
         row.closed = True
         await self.session.flush()
 
+    async def update_interval_fence(
+        self, scope: SessionScope, operation_id: UUID, fence: int
+    ) -> None:
+        row = await self._row(scope, operation_id)
+        row.fence = fence
+        await self.session.flush()
+
 
 class PostgreSQLUsageTransaction(PostgreSQLSessionTransaction):
     def __init__(self, factory: PostgreSQLAssistantTransactionFactory, actor: AuthenticatedActor):

@@ -1,11 +1,13 @@
 """Candidate admission and durable worker execution against PostgreSQL."""
 
 import os
+from collections.abc import Awaitable, Callable
 from typing import Literal
 from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings
 from app.core.database import create_database_engine, create_session_factory
@@ -66,6 +68,20 @@ class PlanningSnapshot:
 
 @pytest.mark.parametrize("planning", [False, True])
 async def test_candidate_worker_executes_the_saved_pin_after_rollback(planning: bool) -> None:
+    await run_candidate_turn(planning=planning)
+
+
+async def run_candidate_turn(
+    *,
+    planning: bool,
+    interrupt: Callable[
+        [AsyncEngine, AssistantJob, AssistantJobService, list[Exception]], Awaitable[None]
+    ]
+    | None = None,
+    interrupt_resume: Callable[[AsyncEngine, UUID, UUID, AssistantJobService], Awaitable[None]]
+    | None = None,
+    lost_model_response: bool = False,
+) -> None:
     from app.modules.assistant.adapters.tool_loop_runtime import (
         CandidateBackends,
         DriverAdmission,
@@ -163,6 +179,8 @@ async def test_candidate_worker_executes_the_saved_pin_after_rollback(planning: 
                 },
                 terminal,
             )
+            if lost_model_response:
+                steps = (steps[0], *steps)
         gateway = MockModelGateway(
             fixtures={"planning_agent.en.goal_intake": {"operation": "CREATE"}},
             usage_fixtures={
@@ -268,6 +286,8 @@ async def test_candidate_worker_executes_the_saved_pin_after_rollback(planning: 
             handler=execute,
             organization_scopes={organization_id},
         )
+        if interrupt is not None:
+            await interrupt(engine, submitted.job, worker, unexpected)
         assert await worker.run_once(worker_id="candidate-test", organization_id=organization_id)
         assert not await worker.run_once(
             worker_id="candidate-test", organization_id=organization_id
@@ -276,12 +296,14 @@ async def test_candidate_worker_executes_the_saved_pin_after_rollback(planning: 
             raise unexpected[0]
         if planning:
             async with engine.connect() as connection:
-                waiting = await connection.scalar(
-                    text("SELECT status FROM orchestration_runs WHERE id=:id"),
-                    {"id": submitted.run.id},
-                )
-            assert waiting == "RUNNING"
-            assert len(gateway.step_requests) == 1
+                waiting = (
+                    await connection.execute(
+                        text("SELECT status, stop_reason FROM orchestration_runs WHERE id=:id"),
+                        {"id": submitted.run.id},
+                    )
+                ).one()
+            assert waiting.status == "RUNNING", waiting
+            assert len(gateway.step_requests) == 1 + lost_model_response
             delegate_schema = next(
                 tool
                 for tool in gateway.step_requests[0].tools
@@ -312,12 +334,14 @@ async def test_candidate_worker_executes_the_saved_pin_after_rollback(planning: 
                 organization_scopes={organization_id},
                 job_type="assistant.turn.resume",
             )
+            if interrupt_resume is not None:
+                await interrupt_resume(engine, organization_id, submitted.run.id, wake_worker)
             assert await wake_worker.run_once(
                 worker_id="resume-test", organization_id=organization_id
             )
             if unexpected:
                 raise unexpected[0]
-            assert len(gateway.step_requests) == 2
+            assert len(gateway.step_requests) == 2 + lost_model_response
         gateway.assert_complete()
         async with engine.connect() as connection:
             result = await connection.scalar(
@@ -337,6 +361,35 @@ async def test_candidate_worker_executes_the_saved_pin_after_rollback(planning: 
                     {"id": submitted.run.id},
                 )
                 assert closed is True
+                if interrupt is not None or interrupt_resume is not None:
+                    counts = await connection.execute(
+                        text(
+                            "SELECT "
+                            "(SELECT count(*) FROM agent_runs WHERE orchestration_run_id=:run), "
+                            "(SELECT count(*) FROM workflow_runs WHERE organization_id=:org), "
+                            "(SELECT count(*) FROM planning_drafts WHERE organization_id=:org), "
+                            "(SELECT count(*) FROM proposals WHERE organization_id=:org), "
+                            "(SELECT count(*) FROM assistant_messages WHERE turn_id=:turn "
+                            "AND role='ASSISTANT'), "
+                            "(SELECT count(*) FROM assistant_jobs WHERE orchestration_run_id=:run "
+                            "AND job_type='assistant.turn.resume'), "
+                            "(SELECT count(*) FROM workflow_jobs WHERE organization_id=:org), "
+                            "(SELECT count(*) FROM audit_events WHERE organization_id=:org "
+                            "AND action='planning_run.created'), "
+                            "(SELECT count(*) FROM orchestration_usage WHERE "
+                            "orchestration_run_id=:run AND kind='INTERVAL'), "
+                            "(SELECT count(*) FROM orchestration_session_events WHERE "
+                            "orchestration_run_id=:run AND kind='tool.started'), "
+                            "(SELECT count(*) FROM assistant_events WHERE turn_id=:turn "
+                            "AND event_type='assistant.turn.response.v1')"
+                        ),
+                        {
+                            "run": submitted.run.id,
+                            "org": organization_id,
+                            "turn": submitted.turn.id,
+                        },
+                    )
+                    assert tuple(counts.one()) == (2, 1, 1, 0, 1, 1, 1, 1, 4, 1, 1)
         if unexpected:
             raise unexpected[0]
         assert result == "COMPLETED"

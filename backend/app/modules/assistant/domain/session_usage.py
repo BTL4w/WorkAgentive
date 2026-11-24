@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+from hashlib import sha256
 from typing import Literal, cast
 from uuid import UUID
 
@@ -21,6 +22,10 @@ CAPS = dict(zip(DIMENSIONS, (8, 24, 12, 6, 48000, 8000, 4, 720000), strict=True)
 POOL_ID = UUID(int=0)
 
 type ChildJobKind = Literal["PLANNING", "REPORTING"]
+
+
+def assistant_job_interval(job_id: UUID) -> UUID:
+    return UUID(bytes=sha256(f"assistant-root-interval:{job_id}".encode()).digest()[:16])
 
 
 @dataclass(frozen=True, slots=True)

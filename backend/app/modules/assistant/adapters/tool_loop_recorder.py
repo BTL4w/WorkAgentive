@@ -49,6 +49,7 @@ def session_lease(lease: RunLease) -> SessionLease:
         lease.worker_id,
         lease.fencing_token,
         lease.expires_at,
+        lease.job_attempt,
     )
 
 
@@ -123,7 +124,13 @@ class PostgreSQLToolLoopRecorder:
         )
 
     async def claim(
-        self, scope: RunScope, *, job_id: UUID, worker_id: str, lease_seconds: int
+        self,
+        scope: RunScope,
+        *,
+        job_id: UUID,
+        worker_id: str,
+        lease_seconds: int,
+        job_attempt: int | None = None,
     ) -> RunLease:
         value = await self.service.claim(
             self._actor,
@@ -131,6 +138,7 @@ class PostgreSQLToolLoopRecorder:
             job_id=job_id,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
+            job_attempt=job_attempt,
         )
         return RunLease.model_validate({**asdict(value), "scope": scope})
 

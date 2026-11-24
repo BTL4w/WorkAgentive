@@ -105,7 +105,13 @@ class PostgreSQLSessionRepository:
                 and row.lease_until is not None
             )
             lease = SessionLease(
-                scope, row.lease_id, row.lease_job_id, row.lease_owner, row.fence, row.lease_until
+                scope,
+                row.lease_id,
+                row.lease_job_id,
+                row.lease_owner,
+                row.fence,
+                row.lease_until,
+                row.lease_job_attempt,
             )
         return RuntimeState(
             scope,
@@ -155,6 +161,7 @@ class PostgreSQLSessionRepository:
         lease = state.lease
         row.lease_id = lease.lease_id if lease else None
         row.lease_job_id = lease.job_id if lease else None
+        row.lease_job_attempt = lease.job_attempt if lease else None
         row.lease_owner = lease.worker_id if lease else None
         row.lease_until = lease.expires_at if lease else None
         await self.session.flush()
@@ -174,6 +181,26 @@ class PostgreSQLSessionRepository:
                 )
             )
             is not None
+        )
+
+    async def lock_job_expiry(
+        self, scope: SessionScope, job_id: UUID, worker_id: str, attempt: int
+    ) -> datetime | None:
+        job = AssistantJobModel
+        return await self.session.scalar(
+            select(job.lease_until)
+            .where(
+                job.organization_id == scope.organization_id,
+                job.id == job_id,
+                job.orchestration_run_id == scope.orchestration_run_id,
+                job.turn_id == scope.turn_id,
+                job.conversation_id == scope.conversation_id,
+                job.requester_membership_id == scope.membership_id,
+                job.status == "RUNNING",
+                job.locked_by == worker_id,
+                job.attempt_count == attempt,
+            )
+            .with_for_update()
         )
 
     async def put_payload(self, payload: SessionPayload) -> None:

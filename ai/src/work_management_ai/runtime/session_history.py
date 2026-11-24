@@ -86,6 +86,7 @@ class MessagePayload(_Contract):
     role: Literal["user", "assistant"]
     text: str = Field(min_length=1, max_length=32000)
     references: tuple[ContextReference, ...] = ()
+    verified_publication: dict[str, JsonValue] | None = None
 
 
 class ToolArgumentsPayload(_Contract):

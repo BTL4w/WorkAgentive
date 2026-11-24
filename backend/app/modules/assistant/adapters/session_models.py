@@ -100,6 +100,7 @@ class OrchestrationRuntimeStateModel(Base):
     checkpoint_payload_id: Mapped[UUID | None]
     lease_id: Mapped[UUID | None]
     lease_job_id: Mapped[UUID | None]
+    lease_job_attempt: Mapped[int | None]
     lease_owner: Mapped[str | None] = mapped_column(String(128))
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     fence: Mapped[int] = mapped_column(Integer, server_default="0")

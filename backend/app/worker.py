@@ -680,6 +680,10 @@ async def _run_worker_with_tracing(
     )
 
     async def verify_candidate_ref(actor: AuthenticatedActor, ref: ContextReference) -> bool:
+        if ref.resource_type == "WORKLOAD":
+            return await assignment_application.verify_workload_reference(
+                actor, ref, project_service
+            )
         if ref.resource_type == "RISK_CONTEXT" and ref.fingerprint is not None:
             try:
                 current = await risk_backend.reads.read(actor, ref.resource_id, ref.fingerprint)

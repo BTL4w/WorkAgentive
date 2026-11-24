@@ -67,13 +67,21 @@ class SessionService:
     async def locked(
         repo: SessionRepository, scope: SessionScope, lease: SessionLease
     ) -> RuntimeState:
+        if lease.scope != scope:
+            raise SessionError("LEASE_LOST")
+        if lease.job_attempt is not None:
+            deadline = await repo.lock_job_expiry(
+                scope, lease.job_id, lease.worker_id, lease.job_attempt
+            )
+            if deadline is None or deadline <= await repo.now():
+                raise SessionError("LEASE_LOST")
         state = await repo.state(scope, lock=True)
         if state is None:
             raise SessionError("SESSION_NOT_INITIALIZED")
         current = state.lease
         if (
-            lease.scope != scope
-            or current is None
+            current is None
+            or current.job_attempt != lease.job_attempt
             or (current.lease_id, current.job_id, current.worker_id, current.fencing_token)
             != (lease.lease_id, lease.job_id, lease.worker_id, lease.fencing_token)
             or current.expires_at <= await repo.now()
@@ -218,9 +226,15 @@ class SessionService:
         job_id: UUID,
         worker_id: str,
         lease_seconds: int,
+        job_attempt: int | None = None,
     ) -> SessionLease:
         self._lease_options(worker_id, lease_seconds)
         async with self._transaction(actor, scope) as repo:
+            deadline = None
+            if job_attempt is not None:
+                deadline = await repo.lock_job_expiry(scope, job_id, worker_id, job_attempt)
+                if deadline is None or deadline <= await repo.now():
+                    raise SessionError("LEASE_LOST")
             state = await repo.state(scope, lock=True)
             if state is None:
                 raise SessionError("SESSION_NOT_INITIALIZED")
@@ -228,16 +242,28 @@ class SessionService:
                 raise SessionError("SESSION_NOT_FOUND")
             now = await repo.now()
             if state.lease is not None and state.lease.expires_at > now:
-                if (state.lease.job_id, state.lease.worker_id) != (job_id, worker_id):
+                current = state.lease
+                if (current.job_id, current.worker_id, current.job_attempt) == (
+                    job_id,
+                    worker_id,
+                    job_attempt,
+                ):
+                    return state.lease
+                if (
+                    current.job_id != job_id
+                    or job_attempt is None
+                    or (current.job_attempt is not None and current.job_attempt >= job_attempt)
+                ):
                     raise SessionError("LEASE_BUSY")
-                return state.lease
+            expires = now + timedelta(seconds=lease_seconds)
             lease = SessionLease(
                 scope,
                 uuid4(),
                 job_id,
                 worker_id,
                 state.fence + 1,
-                now + timedelta(seconds=lease_seconds),
+                min(expires, deadline) if deadline is not None else expires,
+                job_attempt,
             )
             await repo.save_state(replace(state, lease=lease, fence=lease.fencing_token))
             return lease

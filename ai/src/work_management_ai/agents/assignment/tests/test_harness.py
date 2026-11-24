@@ -472,6 +472,18 @@ async def test_read_workload_and_assign_task_adapters_preserve_exact_values() ->
     workload_result = await ReadWorkloadToolAdapter(
         application=FakeWorkloadApplication(workload)
     ).execute(workload_request)
+    assert workload_result.evidence[0].fingerprint is not None
+    replay = await ReadWorkloadToolAdapter(
+        application=FakeWorkloadApplication(
+            workload.model_copy(update={"observed_at": datetime.now(UTC)})
+        )
+    ).execute(workload_request)
+    assert replay.evidence[0].fingerprint == workload_result.evidence[0].fingerprint
+    changed = workload.workloads[0].model_copy(update={"allocated_effort_hours": 48})
+    stale = await ReadWorkloadToolAdapter(
+        application=FakeWorkloadApplication(workload.model_copy(update={"workloads": (changed,)}))
+    ).execute(workload_request)
+    assert stale.evidence[0].fingerprint != workload_result.evidence[0].fingerprint
     assignment_result = await AssignTaskToolAdapter(
         application=FakeAssignTaskApplication(assigned)
     ).execute(assignment_request)

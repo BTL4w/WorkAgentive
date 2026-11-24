@@ -12,7 +12,11 @@ from app.modules.organization.domain.roles import MembershipRole
 from app.modules.people_capacity.application.service import PeopleCapacityService
 from app.modules.work.application.project_service import ProjectService
 from app.modules.work.application.task_service import TaskService
-from app.modules.work.planning.application.manual_service import ManualPlanningService
+from app.modules.work.domain.projects import ProjectError
+from app.modules.work.planning.application.manual_service import (
+    ManualPlanningService,
+    PlanningError,
+)
 from app.modules.work.planning.assignment.application.assignment_service import (
     ExplicitAssignmentCommand,
     ExplicitAssignmentResult,
@@ -60,6 +64,7 @@ from work_management_ai.agents.orchestrator.contracts import (
 from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentHandoffV2,
+    ContextReference,
     SourceTurnTextPort,
     ToolExecutionRequest,
     ToolExecutionResult,
@@ -74,7 +79,10 @@ from work_management_ai.tools.assignment.manage_team.contracts import (
     ManageTeamApplicationPort,
     ManageTeamInput,
 )
-from work_management_ai.tools.assignment.read_workload.adapter import ReadWorkloadToolAdapter
+from work_management_ai.tools.assignment.read_workload.adapter import (
+    ReadWorkloadToolAdapter,
+    workload_fingerprint,
+)
 from work_management_ai.tools.assignment.read_workload.contracts import (
     ReadWorkloadApplicationPort,
     ReadWorkloadInput,
@@ -409,6 +417,32 @@ class AssignmentApplicationService:
             project_id=value.project_id,
             workloads=tuple(workloads),
             observed_at=datetime.now(UTC),
+        )
+
+    async def verify_workload_reference(
+        self, actor: AuthenticatedActor, reference: ContextReference, projects: ProjectService
+    ) -> bool:
+        if (
+            reference.organization_id != actor.organization_id
+            or reference.resource_type != "WORKLOAD"
+            or reference.fingerprint is None
+            or actor.role not in {MembershipRole.ADMIN, MembershipRole.MANAGER}
+        ):
+            return False
+        try:
+            await projects.get_project(actor=actor, project_id=reference.resource_id)
+            current = await self.read_workload(
+                actor=ActorReference(
+                    organization_id=actor.organization_id, membership_id=actor.membership_id
+                ),
+                value=ReadWorkloadInput(project_id=reference.resource_id),
+            )
+        except (MemberForbiddenError, PlanningError, ProjectError, ValueError):
+            return False
+        return (
+            current.organization_id == reference.organization_id
+            and current.project_id == reference.resource_id
+            and workload_fingerprint(current) == reference.fingerprint
         )
 
     async def assign_task(

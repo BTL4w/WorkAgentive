@@ -31,6 +31,7 @@ class RunLease(_Contract):
     worker_id: str = Field(min_length=1, max_length=128)
     fencing_token: int = Field(ge=1, strict=True)
     expires_at: AwareDatetime
+    job_attempt: int | None = Field(default=None, ge=1, strict=True)
 
 
 class ToolLoopLimits(_Contract):

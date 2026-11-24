@@ -13,10 +13,11 @@ from app.modules.assistant.adapters.tool_loop_recorder import session_lease, ses
 from app.modules.assistant.application.session_service import fingerprint
 from app.modules.assistant.application.session_usage_service import RunUsageService
 from app.modules.assistant.domain.session import SessionError, SessionLease
-from app.modules.assistant.domain.session_usage import DIMENSIONS, JobClaim
+from app.modules.assistant.domain.session_usage import DIMENSIONS, JobClaim, subtract, vector
 from app.modules.identity.domain.auth import AuthenticatedActor
 from work_management_ai.model_gateway.contracts import ModelUsage
 from work_management_ai.runtime.run_budget import (
+    BudgetError,
     BudgetReceipt,
     ChildAllocation,
     ChildJobClaim,
@@ -47,6 +48,10 @@ def _claim(value: ChildJobClaim) -> JobClaim:
     return JobClaim(value.kind, value.job_id, value.worker_id, value.attempt, value.lease_until)
 
 
+class LedgerBudgetExhausted(SessionError, BudgetError):
+    """Preserve the ledger error contract while signaling exhaustion to the AI runtime."""
+
+
 class PostgreSQLRunBudget:
     def __init__(self, sessions: async_sessionmaker[AsyncSession], actor: AuthenticatedActor):
         self._transactions = PostgreSQLUsageTransactionFactory(sessions)
@@ -74,6 +79,28 @@ class PostgreSQLRunBudget:
         claim: ChildJobClaim,
     ) -> None:
         await self.service.close_job(session_scope(scope), allocation_id, _claim(claim))
+
+    async def child_job_output_cap(
+        self, scope: RunScope, allocation_id: UUID, claim: ChildJobClaim
+    ) -> int:
+        owner = session_scope(scope)
+        async with self.service.transaction(owner, job=(allocation_id, _claim(claim))) as repo:
+            entries = await repo.usage_entries(owner)
+            allocation = self.service.entry(entries, allocation_id)
+            used = vector(
+                output_tokens=sum(
+                    entry.charge["output_tokens"]
+                    for entry in entries
+                    if entry.allocation_id == allocation_id
+                ),
+                total_model_requests=sum(
+                    entry.charge["total_model_requests"]
+                    for entry in entries
+                    if entry.allocation_id == allocation_id
+                ),
+            )
+            remaining = subtract(allocation.amount, used)
+            return remaining["output_tokens"] // max(1, remaining["total_model_requests"])
 
     async def recover_tool(
         self,
@@ -120,7 +147,12 @@ class PostgreSQLRunBudget:
         self, scope: RunScope, reservation: UsageReservation, *, lease: RunLease
     ) -> BudgetReceipt:
         reservation = UsageReservation.model_validate(reservation)
-        replayed, seconds = await self._reserve(scope, reservation, session_lease(lease))
+        try:
+            replayed, seconds = await self._reserve(scope, reservation, session_lease(lease))
+        except SessionError as error:
+            if str(error) != "BUDGET_EXHAUSTED":
+                raise
+            raise LedgerBudgetExhausted("BUDGET_EXHAUSTED") from None
         return BudgetReceipt(
             scope=scope,
             lease=lease,

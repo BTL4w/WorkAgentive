@@ -6,6 +6,7 @@ import subprocess
 import sys
 from typing import Any
 
+from .orchestrator_tool_loop import evaluate_tool_loop
 from .phase5_cases import load_cases
 from .phase5_reporting import MockReportingEvaluationGateway, run_reporting_suite
 from .progressive_planning import evaluate_default_suite
@@ -20,7 +21,11 @@ LEGACY_SUITES = (
 
 
 def evaluate_core_gate(suites: dict[str, bool]) -> bool:
-    required = set(LEGACY_SUITES) | {"phase5_reporting", "progressive_planning"}
+    required = set(LEGACY_SUITES) | {
+        "phase5_reporting",
+        "progressive_planning",
+        "orchestrator_tool_loop",
+    }
     return required.issubset(suites) and all(suites[name] for name in required)
 
 
@@ -46,6 +51,9 @@ def main() -> int:
     progressive = asyncio.run(evaluate_default_suite())
     reports["progressive_planning"] = progressive.model_dump(mode="json")
     gates["progressive_planning"] = progressive.passed
+    candidate = asyncio.run(evaluate_tool_loop())
+    reports["orchestrator_tool_loop"] = candidate.model_dump(mode="json")
+    gates["orchestrator_tool_loop"] = candidate.passed
     passed = evaluate_core_gate(gates)
     print(
         json.dumps(

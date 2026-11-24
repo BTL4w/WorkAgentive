@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.modules.assistant.api.schemas import PostAssistantMessageRequest
+from app.modules.assistant.domain.session import SessionError
 from app.modules.identity.domain.auth import AuthenticatedActor
 from app.modules.organization.domain.roles import MembershipRole
 
@@ -68,6 +69,16 @@ def test_admission_keeps_routes_and_is_scoped_to_pilot_membership(
     )
     assert rollback.select(actor, verified_action=False, continuation_source=None) is None
     assert rollback.resolve_saved(pin) == pin
+    for pin_name, pins in (
+        ("tool_versions", pin.tool_versions),
+        ("skill_bundle_fingerprints", pin.skill_bundle_fingerprints),
+        ("specialist_versions", pin.specialist_versions),
+    ):
+        with pytest.raises(SessionError, match="DRIVER_PIN_MISMATCH"):
+            rollback.resolve_saved(pin.model_copy(update={pin_name: pins[1:]}))
+        changed = pins[0].model_copy(update={"fingerprint": "changed-with-the-same-version"})
+        with pytest.raises(SessionError, match="DRIVER_PIN_MISMATCH"):
+            rollback.resolve_saved(pin.model_copy(update={pin_name: (changed, *pins[1:])}))
 
 
 @pytest.mark.parametrize("field", ["driver_pin", "orchestrator_driver", "organization_id"])
