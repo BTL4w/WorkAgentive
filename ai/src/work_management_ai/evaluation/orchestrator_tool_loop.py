@@ -90,8 +90,10 @@ _PROMPTS: tuple[tuple[Scenario, str, str], ...] = (
     ("ambiguity", "Cho tôi biết tổng quan dự án Sao Mai", "Give me an overview of Project Sao Mai"),
     (
         "workload",
-        "Kiểm tra tải tuần này và đề xuất điều chỉnh nếu quá tải",
-        "Check this week's workload and suggest an adjustment if there is an overload",
+        "Kiểm tra tải tuần này của dự án đã chọn. Nếu quá tải, hãy tạo một đề xuất "
+        "điều chỉnh kế hoạch dự án để quản lý duyệt.",
+        "Check this week's workload for the selected project. If it is overloaded, "
+        "prepare a project plan change proposal for manager review.",
     ),
     ("waits", "Chuẩn bị kế hoạch để quản lý xem xét", "Prepare a plan for manager review"),
     ("revoked", "Đề xuất sửa kế hoạch dự án", "Propose a change to the project plan"),
@@ -160,7 +162,7 @@ class ToolLoopEvaluationReport(BaseModel):
     skill_pin: VersionPin
     skill_descriptor_sha256: str
     skill_body_sha256: str
-    case_set_version: Literal["1.0"] = "1.0"
+    case_set_version: Literal["1.1"] = "1.1"
     case_set_sha256: str
     legacy_authored_cases: int
     legacy_corpus_sha256: str
@@ -429,7 +431,9 @@ class Trial:
             case "workload":
                 if not observed:
                     return _delegate(
-                        AgentId.ASSIGNMENT, "Kiểm tra tải" if vi else "Check workload", []
+                        AgentId.ASSIGNMENT,
+                        "Kiểm tra tải" if vi else "Check workload",
+                        [str(self.ref_id)],
                     )
                 workload = next((item for item in observed if item.call_id == "assignment"), None)
                 if workload is None:
@@ -486,7 +490,7 @@ class Trial:
             checkpoint=None,
             lease=lease,
             verified_context_refs=(self.ref(scope),)
-            if self.case.scenario == "fresh-context"
+            if self.case.scenario in {"fresh-context", "workload"}
             else (),
         )
         elapsed = (perf_counter() - started) * 1000

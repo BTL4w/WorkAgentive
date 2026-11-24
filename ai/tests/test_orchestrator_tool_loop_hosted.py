@@ -4,11 +4,15 @@ import asyncio
 import json
 import os
 from dataclasses import replace
+from pathlib import Path
 from time import perf_counter
-from typing import Literal
+from typing import Literal, cast
 from uuid import uuid4
 
 import pytest
+from dotenv import dotenv_values
+from langchain_core.language_models import LanguageModelInput
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr
 
 from work_management_ai.agents.orchestrator.contracts import OrchestratorStatus
@@ -164,26 +168,128 @@ async def test_synthetic_unique_overview_fixture_runs_through_tool_pipeline() ->
     gateway.assert_complete()
 
 
+@pytest.mark.parametrize(
+    ("configured_model", "expected"),
+    [("gpt-5-mini", "openai/gpt-5-mini"), ("openai/gpt-5-mini", "openai/gpt-5-mini")],
+)
+def test_openrouter_settings_use_configured_model_and_routing_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, configured_model: str, expected: str
+) -> None:
+    for name in (*_OPENAI_OVERRIDE_VARS, *_TRACING_VARS):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("APP_AI_MODEL", configured_model)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "fixture-openrouter-key")
+    monkeypatch.delenv("APP_OPENAI_API_KEY", raising=False)
+    model, key = _openrouter_settings(tmp_path / ".env")
+    assert model == expected
+    assert key == SecretStr("fixture-openrouter-key")
+    chat = _create_openrouter_chat_model(
+        model_name=model,
+        api_key=key,
+        timeout_seconds=5,
+        max_output_tokens=500,
+        use_responses_api=False,
+    )
+    assert isinstance(chat, ChatOpenAI)
+    assert chat.openai_api_base == "https://openrouter.ai/api/v1"
+    assert chat.model_name == expected
+    assert chat.extra_body == {"provider": {"require_parameters": True}}
+    payload = chat._get_request_payload(  # pyright: ignore[reportPrivateUsage]
+        "fixture", parallel_tool_calls=False
+    )
+    assert payload["max_tokens"] == 500
+    assert "max_completion_tokens" not in payload
+    assert "parallel_tool_calls" not in payload
+
+
+def test_openrouter_settings_loads_local_alias_without_exporting_secrets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    for name in (
+        "APP_AI_MODEL",
+        "OPENROUTER_API_KEY",
+        "OPEN_ROUTER_API",
+        *_OPENAI_OVERRIDE_VARS,
+        *_TRACING_VARS,
+    ):
+        monkeypatch.delenv(name, raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text('APP_AI_MODEL="gpt-5-mini"\nOPEN_ROUTER_API="fixture-local-key"\n')
+    assert _openrouter_settings(env_file) == ("openai/gpt-5-mini", SecretStr("fixture-local-key"))
+    assert "OPEN_ROUTER_API" not in os.environ
+    assert "OPENROUTER_API_KEY" not in os.environ
+
+
+_OPENAI_OVERRIDE_VARS = ("OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENAI_PROXY")
+_TRACING_VARS = (
+    "APP_LANGSMITH_TRACING",
+    "LANGSMITH_TRACING",
+    "LANGSMITH_TRACING_V2",
+    "LANGCHAIN_TRACING",
+    "LANGCHAIN_TRACING_V2",
+)
+
+
+def _openrouter_settings(env_file: Path) -> tuple[str, SecretStr]:
+    local = dotenv_values(env_file, interpolate=False) if env_file.is_file() else {}
+    model = os.getenv("APP_AI_MODEL", "").strip() or (local.get("APP_AI_MODEL") or "").strip()
+    credential = (
+        os.getenv("OPENROUTER_API_KEY", "").strip()
+        or os.getenv("OPEN_ROUTER_API", "").strip()
+        or (local.get("OPENROUTER_API_KEY") or "").strip()
+        or (local.get("OPEN_ROUTER_API") or "").strip()
+    )
+    if not model or not credential:
+        pytest.fail("Set APP_AI_MODEL and either OPENROUTER_API_KEY or OPEN_ROUTER_API.")
+    if any(os.getenv(name) for name in _OPENAI_OVERRIDE_VARS):
+        pytest.fail("Pilot uses the official OpenRouter endpoint without OpenAI overrides.")
+    if any(os.getenv(name, "").casefold() in ("1", "true", "yes", "on") for name in _TRACING_VARS):
+        pytest.fail("Pilot requires automatic tracing to be disabled.")
+    return model if "/" in model else f"openai/{model}", SecretStr(credential)
+
+
+class _OpenRouterChatOpenAI(ChatOpenAI):
+    def _get_request_payload(
+        self,
+        input_: LanguageModelInput,
+        *,
+        stop: list[str] | None = None,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        payload = cast(
+            dict[str, object],
+            super()._get_request_payload(input_, stop=stop, **kwargs),  # pyright: ignore[reportUnknownMemberType]
+        )
+        # OpenRouter's request filter expects max_tokens. The native gateway still
+        # validates that the model returns at most one tool call per step.
+        payload["max_tokens"] = payload.pop("max_completion_tokens")
+        payload.pop("parallel_tool_calls", None)
+        return payload
+
+
+def _create_openrouter_chat_model(
+    *,
+    model_name: str,
+    api_key: SecretStr,
+    timeout_seconds: float,
+    max_output_tokens: int,
+    use_responses_api: bool,
+) -> _OpenRouterChatOpenAI:
+    return _OpenRouterChatOpenAI(
+        model=model_name,
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        timeout=timeout_seconds,
+        max_retries=0,
+        max_completion_tokens=max_output_tokens,
+        use_responses_api=use_responses_api,
+        extra_body={"provider": {"require_parameters": True}},
+    )
+
+
 @pytest.fixture(scope="module")
 def hosted_settings() -> tuple[str, SecretStr]:
-    model = os.getenv("APP_AI_MODEL", "").strip()
-    credential = os.getenv("APP_OPENAI_API_KEY", "").strip()
-    if not model or not credential or os.getenv("APP_AI_PROVIDER") != "openai":
-        pytest.fail("Pilot requires configured OpenAI provider, main model and credential.")
-    if any(os.getenv(name) for name in ("OPENAI_API_BASE", "OPENAI_BASE_URL", "OPENAI_PROXY")):
-        pytest.fail("Pilot requires the default OpenAI endpoint and no OpenAI proxy override.")
-    if any(
-        os.getenv(name, "").casefold() in ("1", "true", "yes", "on")
-        for name in (
-            "APP_LANGSMITH_TRACING",
-            "LANGSMITH_TRACING",
-            "LANGSMITH_TRACING_V2",
-            "LANGCHAIN_TRACING",
-            "LANGCHAIN_TRACING_V2",
-        )
-    ):
-        pytest.fail("Pilot requires automatic tracing to be disabled.")
-    return model, SecretStr(credential)
+    return _openrouter_settings(Path(__file__).resolve().parents[2] / ".env")
 
 
 @pytest.mark.asyncio
@@ -198,7 +304,13 @@ async def test_hosted_native_tool_loop(
     locale: Locale, probe: Probe, hosted_settings: tuple[str, SecretStr]
 ) -> None:
     model, credential = hosted_settings
-    gateway = BoundedNativeGateway(OpenAINativeToolGateway(model_name=model, api_key=credential))
+    gateway = BoundedNativeGateway(
+        OpenAINativeToolGateway(
+            model_name=model,
+            api_key=credential,
+            chat_model_factory=_create_openrouter_chat_model,
+        )
+    )
     case = _case(locale, probe)
     trial = Trial(case, probe if probe in ("ambiguous", "32h", "48h") else "default")
     specialist_manifests = tuple(
@@ -228,7 +340,13 @@ async def test_hosted_native_tool_loop(
     orch.gateway = gateway
     started = perf_counter()
     async with asyncio.timeout(180):
-        result = await orch.run_segment(value, scope=scope, checkpoint=None, lease=lease)
+        result = await orch.run_segment(
+            value,
+            scope=scope,
+            checkpoint=None,
+            lease=lease,
+            verified_context_refs=(trial.ref(scope),) if probe in {"32h", "48h"} else (),
+        )
     called = tuple(
         event.invocation.tool_reference
         for event in log.records
@@ -242,6 +360,7 @@ async def test_hosted_native_tool_loop(
     record = {
         "probe": probe,
         "locale": locale,
+        "provider": "openrouter",
         "model": model,
         "latency_ms": round((perf_counter() - started) * 1000, 3),
         "input_tokens": [entry.input_tokens if entry else None for entry in gateway.responses],
@@ -292,7 +411,9 @@ async def test_hosted_native_tool_loop(
         assert result.wait_ref is not None and result.wait_ref.kind == "HUMAN_DECISION"
         assert result.wait_ref.resource_id == trial.expected_resource_id
     if probe == "skill-overview":
-        assert resources.bodies_read == 1
+        # Loading and verifying the same pinned artifact can both read the body.
+        # The pilot measures the model's tool calls, not package I/O.
+        assert called.count("load_skill@1") == 1
         assert called.count("explore_projects@1") == 1 and "read_project_context@1" not in called
     if probe in {"greeting", "32h", "skill-overview"}:
         assert result.output.status is OrchestratorStatus.COMPLETED
