@@ -8,7 +8,7 @@ import sys
 from collections.abc import AsyncGenerator, Sequence
 from datetime import UTC, datetime
 from typing import NoReturn, Protocol
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from langsmith import tracing_context  # pyright: ignore[reportUnknownVariableType]
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -153,6 +153,7 @@ async def process_tenant_once(
     planning_job_service: _PlanningRunner,
     projection_service: _ProjectionRunner | None = None,
     title_job_service: _AssistantRunner | None = None,
+    continuation_job_service: _AssistantRunner | None = None,
     risk_job_service: _AssistantRunner | None = None,
     summary_job_service: _AssistantRunner | None = None,
     reporting_job_service: _AssistantRunner | None = None,
@@ -212,6 +213,16 @@ async def process_tenant_once(
                 "Error projecting linked Planning workflows for organization %s",
                 organization_id,
             )
+    if continuation_job_service is not None:
+        try:
+            processed = (
+                await continuation_job_service.run_once(
+                    worker_id=worker_id, organization_id=organization_id
+                )
+                or processed
+            )
+        except Exception:
+            logger.exception("Error continuing Assistant work for organization %s", organization_id)
     if risk_job_service is not None:
         try:
             processed = (
@@ -356,9 +367,8 @@ async def _run_worker_with_tracing(
     assistant_transaction_factory = PostgreSQLAssistantTransactionFactory(
         session_factory, wakeup=redis_runtime.wakeup
     )
-    actor_resolver = CurrentActorResolver(
-        CurrentActorService(SqlAlchemyAuthTransactionFactory(session_factory))
-    )
+    current_actor = CurrentActorService(SqlAlchemyAuthTransactionFactory(session_factory))
+    actor_resolver = CurrentActorResolver(current_actor)
 
     scopes = set(organization_ids)
 
@@ -538,14 +548,15 @@ async def _run_worker_with_tracing(
     from app.modules.assistant.adapters.risk_tools import RiskBlockProjector, RiskToolAdapter
     from app.modules.risk.application.read_service import RiskReadService
 
+    risk_backend = RiskToolAdapter(
+        actors=actor_resolver,
+        tasks=task_service,
+        reads=RiskReadService(RiskTransactions(session_factory, settings.reporting_timezone)),
+    )
     risk_tools = RecordingToolExecutor(
         transaction_factory=assistant_transaction_factory,
         tool_registry=tool_registry,
-        backend=RiskToolAdapter(
-            actors=actor_resolver,
-            tasks=task_service,
-            reads=RiskReadService(RiskTransactions(session_factory, settings.reporting_timezone)),
-        ),
+        backend=risk_backend,
     )
     from app.modules.assistant.adapters.report_projection import ReportStatusContexts
     from app.modules.assistant.adapters.reporting_tools import (
@@ -621,15 +632,148 @@ async def _run_worker_with_tracing(
             projects=project_service,
         ),
     )
+    from app.modules.assistant.adapters.candidate_specialists import CandidateSpecialists
+    from app.modules.assistant.adapters.tool_loop_runtime import (
+        DriverAdmission,
+        ToolLoopTurnExecutor,
+        build_candidate_artifacts,
+        build_native_gateway,
+        register_candidate_specialists,
+    )
+    from app.modules.identity.domain.auth import AuthenticatedActor
+    from app.modules.progress.domain.blockers import BlockerError
+    from work_management_ai.runtime.activation import capability_enabled
+    from work_management_ai.runtime.contracts import ContextReference
+
+    candidate = build_candidate_artifacts()
+    register_candidate_specialists(
+        registry, retrieval_enabled=capability_enabled("retrieval.search_web", retrieval_activation)
+    )
+    from app.modules.assistant.domain.models import AssistantTurn
+    from app.modules.progress.domain.daily_updates import DailyUpdateError
+    from work_management_ai.runtime.tool_loop_contracts import RunScope
+
+    assignment_contexts = AssistantAssignmentContextResolver(
+        tasks=task_service,
+        members=member_service,
+        projects=project_service,
+    )
+    daily_contexts = DailyUpdateContextResolver(tasks=task_service, updates=daily_updates)
+    goal_backends = CandidateSpecialists(
+        sessions=session_factory,
+        registry=registry,
+        tools=candidate.tools,
+        actors=actor_resolver,
+        gateway=model_gateway,
+        work=work_tool_executor,
+        planning=planning_tool_executor,
+        assignment=assignment_tool_executor,
+        assignment_contexts=assignment_contexts,
+        daily_update=daily_tools,
+        risk=risk_backend,
+        recorded_risk=risk_tools,
+        reporting=chat_tools,
+        automation=automation_tools,
+        retrieval=retrieval_runtime,
+        activation=retrieval_activation,
+        timezone=settings.reporting_timezone,
+    )
+
+    async def verify_candidate_ref(actor: AuthenticatedActor, ref: ContextReference) -> bool:
+        if ref.resource_type == "RISK_CONTEXT" and ref.fingerprint is not None:
+            try:
+                current = await risk_backend.reads.read(actor, ref.resource_id, ref.fingerprint)
+            except BlockerError:
+                return False
+            return current.task_version == ref.version
+        if ref.resource_type == "DAILY_UPDATE_DRAFT":
+            try:
+                draft = await daily_updates.get_draft(actor, ref.resource_id)
+            except DailyUpdateError:
+                return False
+            return draft.version == ref.version and draft.confirmed_update_id is None
+        if ref.resource_type == "MEMBERSHIP" and actor.role.value in {"MANAGER", "ADMIN"}:
+            return (
+                await actor_resolver.resolve(
+                    organization_id=actor.organization_id,
+                    membership_id=ref.resource_id,
+                )
+                is not None
+            )
+        return await work_tool_backend.verify_reference(actor, ref)
+
+    async def candidate_context(
+        actor: AuthenticatedActor,
+        turn: AssistantTurn,
+        scope: RunScope,
+    ) -> tuple[ContextReference, ...]:
+        values: dict[tuple[str, UUID], int | None] = {}
+        assignment = await assignment_contexts.resolve_assignment(
+            actor=actor,
+            message=turn.objective,
+            require_complete=True,
+        )
+        if assignment.exact_context is not None:
+            exact = assignment.exact_context
+            values["TASK", exact.task_id] = exact.task_version
+            values["MEMBERSHIP", exact.membership_id] = None
+        if assignment.team_context is not None:
+            project = await project_service.get_project(
+                actor=actor,
+                project_id=assignment.team_context.project_id,
+            )
+            values["PROJECT", project.id] = project.version
+        update, _ = await daily_contexts.resolve(
+            actor=actor, message=turn.objective, locale=turn.locale
+        )
+        if update is not None:
+            values["TASK", update.task_id] = update.task_version
+            if update.draft_id is not None and update.draft_version is not None:
+                values["DAILY_UPDATE_DRAFT", update.draft_id] = update.draft_version
+        return tuple(
+            ContextReference(
+                reference_id=uuid5(scope.orchestration_run_id, f"active:{kind}:{identifier}"),
+                organization_id=actor.organization_id,
+                resource_type=kind,
+                resource_id=identifier,
+                version=version,
+                observed_at=turn.created_at,
+            )
+            for (kind, identifier), version in values.items()
+        )
+
+    candidate_executor = ToolLoopTurnExecutor(
+        sessions=session_factory,
+        transactions=assistant_transaction_factory,
+        actors=current_actor,
+        admission=DriverAdmission(settings, candidate),
+        artifacts=candidate,
+        gateway=build_native_gateway(settings),
+        legacy=AssistantAgentRuntime(turn_executor),
+        specialist_registry=registry,
+        backend_factory=goal_backends.build,
+        activation=retrieval_activation,
+        lease_seconds=settings.worker_lease_seconds,
+        reference_check=verify_candidate_ref,
+        active_context_seed=candidate_context,
+        block_projector=retrieval_projector,
+    )
     assistant_execution_service = AssistantExecutionService(
         actor_resolver=actor_resolver,
-        runtime=AssistantAgentRuntime(turn_executor),
+        runtime=candidate_executor,
     )
     assistant_job_service = AssistantJobService(
         transaction_factory=assistant_transaction_factory,
         handler=assistant_execution_service.execute,
         organization_scopes=scopes,
         lease_seconds=settings.worker_lease_seconds,
+    )
+    continuation_job_service = AssistantJobService(
+        transaction_factory=assistant_transaction_factory,
+        handler=assistant_execution_service.execute,
+        organization_scopes=scopes,
+        lease_seconds=settings.worker_lease_seconds,
+        job_type="assistant.turn.resume",
     )
     title_execution_service = AssistantExecutionService(
         actor_resolver=actor_resolver,
@@ -687,6 +831,7 @@ async def _run_worker_with_tracing(
                     planning_job_service=planning_job_service,
                     projection_service=projection_service,
                     title_job_service=title_job_service,
+                    continuation_job_service=continuation_job_service,
                     risk_job_service=risk_job_service,
                     summary_job_service=summary_scheduler,
                     reporting_job_service=reporting_job_service,

@@ -6,13 +6,19 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.modules.assistant.adapters.context_tools import revalidate_refs
 from app.modules.assistant.adapters.continuation_models import OrchestrationWaitModel
 from app.modules.assistant.adapters.session_repository import PostgreSQLSessionRepository
 from app.modules.assistant.adapters.tool_loop_recorder import session_scope
 from app.modules.assistant.adapters.transaction import PostgreSQLAssistantTransactionFactory
+from app.modules.assistant.application.context_service import ContextReadError, ContextReadService
 from app.modules.assistant.domain.session import SessionError
+from app.modules.identity.application.current_actor_service import CurrentActorService
 from app.modules.identity.domain.auth import AuthenticatedActor
-from work_management_ai.runtime.context_exploration import ContextUseAccessPort
+from work_management_ai.runtime.context_exploration import (
+    ContextAccessDecision,
+    ContextUseAccessPort,
+)
 from work_management_ai.runtime.continuation import ResolvedContextBinding
 from work_management_ai.runtime.session_history import ToolResultPayload
 from work_management_ai.runtime.tool_loop_contracts import (
@@ -20,6 +26,7 @@ from work_management_ai.runtime.tool_loop_contracts import (
     ToolLoopCheckpoint,
     WaitReference,
 )
+from work_management_ai.runtime.tool_pipeline import ToolPolicyError
 from work_management_ai.tools.context.contracts import ContextReadObservation, ContextRef
 
 
@@ -173,3 +180,41 @@ class PostgreSQLUserClarifications:
                 )
             )
             return ResolvedContextBinding.model_validate(stored) if stored is not None else None
+
+
+class ApplicationClarificationAccess:
+    def __init__(self, contexts: ContextReadService, actors: CurrentActorService) -> None:
+        self.contexts, self.actors = contexts, actors
+
+    async def check(
+        self,
+        scope: RunScope,
+        *,
+        target_tool: str,
+        input_fingerprint: str,
+        refs: tuple[ContextRef, ...],
+    ) -> ContextAccessDecision:
+        current = await self.actors.resolve(
+            organization_id=scope.organization_id,
+            membership_id=scope.membership_id,
+        )
+        if current is None:
+            return ContextAccessDecision(
+                outcome="DENIED",
+                actor_revision="unavailable",
+                policy_revision="unavailable",
+            )
+        revision = f"candidate-v2:{current.role.value}"
+        try:
+            await revalidate_refs(service=self.contexts, actor=current, scope=scope, refs=refs)
+        except (ContextReadError, ToolPolicyError):
+            return ContextAccessDecision(
+                outcome="REFRESH_REQUIRED",
+                actor_revision=revision,
+                policy_revision=revision,
+            )
+        return ContextAccessDecision(
+            outcome="ACCEPTED",
+            actor_revision=revision,
+            policy_revision=revision,
+        )

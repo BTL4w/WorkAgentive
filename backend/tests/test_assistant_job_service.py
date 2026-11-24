@@ -16,6 +16,9 @@ class Repo:
     async def claim_job(self, **kwargs):
         return self.job
 
+    async def assert_job_claim(self, *, job: AssistantJob) -> None:
+        assert job == self.job
+
     async def complete_job(self, **kwargs):
         self.completed = True
 

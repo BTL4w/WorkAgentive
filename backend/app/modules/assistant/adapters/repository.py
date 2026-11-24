@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import case, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.assistant.adapters.continuation_models import OrchestrationWaitModel
 from app.modules.assistant.adapters.database_models import (
     AgentCheckpointModel,
     AgentHandoffModel,
@@ -22,6 +23,7 @@ from app.modules.assistant.adapters.database_models import (
     OrchestrationRunModel,
     ToolInvocationModel,
 )
+from app.modules.assistant.application.driver_admission import ContinuationAdmission
 from app.modules.assistant.application.ports import (
     AssistantConversationMutationResult,
     AssistantConversationSnapshot,
@@ -62,6 +64,7 @@ from app.modules.planning_runs.domain.models import WorkflowEvent
 from app.modules.work.adapters.database_models import IdempotencyRecordModel, IdempotencyState
 from app.modules.work.planning.assignment.adapters.database_models import TeamRequirementSetModel
 from work_management_ai.agents.orchestrator.contracts import PendingFollowup
+from work_management_ai.runtime.context_exploration import ContextUseAccessPort
 
 _IDEMPOTENCY_TTL = timedelta(hours=24)
 
@@ -624,6 +627,72 @@ class PostgreSQLAssistantRepository:
         await self._session.flush()
         return AssistantConversationMutationResult(conversation, False)
 
+    async def has_legacy_followup(
+        self, *, actor: AuthenticatedActor, conversation_id: UUID
+    ) -> bool:
+        run, turn, conversation = (
+            OrchestrationRunModel,
+            AssistantTurnModel,
+            AssistantConversationModel,
+        )
+        return (
+            await self._session.scalar(
+                select(run.id)
+                .join(
+                    turn, (turn.organization_id == run.organization_id) & (turn.id == run.turn_id)
+                )
+                .join(
+                    conversation,
+                    (conversation.organization_id == turn.organization_id)
+                    & (conversation.id == turn.conversation_id),
+                )
+                .where(
+                    run.organization_id == actor.organization_id,
+                    run.actor_membership_id == actor.membership_id,
+                    conversation.id == conversation_id,
+                    conversation.owner_membership_id == actor.membership_id,
+                    ~run.execution_plan.has_key("driver_pin"),
+                    run.status.in_(("AWAITING_INPUT", "AWAITING_HUMAN")),
+                    live_payload(run, "orchestration_runs"),
+                )
+                .limit(1)
+            )
+            is not None
+        )
+
+    async def select_user_followup(
+        self,
+        *,
+        actor: AuthenticatedActor,
+        conversation_id: UUID,
+        turn_id: UUID,
+        text: str,
+        context_access: ContextUseAccessPort,
+    ) -> ContinuationAdmission | None:
+        from app.modules.assistant.adapters.session_continuations import PostgreSQLContinuations
+
+        return await PostgreSQLContinuations(
+            self._session,
+            context_access=context_access,
+        ).select_followup(actor, conversation_id=conversation_id, turn_id=turn_id, text=text)
+
+    async def transfer_user_followup(
+        self,
+        *,
+        actor: AuthenticatedActor,
+        source: ContinuationAdmission,
+        target_run_id: UUID,
+        context_access: ContextUseAccessPort,
+    ) -> None:
+        from app.modules.assistant.adapters.session_continuations import PostgreSQLContinuations
+
+        await PostgreSQLContinuations(self._session, context_access=context_access).transfer(
+            actor,
+            wait_id=source.wait_id,
+            expected_version=source.expected_version,
+            target_run_id=target_run_id,
+        )
+
     async def submit_message_mutation(
         self,
         *,
@@ -895,6 +964,50 @@ class PostgreSQLAssistantRepository:
             replayed=replayed,
         )
 
+    async def get_job_run_and_turn(
+        self,
+        *,
+        actor: AuthenticatedActor,
+        job: AssistantJob,
+    ) -> tuple[OrchestrationRun, AssistantTurn] | None:
+        run, turn, conversation = (
+            OrchestrationRunModel,
+            AssistantTurnModel,
+            AssistantConversationModel,
+        )
+        pair = (
+            (
+                await self._session.execute(
+                    select(run, turn)
+                    .join(
+                        turn,
+                        (turn.organization_id == run.organization_id) & (turn.id == run.turn_id),
+                    )
+                    .join(
+                        conversation,
+                        (conversation.organization_id == turn.organization_id)
+                        & (conversation.id == turn.conversation_id),
+                    )
+                    .where(
+                        run.organization_id == actor.organization_id,
+                        run.id == job.orchestration_run_id,
+                        run.actor_membership_id == actor.membership_id,
+                        turn.id == job.turn_id,
+                        turn.actor_membership_id == actor.membership_id,
+                        conversation.id == job.conversation_id,
+                        conversation.owner_membership_id == actor.membership_id,
+                        conversation.status == ConversationStatus.ACTIVE.value,
+                        active_actor_scope(actor),
+                        live_payload(turn, "assistant_turns"),
+                        live_payload(run, "orchestration_runs"),
+                    )
+                )
+            )
+            .tuples()
+            .one_or_none()
+        )
+        return (orchestration_domain(pair[0]), _turn(pair[1])) if pair is not None else None
+
     async def get_conversation_snapshot(
         self, *, actor: AuthenticatedActor, conversation_id: UUID
     ) -> AssistantConversationSnapshot | None:
@@ -1112,7 +1225,14 @@ class PostgreSQLAssistantRepository:
         if model is None:
             raise AssistantDomainLookupError("ORCHESTRATION_RUN_NOT_FOUND")
         current = orchestration_domain(model)
-        if current.status is not OrchestrationRunStatus.QUEUED:
+        if current.status is not OrchestrationRunStatus.QUEUED and (
+            job.job_type != "assistant.turn.resume"
+            or current.status
+            not in {
+                OrchestrationRunStatus.AWAITING_INPUT,
+                OrchestrationRunStatus.AWAITING_HUMAN,
+            }
+        ):
             return current
         run = current.mark_running()
         model.status = run.status.value
@@ -1123,7 +1243,7 @@ class PostgreSQLAssistantRepository:
             .where(
                 AssistantTurnModel.organization_id == job.organization_id,
                 AssistantTurnModel.id == job.turn_id,
-                AssistantTurnModel.status == AssistantTurnStatus.QUEUED.value,
+                AssistantTurnModel.status == current.status.value,
             )
             .values(status=AssistantTurnStatus.RUNNING.value, updated_at=run.updated_at)
         )
@@ -1169,6 +1289,32 @@ class PostgreSQLAssistantRepository:
         )
         if run_result.rowcount != 1 or turn_result.rowcount != 1:  # type: ignore[attr-defined]
             raise AssistantDomainLookupError("ORCHESTRATION_FINALIZE_CONFLICT")
+
+    async def close_job_wait(self, *, job: AssistantJob) -> None:
+        wait = OrchestrationWaitModel
+        ownership = (
+            wait.wake_job_id == job.id
+            if job.job_type == "assistant.turn.resume"
+            else (
+                (wait.kind == "USER_INPUT")
+                & (wait.source_run_id != wait.owner_run_id)
+                & wait.context_binding.is_not(None)
+                & wait.wake_job_id.is_(None)
+            )
+        )
+        await self._session.execute(
+            update(wait)
+            .where(
+                wait.organization_id == job.organization_id,
+                wait.conversation_id == job.conversation_id,
+                wait.owner_run_id == job.orchestration_run_id,
+                wait.owner_turn_id == job.turn_id,
+                wait.membership_id == job.requester_membership_id,
+                wait.closed.is_(False),
+                ownership,
+            )
+            .values(closed=True)
+        )
 
     async def append_agent_run(self, *, run: AgentRun) -> AgentRun:
         self._session.add(
@@ -2139,19 +2285,39 @@ class PostgreSQLAssistantRepository:
         model.lease_until = None
         now = datetime.now(UTC)
         model.updated_at = now
-        if terminal and model.job_type == "assistant.turn.execute":
+        resume = model.job_type == "assistant.turn.resume"
+        if terminal and (resume or model.job_type == "assistant.turn.execute"):
             job = _job(model)
+            before_terminal = ("QUEUED", "RUNNING")
+            if resume:
+                before_terminal += ("AWAITING_INPUT", "AWAITING_HUMAN")
+                from app.modules.assistant.adapters.session_continuations import (
+                    PostgreSQLContinuations,
+                )
+
+                continuations = PostgreSQLContinuations(self._session)
+                async with continuations.as_owner(
+                    job.organization_id, job.requester_membership_id
+                ) as actor:
+                    if actor is not None:
+                        await self.close_job_wait(job=job)
+                run_status = await self._session.scalar(
+                    select(OrchestrationRunModel.status)
+                    .where(
+                        OrchestrationRunModel.organization_id == job.organization_id,
+                        OrchestrationRunModel.id == job.orchestration_run_id,
+                    )
+                    .with_for_update()
+                )
+                if run_status not in before_terminal:
+                    await self._session.flush()
+                    return
             await self._session.execute(
                 update(AssistantTurnModel)
                 .where(
                     AssistantTurnModel.organization_id == model.organization_id,
                     AssistantTurnModel.id == model.turn_id,
-                    AssistantTurnModel.status.in_(
-                        (
-                            AssistantTurnStatus.QUEUED.value,
-                            AssistantTurnStatus.RUNNING.value,
-                        )
-                    ),
+                    AssistantTurnModel.status.in_(before_terminal),
                 )
                 .values(
                     status=AssistantTurnStatus.FAILED.value,
@@ -2164,12 +2330,7 @@ class PostgreSQLAssistantRepository:
                 .where(
                     OrchestrationRunModel.organization_id == model.organization_id,
                     OrchestrationRunModel.id == model.orchestration_run_id,
-                    OrchestrationRunModel.status.in_(
-                        (
-                            OrchestrationRunStatus.QUEUED.value,
-                            OrchestrationRunStatus.RUNNING.value,
-                        )
-                    ),
+                    OrchestrationRunModel.status.in_(before_terminal),
                 )
                 .values(
                     status=OrchestrationRunStatus.FAILED.value,
@@ -2184,9 +2345,7 @@ class PostgreSQLAssistantRepository:
                 .where(
                     AgentRunModel.organization_id == model.organization_id,
                     AgentRunModel.orchestration_run_id == model.orchestration_run_id,
-                    AgentRunModel.status.in_(
-                        (AgentRunStatus.QUEUED.value, AgentRunStatus.RUNNING.value)
-                    ),
+                    AgentRunModel.status.in_(before_terminal),
                 )
                 .values(
                     status=AgentRunStatus.FAILED.value,

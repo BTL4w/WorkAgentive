@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any, Literal, Protocol
 from uuid import UUID
 
+from app.modules.assistant.application.driver_admission import ContinuationAdmission
 from app.modules.assistant.domain.models import (
     AgentCheckpoint,
     AgentHandoffRecord,
@@ -21,6 +22,7 @@ from app.modules.assistant.domain.models import (
 from app.modules.identity.domain.auth import AuthenticatedActor
 from app.modules.optimization.application.admission import NewWorkGuard
 from app.modules.planning_runs.domain.models import WorkflowEvent
+from work_management_ai.runtime.context_exploration import ContextUseAccessPort
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +100,29 @@ class AssistantRepository(Protocol):
         request_fingerprint: str,
     ) -> AssistantConversationMutationResult: ...
 
+    async def has_legacy_followup(
+        self, *, actor: AuthenticatedActor, conversation_id: UUID
+    ) -> bool: ...
+
+    async def select_user_followup(
+        self,
+        *,
+        actor: AuthenticatedActor,
+        conversation_id: UUID,
+        turn_id: UUID,
+        text: str,
+        context_access: ContextUseAccessPort,
+    ) -> ContinuationAdmission | None: ...
+
+    async def transfer_user_followup(
+        self,
+        *,
+        actor: AuthenticatedActor,
+        source: ContinuationAdmission,
+        target_run_id: UUID,
+        context_access: ContextUseAccessPort,
+    ) -> None: ...
+
     async def submit_message_mutation(
         self,
         *,
@@ -112,6 +137,10 @@ class AssistantRepository(Protocol):
         request_fingerprint: str,
         before_new_work: NewWorkGuard | None = None,
     ) -> AssistantTurnMutationResult: ...
+
+    async def get_job_run_and_turn(
+        self, *, actor: AuthenticatedActor, job: AssistantJob
+    ) -> tuple[OrchestrationRun, AssistantTurn] | None: ...
 
     async def get_conversation_snapshot(
         self, *, actor: AuthenticatedActor, conversation_id: UUID
@@ -147,6 +176,8 @@ class AssistantRepository(Protocol):
     ) -> AssistantJob | None: ...
 
     async def begin_orchestration(self, *, job: AssistantJob) -> OrchestrationRun: ...
+
+    async def close_job_wait(self, *, job: AssistantJob) -> None: ...
 
     async def finish_orchestration(
         self,

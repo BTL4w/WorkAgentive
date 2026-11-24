@@ -32,3 +32,9 @@ class TransferReceipt:
 class WakeDecision:
     outcome: Literal["IGNORED", "QUEUED", "DUPLICATE"]
     job_id: UUID | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WakeReceipt:
+    wait: WaitRecord
+    outcome: str

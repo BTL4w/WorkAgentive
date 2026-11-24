@@ -15,11 +15,12 @@ from app.modules.assistant.domain.models import (
 from app.modules.assistant.domain.models import AgentRunStatus as DomainAgentRunStatus
 from app.modules.identity.domain.auth import AuthenticatedActor
 from work_management_ai.agents.orchestrator.contracts import OrchestratorOutput
+from work_management_ai.agents.orchestrator.tool_loop_contracts import OrchestratorOutputV2
 from work_management_ai.agents.retrieve.prompts.system_v1 import (
     PROMPT_VERSION as RETRIEVE_PROMPT_VERSION,
 )
 from work_management_ai.runtime.activation import ActivationContext
-from work_management_ai.runtime.agent_registry import AgentRegistry
+from work_management_ai.runtime.agent_registry import AgentRegistry, RegisteredToolLoopAgent
 from work_management_ai.runtime.contracts import (
     ActorReference,
     AgentHandoff,
@@ -60,8 +61,10 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
         actor: AuthenticatedActor | None = None,
         retrieval_replay_validator: RetrievalResultRevalidator | None = None,
         activation: ActivationContext | None = None,
+        candidate: RegisteredToolLoopAgent | None = None,
     ) -> None:
         self._activation = activation
+        self._candidate = candidate
         self._transactions = transaction_factory
         self._registry = registry
         self._job = job
@@ -101,7 +104,7 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
             organization_id=self._scope.organization_id,
             orchestration_run_id=self._scope.orchestration_run_id,
         )
-        if self._report_chat_active and self._job is not None:
+        if (self._report_chat_active or self._candidate is not None) and self._job is not None:
             await repository.assert_job_claim(job=self._job)
         if self._retrieval_active:
             if (
@@ -131,7 +134,9 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                 organization_id=self._scope.organization_id, run_id=run_id
             )
             if existing is None:
-                registered = self._registry.resolve(AgentId.ORCHESTRATOR, "1.0.0", self._phase)
+                registered = self._candidate or self._registry.resolve(
+                    AgentId.ORCHESTRATOR, "1.0.0", self._phase
+                )
                 run = AgentRun.create(
                     id=run_id,
                     organization_id=self._scope.organization_id,
@@ -144,6 +149,12 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
                     budget=registered.manifest.runtime.model_dump(mode="json"),
                 ).mark_running()
                 await transaction.repository.append_agent_run(run=run)
+            elif self._candidate is not None and (
+                existing.agent_version != self._candidate.manifest.agent.version
+                or existing.manifest_fingerprint != self._candidate.fingerprint
+                or existing.orchestration_run_id != self._scope.orchestration_run_id
+            ):
+                raise RuntimeError("ORCHESTRATOR_ROOT_PIN_MISMATCH")
             elif existing.status in {
                 DomainAgentRunStatus.AWAITING_INPUT,
                 DomainAgentRunStatus.AWAITING_HUMAN,
@@ -152,7 +163,9 @@ class PostgreSQLExecutionRecorder(ExecutionRecorderPort):
             await transaction.commit()
         return run_id
 
-    async def finish_orchestrator_run(self, run_id: UUID, output: OrchestratorOutput) -> None:
+    async def finish_orchestrator_run(
+        self, run_id: UUID, output: OrchestratorOutput | OrchestratorOutputV2
+    ) -> None:
         if run_id != uuid5(NAMESPACE_URL, f"orchestrator:{self._identity}"):
             raise RuntimeError("ORCHESTRATOR_AGENT_RUN_SCOPE_MISMATCH")
         stored_output = output.model_dump(mode="json")

@@ -9,7 +9,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Literal, Protocol, TypedDict
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -285,7 +285,15 @@ class SessionHistory:
             terminals: dict[UUID, SessionRecord] = {}
             waits: dict[UUID, SessionRecord] = {}
             call_ids: set[str] = set()
+            resumed_waits: set[UUID] = set()
             for record in ordered:
+                if (
+                    record.kind == "continuation.received"
+                    and record.correlation_id is not None
+                    and record.causation_id is not None
+                    and record.event_id == uuid5(record.correlation_id, "canonical-completion")
+                ):
+                    resumed_waits.add(record.correlation_id)
                 desc = record.invocation
                 if record.kind == "tool.requested":
                     assert desc is not None
@@ -309,12 +317,20 @@ class SessionHistory:
                         raise _Stop("HISTORY_INVALID")
                     if record.settlement.wait_ref is not None:
                         wait = record.settlement.wait_ref
-                        if (
-                            wait.scope != scope
-                            or wait.source_invocation_id != desc.invocation_id
-                            or desc.invocation_id in waits
-                        ):
+                        if wait.scope != scope or wait.source_invocation_id != desc.invocation_id:
                             raise _Stop("HISTORY_INVALID")
+                        earlier = waits.get(desc.invocation_id)
+                        if earlier is not None:
+                            assert earlier.settlement is not None
+                            old_wait = earlier.settlement.wait_ref
+                            if (
+                                old_wait is None
+                                or old_wait.wait_id not in resumed_waits
+                                or old_wait.wait_id == wait.wait_id
+                            ):
+                                raise _Stop("HISTORY_INVALID")
+                            if pending_wait == old_wait:
+                                pending_wait = wait
                         waits[desc.invocation_id] = record
                     else:
                         terminals[desc.invocation_id] = record

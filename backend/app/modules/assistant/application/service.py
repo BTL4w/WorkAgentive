@@ -15,6 +15,7 @@ from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 from app.modules.assistant.adapters.repository import AssistantDomainLookupError
+from app.modules.assistant.application.driver_admission import DriverAdmissionPort
 from app.modules.assistant.application.ports import (
     AssistantConversationMutationResult,
     AssistantConversationSnapshot,
@@ -30,10 +31,12 @@ from app.modules.assistant.domain.models import (
     MessageRole,
     OrchestrationRun,
 )
+from app.modules.assistant.domain.session import SessionError
 from app.modules.identity.domain.auth import AuthenticatedActor
 from app.modules.optimization.application.admission import AdmissionError, AIAdmissionService
 from app.modules.planning_runs.application.draft_service import PlanningDraftService
 from app.modules.planning_runs.domain.models import PlanningRunDomainError
+from work_management_ai.runtime.context_exploration import ContextUseAccessPort
 
 # ---------------------------------------------------------------------------
 # Error hierarchy
@@ -157,8 +160,12 @@ class AssistantService:
         orchestrator_fingerprint: str,
         retrieval_enabled: bool = False,
         admission: AIAdmissionService | None = None,
+        driver_admission: DriverAdmissionPort | None = None,
+        continuation_access: ContextUseAccessPort | None = None,
     ) -> None:
         self._admission = admission
+        self._driver_admission = driver_admission
+        self._continuation_access = continuation_access
         self._retrieval_enabled = retrieval_enabled
         self._transactions = transaction_factory
         self.block_projector = block_projector
@@ -537,11 +544,45 @@ class AssistantService:
 
         async def submit() -> AssistantTurnMutationResult:
             async with self._transactions(actor) as txn:
+                selected_run = run
+                continuation = None
+                if self._driver_admission is not None and card_kind is None:
+                    access = self._continuation_access
+                    if access is not None:
+                        continuation = await txn.repository.select_user_followup(
+                            actor=actor,
+                            conversation_id=conversation_id,
+                            turn_id=turn_id,
+                            text=normalized_message,
+                            context_access=access,
+                        )
+                    driver = self._driver_admission.select(
+                        actor,
+                        verified_action=False,
+                        continuation_source=continuation.pin
+                        if continuation is not None
+                        else "legacy"
+                        if await txn.repository.has_legacy_followup(
+                            actor=actor,
+                            conversation_id=conversation_id,
+                        )
+                        else None,
+                    )
+                    if driver is not None:
+                        selected_run = replace(
+                            run,
+                            orchestrator_version=driver.agent_version,
+                            orchestrator_fingerprint=driver.manifest_fingerprint,
+                            execution_plan={
+                                **run.execution_plan,
+                                "driver_pin": driver.model_dump(mode="json"),
+                            },
+                        )
                 result = await txn.repository.submit_message_mutation(
                     actor=actor,
                     message=user_message,
                     turn=turn,
-                    run=run,
+                    run=selected_run,
                     job=job,
                     event=initial_event,
                     request_id=request_id,
@@ -553,6 +594,17 @@ class AssistantService:
                         else {}
                     ),
                 )
+                if (
+                    continuation is not None
+                    and not result.replayed
+                    and self._continuation_access is not None
+                ):
+                    await txn.repository.transfer_user_followup(
+                        actor=actor,
+                        source=continuation,
+                        target_run_id=result.run.id,
+                        context_access=self._continuation_access,
+                    )
                 await txn.commit()
                 return result
 
@@ -573,6 +625,8 @@ class AssistantService:
                 # Reacquire the original locks and recheck replay before any
                 # admission/write; concurrent retries still create one receipt.
                 return await submit()
+        except SessionError as error:
+            raise AssistantServiceError(str(error)) from None
         except AdmissionError as error:
             await self._record_rejection(
                 actor=actor,

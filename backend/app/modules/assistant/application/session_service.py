@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import timedelta
 from typing import cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from app.core.config import get_settings
 from app.modules.assistant.application.session_ports import (
@@ -451,6 +451,18 @@ class SessionService:
             if existing is not None:
                 if existing.event == event:
                     return existing
-                if existing.event.settlement_status is not None or event.wait_id is not None:
+                if existing.event.settlement_status is not None:
                     raise SessionError("INVOCATION_CONFLICT")
+                if event.wait_id is not None:
+                    old_wait = existing.event.wait_id
+                    if old_wait is None or old_wait == event.wait_id:
+                        raise SessionError("INVOCATION_CONFLICT")
+                    wake = await repo.event(scope, uuid5(old_wait, "canonical-completion"))
+                    if (
+                        wake is None
+                        or wake.event.kind != "continuation.received"
+                        or wake.event.correlation_id != old_wait
+                        or wake.event.causation_id is None
+                    ):
+                        raise SessionError("INVOCATION_CONFLICT")
             return await self.append_locked(repo, state, event, state.sequence)

@@ -119,6 +119,8 @@ class Settings(BaseSettings):
     session_secure_cookie: bool = False
     frontend_origin: str = "http://localhost:3000"
     ai_provider: Literal["disabled", "mock", "openai"] = "disabled"
+    orchestrator_driver: Literal["legacy", "tool_loop"] = "legacy"
+    orchestrator_tool_loop_organizations: tuple[UUID, ...] = ()
     retrieval_enabled: bool = False
     retrieval_provider: Literal["disabled", "mock", "exa"] = "disabled"
     retrieval_core_exit_verified: bool = False

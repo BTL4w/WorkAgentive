@@ -1,0 +1,51 @@
+schema_version: "3.0"
+agent:
+  id: orchestrator
+  name: Orchestrator Tool Loop
+  version: "2.0.0"
+  owner: ai-runtime
+  activation_phase: 2
+
+capabilities:
+  - orchestration.plan
+  - orchestration.delegate
+  - orchestration.synthesize
+  - orchestration.explore
+
+contracts:
+  input: work_management_ai.agents.orchestrator.contracts.OrchestratorInput
+  output: work_management_ai.agents.orchestrator.tool_loop_contracts.OrchestratorOutputV2
+  handoff: work_management_ai.runtime.contracts.AgentHandoffV2
+
+permissions:
+  roles: [ADMIN, MANAGER, EMPLOYEE]
+  tenant_scope: actor_membership
+  risk_ceiling: PROPOSAL_ONLY
+
+runtime:
+  workflow: orchestrator.tool_loop.v1
+  checkpoint: durable
+  model_policy: native_tool_calling
+
+allowed_skills: [explore_work_context@1]
+allowed_tools:
+  - load_skill@1
+  - delegate_agent@2
+  - explore_projects@1
+  - read_project_context@1
+  - read_actor_context@1
+  - automation.preview@1
+
+approval:
+  produced_writes: NEVER
+  can_self_approve: false
+
+fallback:
+  strategy: SAFE_MANUAL_FALLBACK
+
+evaluators: [orchestrator_tool_loop@1]
+stop_conditions:
+  - no_progress
+  - budget_exhausted
+  - denied_or_stale_context
+  - verified_continuation_required

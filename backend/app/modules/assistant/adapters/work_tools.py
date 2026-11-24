@@ -317,6 +317,45 @@ class WorkToolExecutor:
             return await self._read_resource(actor, request)
         return self._rejected("TOOL_NOT_ALLOWED")
 
+    async def verify_reference(self, actor: AuthenticatedActor, ref: ContextReference) -> bool:
+        if ref.organization_id != actor.organization_id:
+            return False
+        try:
+            if ref.resource_type.upper() == "TASK":
+                task = await self._tasks.get_task(actor=actor, task_id=ref.resource_id)
+                fields = _task_evidence(task).fields
+                version = task.version
+            elif ref.resource_type == "PROJECT":
+                project = await self._projects.get_project(actor=actor, project_id=ref.resource_id)
+                fields = {"name": project.name, "description": project.description}
+                version = project.version
+            elif ref.resource_type == "DEPENDENCY":
+                row = await self._planning.get_dependency(
+                    actor=actor, dependency_id=ref.resource_id
+                )
+                fields = {
+                    "predecessor_task_id": str(row.predecessor_task_id),
+                    "successor_task_id": str(row.successor_task_id),
+                }
+                version = row.version
+            elif ref.resource_type == "ACCEPTANCE_CRITERION":
+                rule = await self._planning.get_acceptance_criterion(
+                    actor=actor, criterion_id=ref.resource_id
+                )
+                fields = {
+                    "task_id": str(rule.task_id),
+                    "text": rule.text,
+                    "position": rule.position,
+                }
+                version = rule.version
+            else:
+                return False
+        except (ProjectNotFoundError, TaskNotFoundError, PlanningNotFoundError):
+            return False
+        return version == ref.version and (
+            ref.fingerprint is None or _fingerprint(fields) == ref.fingerprint
+        )
+
     async def _resolve(self, reference: ActorReference) -> AuthenticatedActor | None:
         actor = await self._actor_resolver.resolve(
             organization_id=reference.organization_id, membership_id=reference.membership_id

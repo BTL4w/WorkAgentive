@@ -48,6 +48,7 @@ from work_management_ai.runtime.contracts import (
     ActivityResponseBlock,
     AgentId,
     ContextReference,
+    DailySummaryResponseBlock,
     InteractionOutcome,
     JsonValue,
     QuestionResponseBlock,
@@ -195,6 +196,7 @@ class _SegmentRun:
     last_progress_signature: tuple[str, str, str, str] | None = None
     last_invocation_id: UUID | None = None
     recovery_error: str | None = None
+    resume_wait: WaitReference | None = None
 
     def close_admitted(self) -> None:
         if self.admitted is not None:
@@ -324,6 +326,7 @@ class ToolLoopOrchestrator:
         history_limits: HistoryLimits | None = None,
         clock: Callable[[], datetime] | None = None,
         delegate_specialists: Callable[[RunScope], Iterable[tuple[AgentId, str]]] | None = None,
+        evidence_sink: Callable[[tuple[ContextReference, ...]], None] | None = None,
     ) -> None:
         self.gateway = gateway
         self.catalog = catalog
@@ -340,6 +343,7 @@ class ToolLoopOrchestrator:
         self.history_limits = history_limits or HistoryLimits()
         self.clock = clock or (lambda: datetime.now(UTC))
         self.delegate_specialists = delegate_specialists
+        self.evidence_sink = evidence_sink
         self.limits: ToolLoopLimits = catalog.agent.manifest.runtime.limits
 
     async def run_segment(
@@ -350,6 +354,7 @@ class ToolLoopOrchestrator:
         checkpoint: ToolLoopCheckpoint | None,
         lease: RunLease,
         verified_context_refs: tuple[ContextReference, ...] = (),
+        resume_wait: WaitReference | None = None,
     ) -> OrchestratorExecutionResult:
         """Execute a segment with optional turn-scoped references bound by the caller."""
 
@@ -375,6 +380,9 @@ class ToolLoopOrchestrator:
             return _fallback_response(
                 code="CONTEXT_DENIED", stop_reason="CONTEXT_DENIED", model_refs=(), call_ids=()
             )
+
+        if resume_wait is not None and resume_wait.scope != scope:
+            raise ValueError("ORCHESTRATOR_SCOPE_MISMATCH")
 
         interval_id = uuid4()
         try:
@@ -407,6 +415,7 @@ class ToolLoopOrchestrator:
                     interval_id=interval_id,
                     verified_context_refs=verified_context_refs,
                 )
+                run.resume_wait = resume_wait
                 try:
                     graph = ToolLoopGraph(_GraphHandlers(self, run))
                     return await graph.run(
@@ -598,9 +607,15 @@ class ToolLoopOrchestrator:
                             report = self.projector.apply(report, obs)
                         _collect_context_evidence(run, obs)
                     elif record.invocation.tool_reference == "delegate_agent@2":
-                        _collect_delegation_evidence(
-                            run, DelegateAgentOutputV2.model_validate(payload.output)
+                        delegation = DelegateAgentOutputV2.model_validate(payload.output)
+                        _collect_delegation_evidence(run, delegation)
+                        if self.evidence_sink is not None:
+                            self.evidence_sink((*delegation.evidence, *delegation.artifact_refs))
+                    elif record.invocation.tool_reference == "automation.preview@1":
+                        run.verified_blocks.append(
+                            DailySummaryResponseBlock.model_validate(payload.output)
                         )
+                        run.proposal_pending = True
         return run
 
 
@@ -678,7 +693,12 @@ class _GraphHandlers:
             checkpoint=self._run.checkpoint,
             skill_access=self._orch.skill_loader,
         )
-        if projected.status == "WAITING" and projected.pending_wait is not None:
+        resumed = (
+            self._run.resume_wait is not None
+            and projected.status == "WAITING"
+            and projected.pending_wait == self._run.resume_wait
+        )
+        if projected.status == "WAITING" and projected.pending_wait is not None and not resumed:
             return {
                 "result": _wait_result(
                     wait_ref=projected.pending_wait,
@@ -689,7 +709,7 @@ class _GraphHandlers:
                 ),
                 "route": "done",
             }
-        if projected.status == "RECONCILE" and projected.pending_call is not None:
+        if (projected.status == "RECONCILE" or resumed) and projected.pending_call is not None:
             receipt = await self._orch.store.get_invocation(
                 self._run.scope, projected.pending_call.invocation_id
             )
@@ -743,6 +763,7 @@ class _GraphHandlers:
                 "route": "fallback",
             }
 
+        self._run.resume_wait = None
         self._run.history_evidence = projected.evidence
         self._run.step_items = (
             build_tool_loop_prompt(
@@ -895,8 +916,13 @@ class _GraphHandlers:
                 }
         try:
             outcome = await self._orch.pipeline.execute(
-                self._run.scope, call, admitted=admitted, lease=self._run.lease
+                self._run.scope,
+                call,
+                admitted=admitted,
+                lease=self._run.lease,
+                resume_wait=self._run.resume_wait,
             )
+            self._run.resume_wait = None
         finally:
             self._run.close_admitted()
         return {
@@ -974,9 +1000,15 @@ class _GraphHandlers:
                 head = self._orch.projector.current or self._orch.projector.empty()
                 self._orch.projector.apply(head, obs)
         elif tool_ref == "delegate_agent@2":
-            _collect_delegation_evidence(
-                self._run, DelegateAgentOutputV2.model_validate(payload.output)
+            value = DelegateAgentOutputV2.model_validate(payload.output)
+            _collect_delegation_evidence(self._run, value)
+            if self._orch.evidence_sink is not None:
+                self._orch.evidence_sink((*value.evidence, *value.artifact_refs))
+        elif tool_ref == "automation.preview@1":
+            self._run.verified_blocks.append(
+                DailySummaryResponseBlock.model_validate(payload.output)
             )
+            self._run.proposal_pending = True
 
         # No-progress guard: 2 identical (tool, args, resource_versions, semantic_result) calls.
         versions_fp = _digest(
@@ -1006,6 +1038,7 @@ class _GraphHandlers:
         updated = self._run.checkpoint.model_copy(
             update={
                 "sequence": next_seq,
+                "pending_wait": None,
                 "skill_versions": tuple(skill_pins),
                 "payload_refs": (*self._run.checkpoint.payload_refs, outcome.payload_ref),
             }

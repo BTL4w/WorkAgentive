@@ -250,7 +250,13 @@ class ToolPipeline:
             raise ToolPolicyError("TOOL_ARGUMENTS_CHANGED", stop_segment=True)
 
     async def execute(
-        self, scope: RunScope, call: ToolCall, *, admitted: AdmittedToolSet, lease: RunLease
+        self,
+        scope: RunScope,
+        call: ToolCall,
+        *,
+        admitted: AdmittedToolSet,
+        lease: RunLease,
+        resume_wait: WaitReference | None = None,
     ) -> ToolOutcome:
         invocation_id = self.invocation_id(scope, call.call_id)
         tool: AdmittedTool | None = None
@@ -314,6 +320,15 @@ class ToolPipeline:
             receipt = await self.store.get_invocation(scope, invocation_id)
             if receipt is not None and receipt.descriptor != descriptor:
                 raise ToolPolicyError("INVOCATION_CONFLICT", stop_segment=True)
+            resume = resume_wait is not None
+            if resume and (
+                receipt is None
+                or receipt.settlement is None
+                or receipt.settlement.wait_ref != resume_wait
+                or resume_wait.scope != scope
+                or resume_wait.source_invocation_id != invocation_id
+            ):
+                raise ToolPolicyError("CONTINUATION_WAIT_MISMATCH", stop_segment=True)
             reservation = UsageReservation(
                 operation_id=invocation_id,
                 kind="HANDOFF"
@@ -376,14 +391,17 @@ class ToolPipeline:
             await self.policy.guard(context, tool, ())
             self._unchanged(context, arguments, original)
             self._admission(admitted, call.name, tool)
-            if receipt.settlement is not None:
+            if receipt.settlement is not None and not resume:
                 outcome = await self._replay(context, tool, receipt, backend)
                 self._unchanged(context, arguments, original)
                 self._admission(admitted, call.name, tool)
                 await binding.store.settle(scope, budget, None)
                 return outcome
-            await self._event(scope, lease, receipt, "tool.authorized")
-            if prepared.decision == "NEEDS_INPUT":
+            if not resume:
+                await self._event(scope, lease, receipt, "tool.authorized")
+            if resume and prepared.decision == "NEEDS_INPUT":
+                raise ToolPolicyError("CONTINUATION_INPUT_REQUIRED", stop_segment=True)
+            if prepared.decision == "NEEDS_INPUT" and not resume:
                 wait = WaitReference(
                     wait_id=uuid5(invocation_id, "needs-input"),
                     scope=scope,
@@ -400,7 +418,7 @@ class ToolPipeline:
                 return DeferredToolResult(
                     invocation_id=invocation_id, call_id=call.call_id, wait_ref=wait
                 )
-            fresh = await self.store.start_invocation(scope, receipt, lease=lease)
+            fresh = not resume and await self.store.start_invocation(scope, receipt, lease=lease)
             started = True
             seconds = min(tool.timeout_seconds, budget.seconds_remaining, 180)
             if seconds <= 0:
@@ -412,6 +430,8 @@ class ToolPipeline:
                     result = await backend.reconcile(context, arguments.model_copy(deep=True))
                     if result is None:
                         raise ToolPolicyError("TOOL_RECONCILIATION_REQUIRED", stop_segment=True)
+                    if resume and result.wait_ref == resume_wait:
+                        raise ToolPolicyError("CONTINUATION_RESULT_UNAVAILABLE", stop_segment=True)
             self._unchanged(context, arguments, original)
             result = self._validate(context, tool, result)
             try:

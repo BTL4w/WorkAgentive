@@ -1,0 +1,21 @@
+schema_version: "2.0"
+name: automation.preview
+version: "1.0.2"
+owner: automations
+tenant_scope: actor_membership
+roles: [ADMIN, MANAGER, EMPLOYEE]
+risk_level: PROPOSAL_ONLY
+input_contract: work_management_ai.tools.automation.contracts.AutomationToolInputV2
+output_contract: work_management_ai.tools.automation.contracts.AutomationToolOutput
+timeout_seconds: 15
+max_attempts: 1
+retry_policy: NONE
+idempotency: REQUIRED
+audit: REQUIRED
+evidence_output: false
+freshness_output: true
+trace_metadata: [tool_id, duration_ms, result_status]
+description: >-
+  Prepare a preview of an explicitly requested daily summary schedule. Permission
+  and the required human confirmation are enforced by the application. The
+  preview does not activate or change a schedule.

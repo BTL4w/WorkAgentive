@@ -27,6 +27,7 @@ from app.modules.assistant.adapters.session_usage_models import OrchestrationChi
 from app.modules.assistant.adapters.tool_loop_recorder import session_lease, session_scope
 from app.modules.assistant.adapters.transaction import PostgreSQLAssistantTransactionFactory
 from app.modules.assistant.application.continuation_service import ContinuationService
+from app.modules.assistant.application.driver_admission import ContinuationAdmission, PinnedDriver
 from app.modules.assistant.application.ports import LinkedWorkflowEvent
 from app.modules.assistant.application.session_service import SessionService
 from app.modules.assistant.domain.continuation import (
@@ -34,8 +35,9 @@ from app.modules.assistant.domain.continuation import (
     WaitDraft,
     WaitRecord,
     WakeDecision,
+    WakeReceipt,
 )
-from app.modules.assistant.domain.models import OrchestrationRunStatus
+from app.modules.assistant.domain.models import AssistantJob, OrchestrationRunStatus
 from app.modules.assistant.domain.session import SessionError, SessionEvent
 from app.modules.feedback.adapters.payload_repository import live_payload
 from app.modules.identity.adapters.auth_repository import SqlAlchemyAuthRepository
@@ -50,6 +52,7 @@ from app.modules.planning_runs.adapters.database_models import (
 from app.modules.planning_runs.domain.models import WorkflowEvent
 from app.modules.reporting.adapters.usage_models import ReportGenerationJobModel
 from work_management_ai.runtime.context_exploration import ContextUseAccessPort
+from work_management_ai.runtime.continuation import ResolvedContextBinding
 from work_management_ai.runtime.tool_loop_contracts import (
     RunScope,
     ToolLoopCheckpoint,
@@ -118,7 +121,7 @@ class PostgreSQLContinuations:
         self._journal = PostgreSQLSessionRepository(session)
 
     @asynccontextmanager
-    async def _as_owner(
+    async def as_owner(
         self, organization_id: UUID, membership_id: UUID
     ) -> AsyncGenerator[AuthenticatedActor | None]:
         previous = await self._session.scalar(
@@ -146,7 +149,7 @@ class PostgreSQLContinuations:
         self, item: LinkedWorkflowEvent, membership_id: UUID
     ) -> Literal["LEGACY", "HANDLED", "PENDING"]:
         """Keep the projection cursor until the exact child job can be reconciled."""
-        async with self._as_owner(item.event.organization_id, membership_id) as actor:
+        async with self.as_owner(item.event.organization_id, membership_id) as actor:
             if actor is None:
                 return "LEGACY"
             scope = session_scope(
@@ -199,7 +202,7 @@ class PostgreSQLContinuations:
         )
 
     async def route_report_completion(self, job: ReportGenerationJobModel) -> None:
-        async with self._as_owner(job.organization_id, job.requester_membership_id) as actor:
+        async with self.as_owner(job.organization_id, job.requester_membership_id) as actor:
             if actor is not None:
                 await self.receive_report_completion(actor, job.id)
 
@@ -641,6 +644,182 @@ class PostgreSQLContinuations:
                 occurred_at=now,
             )
         )
+
+    async def select_followup(
+        self,
+        actor: AuthenticatedActor,
+        *,
+        conversation_id: UUID,
+        turn_id: UUID,
+        text: str,
+    ) -> ContinuationAdmission | None:
+        if self._context_access is None:
+            return None
+        wait, run = OrchestrationWaitModel, OrchestrationRunModel
+        rows = (
+            (
+                await self._session.execute(
+                    select(wait, run.execution_plan)
+                    .join(
+                        run,
+                        (run.organization_id == wait.organization_id)
+                        & (run.id == wait.source_run_id),
+                    )
+                    .where(
+                        wait.organization_id == actor.organization_id,
+                        wait.membership_id == actor.membership_id,
+                        wait.conversation_id == conversation_id,
+                        wait.kind == "USER_INPUT",
+                        wait.owner_run_id == wait.source_run_id,
+                        wait.closed.is_(False),
+                        wait.wake_job_id.is_(None),
+                        run.status == "AWAITING_INPUT",
+                        run.execution_plan.has_key("driver_pin"),
+                    )
+                    .order_by(run.updated_at.desc(), run.id)
+                    .limit(17)
+                )
+            )
+            .tuples()
+            .all()
+        )
+        if len(rows) > 16:
+            return None
+        result: ContinuationAdmission | None = None
+        for row, plan in rows:
+            reference = _record(row).reference
+            if not await self._journal.authorize(session_scope(reference.scope), actor):
+                continue
+            try:
+                binding = await resolve_input(
+                    self._journal,
+                    reference,
+                    user_turn_id=turn_id,
+                    content_blocks=[{"kind": "text", "text": text}],
+                    access=self._context_access,
+                )
+            except SessionError as error:
+                if str(error) in {
+                    "CONTINUATION_TARGET_UNRELATED",
+                    "CONTEXT_EXPIRED",
+                    "CONTINUATION_CLARIFICATION_REQUIRED",
+                    "CONTINUATION_CONTEXT_REFRESH_REQUIRED",
+                }:
+                    continue
+                raise
+            if binding is not None:
+                if result is not None:
+                    return None
+                result = ContinuationAdmission(
+                    row.wait_id, row.version, PinnedDriver.model_validate(plan["driver_pin"])
+                )
+        return result
+
+    async def load_user_choice(
+        self, actor: AuthenticatedActor, job: AssistantJob
+    ) -> ResolvedContextBinding | None:
+        model = OrchestrationWaitModel
+        row = await self._session.scalar(
+            select(model).where(
+                model.organization_id == actor.organization_id,
+                model.membership_id == actor.membership_id,
+                model.conversation_id == job.conversation_id,
+                model.owner_run_id == job.orchestration_run_id,
+                model.owner_turn_id == job.turn_id,
+                model.closed.is_(False),
+                model.context_binding.is_not(None),
+            )
+        )
+        if row is None:
+            return None
+        source = session_scope(_record(row).reference.scope)
+        if not await self._journal.authorize(source, actor):
+            raise SessionError("CONTINUATION_WAKE_NOT_FOUND")
+        await self._journal.retention_deadline(source)
+        value = ResolvedContextBinding.model_validate(row.context_binding)
+        if value.user_turn_id != job.turn_id or session_scope(value.source_scope) != source:
+            raise SessionError("CONTINUATION_WAIT_MISMATCH")
+        return value
+
+    async def load_wake(self, actor: AuthenticatedActor, job: AssistantJob) -> WakeReceipt:
+        model = OrchestrationWaitModel
+        row = await self._session.scalar(
+            select(model)
+            .where(
+                model.organization_id == actor.organization_id,
+                model.membership_id == actor.membership_id,
+                model.conversation_id == job.conversation_id,
+                model.owner_run_id == job.orchestration_run_id,
+                model.owner_turn_id == job.turn_id,
+                model.wake_job_id == job.id,
+                model.closed.is_(False),
+            )
+            .with_for_update()
+        )
+        if row is None or job.job_type != "assistant.turn.resume":
+            raise SessionError("CONTINUATION_WAKE_NOT_FOUND")
+        wait = _record(row)
+        source = session_scope(wait.reference.scope)
+        if (
+            job.payload.get("wait_id") != str(wait.reference.wait_id)
+            or job.payload.get("owner_version") != wait.version
+            or not await self._journal.authorize(source, actor)
+        ):
+            raise SessionError("CONTINUATION_WAKE_NOT_FOUND")
+        await self._journal.retention_deadline(source)
+        outcome: str | None = None
+        if row.workflow_event_id is not None:
+            event = await self._session.get(WorkflowEventModel, row.workflow_event_id)
+            if event is not None and event.organization_id == row.organization_id:
+                agent = await self._session.scalar(
+                    select(AgentRunModel)
+                    .where(
+                        AgentRunModel.organization_id == row.organization_id,
+                        AgentRunModel.orchestration_run_id == row.source_run_id,
+                        AgentRunModel.workflow_run_id == event.workflow_run_id,
+                        AgentRunModel.agent_id == "planning",
+                    )
+                    .order_by(AgentRunModel.created_at.desc(), AgentRunModel.id)
+                    .limit(1)
+                )
+                if agent is not None:
+                    linked = LinkedWorkflowEvent(
+                        agent_run=agent_run_domain(agent),
+                        turn_id=row.source_turn_id,
+                        conversation_id=row.conversation_id,
+                        event=WorkflowEvent(
+                            id=event.id,
+                            organization_id=event.organization_id,
+                            workflow_run_id=event.workflow_run_id,
+                            sequence=event.sequence,
+                            event_type=event.event_type,
+                            public_payload=event.public_payload,
+                            created_at=event.created_at,
+                        ),
+                    )
+                    outcome = await self._workflow_outcome(actor, row, linked)
+        elif row.child_allocation_id is not None:
+            binding, generation = OrchestrationChildJobModel, ReportGenerationJobModel
+            outcome = await self._session.scalar(
+                select(generation.state)
+                .join(
+                    binding,
+                    (binding.organization_id == generation.organization_id)
+                    & (binding.generation_job_id == generation.id),
+                )
+                .where(
+                    binding.organization_id == row.organization_id,
+                    binding.orchestration_run_id == row.source_run_id,
+                    binding.allocation_id == row.child_allocation_id,
+                    generation.id == row.resource_id,
+                    generation.requester_membership_id == actor.membership_id,
+                    generation.expected_report_version == row.resource_version,
+                    generation.state.in_(("AWAITING_REVIEW", "AI_UNAVAILABLE", "FAILED")),
+                )
+            )
+        if outcome is None or outcome != job.payload.get("outcome"):
+            raise SessionError("CONTINUATION_OUTCOME_STALE")
+        return WakeReceipt(wait, outcome)
 
     async def receive_event(
         self, actor: AuthenticatedActor, event: LinkedWorkflowEvent

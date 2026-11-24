@@ -55,19 +55,40 @@ class AssistantJobService:
         try:
             await self._handler(job=job, worker_id=worker_id)
         except AssistantJobClaimLost:
-            # A successor owns the job; the old worker must not fail or complete it.
             return True
         except Exception as error:
-            async with self._transactions(organization_id) as txn:
+            await self._settle(
+                job=job,
+                worker_id=worker_id,
+                error_code=normalize_job_error(error),
+                next_available_at=now + timedelta(seconds=5),
+            )
+        else:
+            await self._settle(job=job, worker_id=worker_id)
+        return True
+
+    async def _settle(
+        self,
+        *,
+        job: AssistantJob,
+        worker_id: str,
+        error_code: str | None = None,
+        next_available_at: datetime | None = None,
+    ) -> None:
+        async with self._transactions(job.organization_id) as txn:
+            try:
+                await txn.repository.assert_job_claim(job=job)
+            except AssistantJobClaimLost:
+                # The current attempt already suspended, or a successor took the claim.
+                return
+            if error_code is None:
+                await txn.repository.complete_job(job_id=job.id, worker_id=worker_id)
+            else:
+                assert next_available_at is not None
                 await txn.repository.fail_job(
                     job_id=job.id,
                     worker_id=worker_id,
-                    error_code=normalize_job_error(error),
-                    next_available_at=now + timedelta(seconds=5),
+                    error_code=error_code,
+                    next_available_at=next_available_at,
                 )
-                await txn.commit()
-        else:
-            async with self._transactions(organization_id) as txn:
-                await txn.repository.complete_job(job_id=job.id, worker_id=worker_id)
-                await txn.commit()
-        return True
+            await txn.commit()

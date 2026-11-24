@@ -320,6 +320,56 @@ async def test_terminal_event_during_transfer_queues_only_one_job_for_current_ow
     assert replay.job_id == wake.job_id
 
 
+async def test_exhausted_resume_closes_its_wait_and_exposes_manual_fallback(
+    journal: Journal,
+) -> None:
+    from app.modules.assistant.adapters.session_continuations import continuation_service
+    from app.modules.assistant.application.job_service import AssistantJobService
+    from app.modules.assistant.domain.continuation import WaitDraft
+    from app.modules.assistant.domain.models import AssistantJob
+
+    engine, sessions, actor, _, scope, lease, _, _ = journal
+    workflow_id = uuid4()
+    reference = await prepare_wait(journal, workflow_id=workflow_id)
+    service = continuation_service(sessions)
+    await service.open_wait(actor, WaitDraft(reference=reference, lease=lease))
+    _, completion = await seed_workflow_events(journal, workflow_id)
+    wake = await service.receive_event(actor, completion)
+    assert wake.job_id is not None
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("UPDATE assistant_jobs SET max_attempts=1 WHERE id=:id"), {"id": wake.job_id}
+        )
+
+    async def fail(*, job: AssistantJob, worker_id: str) -> None:
+        raise SessionError("CONTINUATION_OUTCOME_STALE")
+
+    worker = AssistantJobService(
+        transaction_factory=PostgreSQLAssistantTransactionFactory(sessions),
+        handler=fail,
+        organization_scopes={actor.organization_id},
+        job_type="assistant.turn.resume",
+    )
+    assert await worker.run_once(worker_id="stale-wake", organization_id=actor.organization_id)
+    async with engine.connect() as connection:
+        result = await connection.execute(
+            text(
+                "SELECT j.status, t.status, r.status, w.closed "
+                "FROM assistant_jobs j JOIN assistant_turns t ON t.id=j.turn_id "
+                "JOIN orchestration_runs r ON r.id=j.orchestration_run_id "
+                "JOIN orchestration_waits w ON w.wake_job_id=j.id WHERE j.id=:id"
+            ),
+            {"id": wake.job_id},
+        )
+        assert tuple(result.one()) == ("FAILED", "FAILED", "FAILED", True)
+        fallback = await connection.scalar(
+            text("SELECT content_blocks FROM assistant_messages WHERE dedupe_key=:key"),
+            {"key": f"assistant:{scope.turn_id}:manual-fallback"},
+        )
+        assert fallback is not None
+        assert fallback[0]["message_key"] == "assistant.manual_fallback"
+
+
 async def test_completion_before_wait_is_recovered_and_legacy_projection_does_not_finish_owner(
     journal: Journal,
 ):
@@ -448,14 +498,23 @@ async def test_rejection_wake_requires_canonical_current_proposal_and_approval(
         assert payload is None
 
 
+@pytest.mark.parametrize("through_admission", [False, True])
 async def test_only_an_authorized_candidate_chosen_in_the_user_turn_creates_a_binding(
     journal: Journal,
+    through_admission: bool,
 ) -> None:
+    from app.core.config import Settings
     from app.modules.assistant.adapters.context_continuations import PostgreSQLUserClarifications
     from app.modules.assistant.adapters.session_continuations import continuation_service
+    from app.modules.assistant.adapters.tool_loop_runtime import (
+        DriverAdmission,
+        build_candidate_artifacts,
+    )
+    from app.modules.assistant.application.service import AssistantService
     from app.modules.assistant.domain.continuation import WaitDraft
+    from tests.test_orchestrator_tool_loop_worker_integration import PlanningSnapshot
 
-    _, sessions, actor, recorder, scope, lease, _, _ = journal
+    engine, sessions, actor, recorder, scope, lease, _, _ = journal
     current_outcome: UseOutcome = "REFRESH_REQUIRED"
 
     class Access:
@@ -555,7 +614,8 @@ async def test_only_an_authorized_candidate_chosen_in_the_user_turn_creates_a_bi
     unrelated = await submit_target(journal, "Write a report instead")
     target = await submit_target(journal, "Project Alpha")
     await suspend_fixture_job(journal, reference, tool_pins=(pin,))
-    service = continuation_service(sessions, context_access=Access())
+    access = Access()
+    service = continuation_service(sessions, context_access=access)
     await service.open_wait(actor, WaitDraft(reference=reference, lease=lease))
     for turn, error in (
         (unrelated, "CONTINUATION_TARGET_UNRELATED"),
@@ -569,13 +629,63 @@ async def test_only_an_authorized_candidate_chosen_in_the_user_turn_creates_a_bi
                 target_run_id=turn,
             )
     current_outcome = "ACCEPTED"
-    receipt_transfer = await service.transfer(
-        actor,
-        wait_id=reference.wait_id,
-        expected_version=1,
-        target_run_id=target,
-    )
-    reply = receipt_transfer.wait.owner_turn_id
+    if through_admission:
+        artifacts = build_candidate_artifacts()
+        settings = Settings(
+            environment="test",
+            ai_provider="mock",
+            orchestrator_driver="tool_loop",
+            orchestrator_tool_loop_organizations=(actor.organization_id,),
+        )
+        driver_pin = DriverAdmission(settings, artifacts).select(
+            actor, verified_action=False, continuation_source=None
+        )
+        assert driver_pin is not None
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE orchestration_runs SET execution_plan = "
+                    "jsonb_build_object('driver_pin', CAST(:pin AS jsonb)) WHERE id = :id"
+                ),
+                {"pin": driver_pin.model_dump_json(), "id": scope.orchestration_run_id},
+            )
+        app_service = AssistantService(
+            transaction_factory=PostgreSQLAssistantTransactionFactory(sessions),
+            planning_snapshot=PlanningSnapshot(),
+            orchestrator_version="1.0.0",
+            orchestrator_fingerprint="legacy",
+            driver_admission=DriverAdmission(
+                settings.model_copy(update={"orchestrator_driver": "legacy"}), artifacts
+            ),
+            continuation_access=access,
+        )
+
+        async def submit_choice():
+            return await app_service.post_message(
+                actor=actor,
+                conversation_id=scope.conversation_id,
+                message="Project Alpha",
+                locale="en",
+                card_action=None,
+                if_match_version=None,
+                request_id="select",
+                idempotency_key="select",
+            )
+
+        submitted = await submit_choice()
+        assert submitted.run.orchestrator_version == "2.0.0"
+        assert submitted.run.execution_plan["driver_pin"] == driver_pin.model_dump(mode="json")
+        replay = await submit_choice()
+        assert replay.replayed and replay.run.id == submitted.run.id
+        reply = submitted.turn.id
+    else:
+        receipt_transfer = await service.transfer(
+            actor,
+            wait_id=reference.wait_id,
+            expected_version=1,
+            target_run_id=target,
+        )
+        reply = receipt_transfer.wait.owner_turn_id
     reader = PostgreSQLUserClarifications(sessions, actor)
     binding = await reader.accepted(
         source_scope=scope,

@@ -290,8 +290,27 @@ def create_app(
             orchestrator_manifest = load_yaml_resource(
                 "work_management_ai.agents.orchestrator", "agent.yaml", AgentManifest
             )
+            from secrets import token_bytes
+
+            from app.modules.assistant.adapters.context_continuations import (
+                ApplicationClarificationAccess,
+            )
+            from app.modules.assistant.adapters.tool_loop_runtime import (
+                DriverAdmission,
+                build_candidate_artifacts,
+            )
+            from app.modules.assistant.application.context_service import ContextReadService
+
+            actor_service = CurrentActorService(
+                SqlAlchemyAuthTransactionFactory(create_session_factory(database_engine))
+            )
+            contexts = ContextReadService(
+                actors=actor_service, projects=resolved_project_service, cursor_key=token_bytes(32)
+            )
             resolved_assistant_service = AssistantService(
                 admission=ai_admission,
+                driver_admission=DriverAdmission(resolved_settings, build_candidate_artifacts()),
+                continuation_access=ApplicationClarificationAccess(contexts, actor_service),
                 transaction_factory=assistant_transaction_factory,
                 planning_drafts=resolved_planning_draft_service,
                 planning_snapshot=PostgreSQLPlanningSnapshot(
